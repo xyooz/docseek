@@ -229,36 +229,55 @@ class ChunkStore:
             clauses.append("LOWER(f.path) LIKE ?")
             params.append(f"%{path_contains.casefold()}%")
 
-        fetch_limit = max(limit * 5, 250)
-        params.extend([fetch_limit, max(0, offset * 3)])
+        params.extend([max(1, limit), max(0, offset)])
         sql = f"""
+            WITH hits AS (
+                SELECT
+                    f.path,
+                    f.filename,
+                    f.extension,
+                    f.modified_time,
+                    f.size,
+                    CAST({table}.ordinal AS INTEGER) AS ordinal,
+                    {table}.location AS location,
+                    {snippet_expr} AS snippet,
+                    {score_expr} AS score
+                FROM {table}
+                JOIN files f ON f.path = {table}.path
+                WHERE {' AND '.join(clauses)}
+            ),
+            ranked AS (
+                SELECT
+                    *,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY path
+                        ORDER BY score ASC, ordinal ASC
+                    ) AS file_rank
+                FROM hits
+            )
             SELECT
-                f.path, f.filename, f.extension, f.modified_time, f.size,
-                {table}.location AS location,
-                {snippet_expr} AS snippet,
-                {score_expr} AS score
-            FROM {table}
-            JOIN files f ON f.path = {table}.path
-            WHERE {' AND '.join(clauses)}
-            ORDER BY score ASC, f.modified_time DESC
+                path, filename, extension, modified_time, size,
+                location, snippet, score
+            FROM ranked
+            WHERE file_rank = 1
+            ORDER BY score ASC, modified_time DESC, path ASC
             LIMIT ? OFFSET ?
         """
         with self.connect() as conn:
             rows = conn.execute(sql, params).fetchall()
 
         results: list[ChunkSearchResult] = []
-        seen: set[str] = set()
         for row in rows:
-            path = str(row["path"])
-            if path in seen:
-                continue
-            seen.add(path)
             snippet = str(row["snippet"] or "")
             if is_short_cjk:
-                snippet = self._plain_chunk_snippet(path, str(row["location"]), query)
+                snippet = self._plain_chunk_snippet(
+                    str(row["path"]),
+                    str(row["location"]),
+                    query,
+                )
             results.append(
                 ChunkSearchResult(
-                    path=path,
+                    path=str(row["path"]),
                     filename=str(row["filename"]),
                     extension=str(row["extension"]),
                     modified_time=float(row["modified_time"]),
@@ -268,8 +287,6 @@ class ChunkStore:
                     score=float(row["score"]),
                 )
             )
-            if len(results) >= limit:
-                break
         return results
 
     def _plain_chunk_snippet(self, path: str, location: str, query: str, radius: int = 52) -> str:
