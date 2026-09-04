@@ -26,5 +26,7 @@ jobs:
         run: python -c "import docseek.app"
       - name: Benchmark smoke
         run: python benchmarks/benchmark_search.py --files 20 --chunks 2 --iterations 1 --limit 10
+      - name: Directory scan smoke
+        run: python benchmarks/benchmark_scan.py --files 20
       - name: Test
         run: python -m unittest discover -s tests -v
