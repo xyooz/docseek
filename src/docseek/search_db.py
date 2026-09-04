@@ -60,6 +60,12 @@ class SearchDatabase:
                 CREATE INDEX IF NOT EXISTS idx_files_modified_time ON files(modified_time);
                 """
             )
+            columns = {
+                str(row["name"])
+                for row in conn.execute("PRAGMA table_info(files)").fetchall()
+            }
+            if "last_error" not in columns:
+                conn.execute("ALTER TABLE files ADD COLUMN last_error TEXT")
 
     def upsert_document(
         self,
@@ -109,13 +115,19 @@ class SearchDatabase:
             )
 
     def remove_missing_under_root(self, root: str, existing_paths: set[str]) -> int:
-        prefix = root.rstrip("\\/") + "%"
+        root_path = Path(root)
         with self.connect() as conn:
-            rows = conn.execute(
-                "SELECT path FROM files WHERE path LIKE ?",
-                (prefix,),
-            ).fetchall()
-            missing = [str(row["path"]) for row in rows if str(row["path"]) not in existing_paths]
+            rows = conn.execute("SELECT path FROM files").fetchall()
+            missing: list[str] = []
+            for row in rows:
+                candidate = Path(str(row["path"]))
+                try:
+                    candidate.relative_to(root_path)
+                except ValueError:
+                    continue
+                if str(candidate) not in existing_paths:
+                    missing.append(str(candidate))
+
             for path in missing:
                 conn.execute("DELETE FROM file_fts WHERE path = ?", (path,))
                 conn.execute("DELETE FROM files WHERE path = ?", (path,))
@@ -143,8 +155,6 @@ class SearchDatabase:
 
     @staticmethod
     def _build_fts_query(query: str) -> str:
-        # Keep the default query language intentionally forgiving for office users:
-        # whitespace means AND, and punctuation is treated as literal text.
         terms = [term.strip() for term in query.split() if term.strip()]
         escaped = [term.replace('"', '""') for term in terms]
         return " AND ".join(f'"{term}"' for term in escaped)
@@ -175,7 +185,7 @@ class SearchDatabase:
                 f.extension,
                 f.modified_time,
                 f.size,
-                snippet(file_fts, 2, '<b>', '</b>', ' … ', 32) AS snippet,
+                snippet(file_fts, 2, '[[HIT]]', '[[/HIT]]', ' … ', 32) AS snippet,
                 bm25(file_fts, 0.0, 4.0, 1.0) AS score
             FROM file_fts
             JOIN files f ON f.path = file_fts.path
