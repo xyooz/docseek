@@ -99,6 +99,54 @@ class ChunkStoreTests(unittest.TestCase):
         rows = self.store.search("客户制度", max_size=5 * 1024)
         self.assertEqual([row.filename for row in rows], ["old.pdf"])
 
+    def test_filter_only_browse_uses_file_metadata_without_keyword(self) -> None:
+        self._insert_sample(
+            path=r"C:\docs\old.pdf",
+            filename="old.pdf",
+            extension=".pdf",
+            modified_time=100.0,
+            size=2 * 1024,
+            chunks=[DocumentChunk(0, "第 1 页", "任意正文")],
+        )
+        self._insert_sample(
+            path=r"C:\docs\new.pdf",
+            filename="new.pdf",
+            extension=".pdf",
+            modified_time=300.0,
+            size=20 * 1024,
+            chunks=[DocumentChunk(0, "第 1 页", "完全不同的正文")],
+        )
+        self._insert_sample(
+            path=r"C:\docs\note.docx",
+            filename="note.docx",
+            extension=".docx",
+            modified_time=400.0,
+            size=30 * 1024,
+            chunks=[DocumentChunk(0, "文档块 1-1", "Word 正文")],
+        )
+
+        rows = self.store.search("", extension=".pdf", modified_after=200.0)
+        self.assertEqual([row.filename for row in rows], ["new.pdf"])
+        self.assertEqual(rows[0].location, "")
+        self.assertEqual(rows[0].snippet, "")
+
+    def test_filter_only_browse_paginates_at_file_level(self) -> None:
+        for index in range(7):
+            self._insert_sample(
+                path=fr"C:\docs\browse_{index}.pdf",
+                filename=f"browse_{index}.pdf",
+                extension=".pdf",
+                modified_time=float(index),
+                chunks=[DocumentChunk(0, "第 1 页", "正文")],
+            )
+
+        page1 = self.store.search("", extension=".pdf", limit=3, offset=0)
+        page2 = self.store.search("", extension=".pdf", limit=3, offset=3)
+        page3 = self.store.search("", extension=".pdf", limit=3, offset=6)
+        paths = [row.path for row in page1 + page2 + page3]
+        self.assertEqual(len(paths), 7)
+        self.assertEqual(len(set(paths)), 7)
+
     def test_best_chunk_is_collapsed_to_one_file_result(self) -> None:
         self._insert_sample(
             path=r"C:\docs\multi.pdf",
