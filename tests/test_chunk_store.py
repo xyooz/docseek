@@ -19,13 +19,22 @@ class ChunkStoreTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
 
-    def _insert_sample(self, *, path: str, filename: str, extension: str, chunks: list[DocumentChunk]) -> None:
+    def _insert_sample(
+        self,
+        *,
+        path: str,
+        filename: str,
+        extension: str,
+        chunks: list[DocumentChunk],
+        modified_time: float = 100.0,
+        size: int = 1024,
+    ) -> None:
         self.store.replace_document(
             path=path,
             filename=filename,
             extension=extension,
-            modified_time=100.0,
-            size=1024,
+            modified_time=modified_time,
+            size=size,
             chunks=chunks,
         )
 
@@ -59,6 +68,36 @@ class ChunkStoreTests(unittest.TestCase):
         )
         rows = self.store.search("客户服务", extension=".pdf", path_contains="制度")
         self.assertEqual([row.filename for row in rows], ["credit.pdf"])
+
+    def test_date_and_size_filters(self) -> None:
+        self._insert_sample(
+            path=r"C:\docs\old.pdf",
+            filename="old.pdf",
+            extension=".pdf",
+            modified_time=100.0,
+            size=2 * 1024,
+            chunks=[DocumentChunk(0, "第 1 页", "客户制度")],
+        )
+        self._insert_sample(
+            path=r"C:\docs\new.pdf",
+            filename="new.pdf",
+            extension=".pdf",
+            modified_time=300.0,
+            size=20 * 1024,
+            chunks=[DocumentChunk(0, "第 1 页", "客户制度")],
+        )
+
+        rows = self.store.search("客户制度", modified_after=200.0)
+        self.assertEqual([row.filename for row in rows], ["new.pdf"])
+
+        rows = self.store.search("客户制度", modified_before=200.0)
+        self.assertEqual([row.filename for row in rows], ["old.pdf"])
+
+        rows = self.store.search("客户制度", min_size=10 * 1024)
+        self.assertEqual([row.filename for row in rows], ["new.pdf"])
+
+        rows = self.store.search("客户制度", max_size=5 * 1024)
+        self.assertEqual([row.filename for row in rows], ["old.pdf"])
 
     def test_best_chunk_is_collapsed_to_one_file_result(self) -> None:
         self._insert_sample(
