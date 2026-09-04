@@ -83,19 +83,33 @@ class IndexIssueStore:
             conn.execute("DELETE FROM index_issues WHERE path = ?", (path,))
 
     def clear_under_root_if_missing(self, root: str, existing_paths: set[str]) -> int:
+        """Remove stale issues only when absence can be established safely.
+
+        Permission/system access errors are intentionally retained because on
+        Windows an inaccessible path may also appear not to exist.
+        """
         root_path = Path(root).resolve()
         with self.connect() as conn:
-            rows = conn.execute("SELECT path FROM index_issues").fetchall()
+            rows = conn.execute("SELECT path, error_code FROM index_issues").fetchall()
 
         stale: list[str] = []
         for row in rows:
             issue_path = str(row["path"])
+            error_code = str(row["error_code"])
             candidate = Path(issue_path)
             try:
                 candidate.relative_to(root_path)
             except ValueError:
                 continue
-            if issue_path not in existing_paths and not candidate.exists():
+            if issue_path in existing_paths:
+                continue
+            if error_code in {"permission_denied", "os_error"}:
+                continue
+            try:
+                exists = candidate.exists()
+            except OSError:
+                continue
+            if not exists:
                 stale.append(issue_path)
 
         if stale:
