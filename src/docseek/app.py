@@ -31,12 +31,12 @@ from PySide6.QtWidgets import (
 
 from .indexer import DirectoryIndexer, IndexCancelled, IndexStats
 from .search_db import SearchDatabase, SearchResult
+from .settings_dialog import IndexSettingsDialog
 from .watcher import WatchManager
 
 
 APP_DIR = Path.home() / ".docseek"
 DB_PATH = APP_DIR / "docseek.db"
-
 
 FILE_FILTERS = [
     ("全部类型", None),
@@ -100,7 +100,7 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("DocSeek — 本地文档全文检索")
-        self.resize(1220, 780)
+        self.resize(1240, 790)
 
         self.database = SearchDatabase(DB_PATH)
         self.thread_pool = QThreadPool.globalInstance()
@@ -124,11 +124,16 @@ class MainWindow(QMainWindow):
         self.type_filter.setMinimumWidth(105)
 
         self.choose_button = QPushButton("添加目录")
-        self.choose_button.setMinimumHeight(38)
         self.refresh_button = QPushButton("刷新索引")
-        self.refresh_button.setMinimumHeight(38)
+        self.settings_button = QPushButton("索引设置")
         self.cancel_button = QPushButton("停止")
-        self.cancel_button.setMinimumHeight(38)
+        for button in (
+            self.choose_button,
+            self.refresh_button,
+            self.settings_button,
+            self.cancel_button,
+        ):
+            button.setMinimumHeight(38)
         self.cancel_button.setVisible(False)
 
         self.scope_label = QLabel()
@@ -158,13 +163,14 @@ class MainWindow(QMainWindow):
         splitter.addWidget(self.preview)
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 2)
-        splitter.setSizes([760, 460])
+        splitter.setSizes([770, 470])
 
         top_bar = QHBoxLayout()
         top_bar.addWidget(self.search_input, 1)
         top_bar.addWidget(self.type_filter)
         top_bar.addWidget(self.choose_button)
         top_bar.addWidget(self.refresh_button)
+        top_bar.addWidget(self.settings_button)
         top_bar.addWidget(self.cancel_button)
 
         layout = QVBoxLayout()
@@ -194,6 +200,7 @@ class MainWindow(QMainWindow):
         self.type_filter.currentIndexChanged.connect(self._perform_search)
         self.choose_button.clicked.connect(self._choose_directory)
         self.refresh_button.clicked.connect(self._refresh_all_roots)
+        self.settings_button.clicked.connect(self._open_index_settings)
         self.cancel_button.clicked.connect(self._cancel_index)
         self.results.cellDoubleClicked.connect(lambda _row, _column: self._open_selected())
         self.results.itemSelectionChanged.connect(self._show_preview)
@@ -226,9 +233,24 @@ class MainWindow(QMainWindow):
     def _choose_directory(self) -> None:
         initial = self.database.get_index_root() or str(Path.home())
         selected = QFileDialog.getExistingDirectory(self, "选择需要索引的目录", initial)
-        if not selected:
+        if selected:
+            self._start_index([Path(selected)])
+
+    def _open_index_settings(self) -> None:
+        if self.current_worker is not None:
+            self.statusBar().showMessage("请等待当前索引任务完成后再修改设置", 5000)
             return
-        self._start_index([Path(selected)])
+        dialog = IndexSettingsDialog(self.database, self)
+        if dialog.exec():
+            self._refresh_scope()
+            self._restart_watcher()
+            self._refresh_status()
+            roots = [Path(root) for root in self.database.get_index_roots()]
+            if roots:
+                self._start_index(roots, automatic=True)
+            else:
+                self.results.setRowCount(0)
+                self.preview.clear()
 
     def _refresh_all_roots(self) -> None:
         roots = [Path(root) for root in self.database.get_index_roots()]
@@ -245,6 +267,7 @@ class MainWindow(QMainWindow):
 
         self.choose_button.setEnabled(False)
         self.refresh_button.setEnabled(False)
+        self.settings_button.setEnabled(False)
         self.cancel_button.setVisible(not automatic)
         self.current_worker = IndexWorker(roots, DB_PATH)
         self.current_worker.signals.progress.connect(self._index_progress)
@@ -254,7 +277,7 @@ class MainWindow(QMainWindow):
         self.thread_pool.start(self.current_worker)
 
         if automatic:
-            self.statusBar().showMessage("检测到文件变化，正在后台更新索引…")
+            self.statusBar().showMessage("检测到变化，正在后台更新索引…")
 
     def _cancel_index(self) -> None:
         if self.current_worker:
@@ -271,9 +294,10 @@ class MainWindow(QMainWindow):
         self._finish_index_ui()
         self._refresh_scope()
         self._restart_watcher()
+        extra = f"，排除 {stats.excluded}" if stats.excluded else ""
         self.statusBar().showMessage(
             f"索引完成：更新 {stats.indexed}，未变化 {stats.unchanged}，"
-            f"删除 {stats.removed}，跳过 {stats.skipped}",
+            f"删除 {stats.removed}，跳过 {stats.skipped}{extra}",
             10000,
         )
         self._perform_search()
@@ -292,6 +316,7 @@ class MainWindow(QMainWindow):
     def _finish_index_ui(self) -> None:
         self.choose_button.setEnabled(True)
         self.refresh_button.setEnabled(True)
+        self.settings_button.setEnabled(True)
         self.cancel_button.setVisible(False)
         self.current_worker = None
         self._refresh_status()
@@ -305,7 +330,10 @@ class MainWindow(QMainWindow):
             self._start_index(roots, automatic=True)
 
     def _restart_watcher(self) -> None:
-        self.watch_manager.start(self.database.get_index_roots())
+        self.watch_manager.start(
+            self.database.get_index_roots(),
+            self.database.get_excluded_paths(),
+        )
 
     def _perform_search(self) -> None:
         query = self.search_input.text().strip()
@@ -406,16 +434,23 @@ class MainWindow(QMainWindow):
 
     def _refresh_scope(self) -> None:
         roots = self.database.get_index_roots()
+        excluded = self.database.get_excluded_paths()
         if not roots:
             self.scope_label.setText("尚未建立索引，请先添加一个工作目录")
+            self.scope_label.setToolTip("")
             return
+
+        suffix = f" · 排除 {len(excluded)} 个目录" if excluded else ""
         if len(roots) == 1:
-            self.scope_label.setText(f"搜索范围：{roots[0]}  ·  自动监测变化")
-            return
-        self.scope_label.setText(
-            f"搜索范围：{len(roots)} 个目录  ·  自动监测变化  ·  最近添加：{roots[-1]}"
-        )
-        self.scope_label.setToolTip("\n".join(roots))
+            self.scope_label.setText(f"搜索范围：{roots[0]} · 自动监测变化{suffix}")
+        else:
+            self.scope_label.setText(
+                f"搜索范围：{len(roots)} 个目录 · 自动监测变化{suffix} · 最近添加：{roots[-1]}"
+            )
+        tooltip = ["索引目录：", *roots]
+        if excluded:
+            tooltip.extend(["", "排除目录：", *excluded])
+        self.scope_label.setToolTip("\n".join(tooltip))
 
     def _refresh_status(self) -> None:
         count = self.database.count_files()
