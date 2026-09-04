@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from docseek.chunk_store import ChunkStore
 from docseek.index_issues import IndexIssueStore
@@ -48,6 +49,23 @@ class DirectoryIndexerTests(unittest.TestCase):
         self.assertGreaterEqual(first.chunks, 1)
         self.assertEqual(second.indexed, 0)
         self.assertEqual(second.unchanged, 1)
+
+    def test_full_scan_uses_prefetched_state_instead_of_per_file_metadata_queries(self) -> None:
+        for index in range(5):
+            (self.root / f"guide_{index}.txt").write_text(
+                f"客户服务操作指引 {index}", encoding="utf-8"
+            )
+        DirectoryIndexer(self.db).scan(self.root)
+
+        with patch.object(
+            self.db,
+            "is_unchanged",
+            side_effect=AssertionError("full scan should use prefetched state"),
+        ):
+            stats = DirectoryIndexer(self.db).scan(self.root)
+
+        self.assertEqual(stats.indexed, 0)
+        self.assertEqual(stats.unchanged, 5)
 
     def test_pre_chunk_file_is_migrated_even_when_unchanged(self) -> None:
         target = self.root / "legacy.txt"
