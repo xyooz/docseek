@@ -11,18 +11,41 @@ from watchdog.observers import Observer
 from .extractors import SUPPORTED_EXTENSIONS
 
 
+def _is_under(path: Path, roots: list[Path]) -> bool:
+    try:
+        resolved = path.resolve()
+    except OSError:
+        resolved = path
+    for root in roots:
+        if resolved == root:
+            return True
+        try:
+            resolved.relative_to(root)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
 class _DocSeekEventHandler(FileSystemEventHandler):
-    def __init__(self, notify: Callable[[], None]) -> None:
+    def __init__(self, notify: Callable[[], None], excluded_paths: list[Path]) -> None:
         super().__init__()
         self.notify = notify
+        self.excluded_paths = excluded_paths
 
     def on_any_event(self, event: FileSystemEvent) -> None:
-        if event.is_directory:
-            self.notify()
-            return
         src = Path(event.src_path)
         dest_path = getattr(event, "dest_path", None)
         dest = Path(dest_path) if dest_path else None
+
+        if _is_under(src, self.excluded_paths) or (
+            dest is not None and _is_under(dest, self.excluded_paths)
+        ):
+            return
+
+        if event.is_directory:
+            self.notify()
+            return
         if src.suffix.lower() in SUPPORTED_EXTENSIONS or (
             dest is not None and dest.suffix.lower() in SUPPORTED_EXTENSIONS
         ):
@@ -30,14 +53,7 @@ class _DocSeekEventHandler(FileSystemEventHandler):
 
 
 class WatchManager:
-    """Watch indexed roots and collapse noisy filesystem events.
-
-    Windows editors often save by writing a temporary file and renaming it.
-    Rather than re-indexing on every low-level event, DocSeek waits for a short
-    quiet period and then asks the incremental indexer to rescan. Unchanged
-    documents are metadata-checked and skipped, keeping the implementation
-    simple and robust while retaining near-real-time behaviour.
-    """
+    """Watch indexed roots and collapse noisy filesystem events."""
 
     def __init__(self, on_change: Callable[[], None], *, debounce_seconds: float = 1.2) -> None:
         self.on_change = on_change
@@ -46,10 +62,11 @@ class WatchManager:
         self._lock = threading.Lock()
         self._generation = 0
 
-    def start(self, roots: list[str]) -> None:
+    def start(self, roots: list[str], excluded_paths: list[str] | None = None) -> None:
         self.stop()
+        excluded = [Path(path).resolve() for path in (excluded_paths or [])]
         observer = Observer()
-        handler = _DocSeekEventHandler(self._queue_change)
+        handler = _DocSeekEventHandler(self._queue_change, excluded)
         scheduled = 0
         for root in roots:
             path = Path(root)
