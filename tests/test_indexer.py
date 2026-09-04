@@ -69,6 +69,49 @@ class DirectoryIndexerTests(unittest.TestCase):
         self.assertEqual([row.filename for row in rows], ["legacy.txt"])
         self.assertTrue(rows[0].location.startswith("行 "))
 
+    def test_precise_update_reindexes_only_changed_file(self) -> None:
+        first = self.root / "first.txt"
+        second = self.root / "second.txt"
+        first.write_text("旧内容 信贷", encoding="utf-8")
+        second.write_text("保持不变 客户", encoding="utf-8")
+        DirectoryIndexer(self.db).scan(self.root)
+
+        first.write_text("新的精准增量内容 风控资料", encoding="utf-8")
+        stats = DirectoryIndexer(self.db).update_paths([first])
+
+        self.assertEqual(stats.scanned, 1)
+        self.assertEqual(stats.indexed, 1)
+        self.assertEqual([row.filename for row in self.chunks.search("风控资料")], ["first.txt"])
+        self.assertEqual(self.chunks.search("旧内容"), [])
+        self.assertEqual([row.filename for row in self.chunks.search("保持不变")], ["second.txt"])
+
+    def test_precise_update_removes_deleted_file(self) -> None:
+        target = self.root / "deleted.txt"
+        target.write_text("即将删除 信贷资料", encoding="utf-8")
+        DirectoryIndexer(self.db).scan(self.root)
+        self.assertEqual(len(self.chunks.search("即将删除")), 1)
+
+        target.unlink()
+        stats = DirectoryIndexer(self.db).update_paths([target])
+
+        self.assertEqual(stats.scanned, 1)
+        self.assertEqual(stats.removed, 1)
+        self.assertEqual(self.chunks.search("即将删除"), [])
+
+    def test_file_growing_over_limit_removes_stale_index(self) -> None:
+        target = self.root / "growing.txt"
+        target.write_text("原先可检索 信贷内容", encoding="utf-8")
+        DirectoryIndexer(self.db, max_file_size=1024).scan(self.root)
+        self.assertEqual(len(self.chunks.search("原先可检索")), 1)
+
+        target.write_text("X" * 2000, encoding="utf-8")
+        stats = DirectoryIndexer(self.db, max_file_size=100).update_paths([target])
+
+        self.assertEqual(stats.removed, 1)
+        self.assertEqual(stats.skipped, 1)
+        self.assertEqual(self.chunks.search("原先可检索"), [])
+        self.assertEqual(self.issues.list()[0].error_code, "file_too_large")
+
     def test_oversized_new_file_is_persisted_as_issue(self) -> None:
         target = self.root / "large.txt"
         target.write_text("超过限制的文件内容", encoding="utf-8")
