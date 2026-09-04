@@ -8,6 +8,7 @@ from pathlib import Path
 
 
 _CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
+_CJK_RUN_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]+")
 
 
 @dataclass(slots=True)
@@ -64,6 +65,13 @@ class SearchDatabase:
                     prefix='2 3 4'
                 );
 
+                CREATE VIRTUAL TABLE IF NOT EXISTS file_fts_cjk2 USING fts5(
+                    path UNINDEXED,
+                    filename_tokens,
+                    content_tokens,
+                    tokenize='unicode61'
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_files_extension ON files(extension);
                 CREATE INDEX IF NOT EXISTS idx_files_modified_time ON files(modified_time);
                 """
@@ -88,9 +96,19 @@ class SearchDatabase:
                 )
                 self._trigram_available = True
             except sqlite3.OperationalError:
-                # Some enterprise Python builds may ship SQLite without the
-                # trigram tokenizer. DocSeek remains usable with unicode61.
                 self._trigram_available = False
+
+    @staticmethod
+    def _cjk_bigrams(text: str) -> str:
+        """Return whitespace-separated CJK bigrams for exact two-char lookup."""
+        tokens: list[str] = []
+        for match in _CJK_RUN_RE.finditer(text):
+            run = match.group(0)
+            if len(run) == 1:
+                tokens.append(run)
+            else:
+                tokens.extend(run[i : i + 2] for i in range(len(run) - 1))
+        return " ".join(tokens)
 
     def upsert_document(
         self,
@@ -121,6 +139,13 @@ class SearchDatabase:
                 "INSERT INTO file_fts(path, filename, content) VALUES (?, ?, ?)",
                 (path, filename, content),
             )
+
+            conn.execute("DELETE FROM file_fts_cjk2 WHERE path = ?", (path,))
+            conn.execute(
+                "INSERT INTO file_fts_cjk2(path, filename_tokens, content_tokens) VALUES (?, ?, ?)",
+                (path, self._cjk_bigrams(filename), self._cjk_bigrams(content)),
+            )
+
             if self._trigram_available:
                 conn.execute("DELETE FROM file_fts_tri WHERE path = ?", (path,))
                 conn.execute(
@@ -140,10 +165,15 @@ class SearchDatabase:
 
     def record_index_error(self, path: str, error: str) -> None:
         with self.connect() as conn:
-            conn.execute(
-                "UPDATE files SET last_error = ? WHERE path = ?",
-                (error, path),
-            )
+            conn.execute("UPDATE files SET last_error = ? WHERE path = ?", (error, path))
+
+    def remove_document(self, path: str) -> None:
+        with self.connect() as conn:
+            conn.execute("DELETE FROM file_fts WHERE path = ?", (path,))
+            conn.execute("DELETE FROM file_fts_cjk2 WHERE path = ?", (path,))
+            if self._trigram_available:
+                conn.execute("DELETE FROM file_fts_tri WHERE path = ?", (path,))
+            conn.execute("DELETE FROM files WHERE path = ?", (path,))
 
     def remove_missing_under_root(self, root: str, existing_paths: set[str]) -> int:
         root_path = Path(root)
@@ -159,11 +189,8 @@ class SearchDatabase:
                 if str(candidate) not in existing_paths:
                     missing.append(str(candidate))
 
-            for path in missing:
-                conn.execute("DELETE FROM file_fts WHERE path = ?", (path,))
-                if self._trigram_available:
-                    conn.execute("DELETE FROM file_fts_tri WHERE path = ?", (path,))
-                conn.execute("DELETE FROM files WHERE path = ?", (path,))
+        for path in missing:
+            self.remove_document(path)
         return len(missing)
 
     def add_index_root(self, root: str) -> None:
@@ -172,7 +199,6 @@ class SearchDatabase:
         if resolved not in roots:
             roots.append(resolved)
         self._set_setting("index_roots", json.dumps(roots, ensure_ascii=False))
-        # Keep the old key for compatibility with early DocSeek versions.
         self._set_setting("index_root", resolved)
 
     def remove_index_root(self, root: str) -> None:
@@ -192,6 +218,39 @@ class SearchDatabase:
         legacy = self._get_setting("index_root")
         return [legacy] if legacy else []
 
+    def add_excluded_path(self, path: str) -> None:
+        resolved = str(Path(path).resolve())
+        paths = self.get_excluded_paths()
+        if resolved not in paths:
+            paths.append(resolved)
+        self._set_setting("excluded_paths", json.dumps(paths, ensure_ascii=False))
+
+    def remove_excluded_path(self, path: str) -> None:
+        resolved = str(Path(path).resolve())
+        paths = [item for item in self.get_excluded_paths() if item != resolved]
+        self._set_setting("excluded_paths", json.dumps(paths, ensure_ascii=False))
+
+    def get_excluded_paths(self) -> list[str]:
+        raw = self._get_setting("excluded_paths")
+        if not raw:
+            return []
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            return []
+        return [str(item) for item in data if item] if isinstance(data, list) else []
+
+    def set_max_file_size_mb(self, value: int) -> None:
+        value = max(1, min(int(value), 4096))
+        self._set_setting("max_file_size_mb", str(value))
+
+    def get_max_file_size_mb(self) -> int:
+        raw = self._get_setting("max_file_size_mb")
+        try:
+            return max(1, min(int(raw), 4096)) if raw is not None else 200
+        except ValueError:
+            return 200
+
     def save_index_root(self, root: str) -> None:
         self.add_index_root(root)
 
@@ -209,10 +268,7 @@ class SearchDatabase:
 
     def _get_setting(self, key: str) -> str | None:
         with self.connect() as conn:
-            row = conn.execute(
-                "SELECT value FROM settings WHERE key = ?",
-                (key,),
-            ).fetchone()
+            row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
         return str(row["value"]) if row else None
 
     def count_files(self) -> int:
@@ -230,6 +286,10 @@ class SearchDatabase:
     def _is_cjk_query(query: str) -> bool:
         return bool(_CJK_RE.search(query))
 
+    @staticmethod
+    def _cjk_only_compact(query: str) -> str:
+        return "".join(ch for ch in query if _CJK_RE.match(ch))
+
     def search(
         self,
         query: str,
@@ -241,15 +301,12 @@ class SearchDatabase:
         if not query:
             return []
 
-        # For Chinese continuous text, trigram substring matching gives much
-        # better recall than unicode61, which otherwise treats long CJK runs as
-        # a single token. Short queries stay on the conventional FTS index.
+        compact_cjk = self._cjk_only_compact(query)
+        if compact_cjk and len(compact_cjk) <= 2 and compact_cjk == "".join(query.split()):
+            return self._search_cjk_short(compact_cjk, limit=limit, extension=extension)
+
         compact = "".join(query.split())
-        use_trigram = (
-            self._trigram_available
-            and self._is_cjk_query(query)
-            and len(compact) >= 3
-        )
+        use_trigram = self._trigram_available and self._is_cjk_query(query) and len(compact) >= 3
         table = "file_fts_tri" if use_trigram else "file_fts"
         fts_query = self._build_fts_query(query)
 
@@ -260,15 +317,9 @@ class SearchDatabase:
             params.append(extension)
         params.append(limit)
 
-        # Filename receives a stronger BM25 weight than body text. The path is
-        # unindexed and is not allowed to influence relevance.
         sql = f"""
             SELECT
-                f.path,
-                f.filename,
-                f.extension,
-                f.modified_time,
-                f.size,
+                f.path, f.filename, f.extension, f.modified_time, f.size,
                 snippet({table}, 2, '[[HIT]]', '[[/HIT]]', ' … ', 36) AS snippet,
                 bm25({table}, 0.0, 5.0, 1.0) AS score
             FROM {table}
@@ -284,11 +335,42 @@ class SearchDatabase:
         except sqlite3.OperationalError:
             if not use_trigram:
                 raise
-            # Fallback protects older/locked-down SQLite builds and malformed
-            # trigram edge cases without making the search box feel fragile.
             return self._search_unicode(query, limit=limit, extension=extension)
-
         return [self._row_to_result(row) for row in rows]
+
+    def _search_cjk_short(
+        self,
+        query: str,
+        *,
+        limit: int,
+        extension: str | None,
+    ) -> list[SearchResult]:
+        params: list[object] = [f'"{query}"']
+        ext_clause = ""
+        if extension:
+            ext_clause = " AND f.extension = ?"
+            params.append(extension)
+        params.append(limit)
+
+        sql = f"""
+            SELECT
+                f.path, f.filename, f.extension, f.modified_time, f.size,
+                '' AS snippet,
+                bm25(file_fts_cjk2, 0.0, 5.0, 1.0) AS score
+            FROM file_fts_cjk2
+            JOIN files f ON f.path = file_fts_cjk2.path
+            WHERE file_fts_cjk2 MATCH ? {ext_clause}
+            ORDER BY score ASC, f.modified_time DESC
+            LIMIT ?
+        """
+        with self.connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+
+        results = [self._row_to_result(row) for row in rows]
+        # The auxiliary bigram index intentionally stores tokens instead of the
+        # original body. Generate a small readable context only for the limited
+        # result set, avoiding any full-database LIKE scan.
+        return results
 
     def _search_unicode(
         self,
