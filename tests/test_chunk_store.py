@@ -74,6 +74,28 @@ class ChunkStoreTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0].filename, "multi.pdf")
 
+    def test_file_level_pagination_has_no_duplicates_or_gaps(self) -> None:
+        for index in range(12):
+            chunk_count = 1 if index % 2 == 0 else 7
+            chunks = [
+                DocumentChunk(chunk_no, f"第 {chunk_no + 1} 页", f"信贷业务 文件{index}")
+                for chunk_no in range(chunk_count)
+            ]
+            self._insert_sample(
+                path=fr"C:\docs\file_{index:02d}.pdf",
+                filename=f"file_{index:02d}.pdf",
+                extension=".pdf",
+                chunks=chunks,
+            )
+
+        page1 = self.store.search("信贷业务", limit=5, offset=0)
+        page2 = self.store.search("信贷业务", limit=5, offset=5)
+        page3 = self.store.search("信贷业务", limit=5, offset=10)
+
+        paths = [row.path for row in page1 + page2 + page3]
+        self.assertEqual(len(paths), 12)
+        self.assertEqual(len(set(paths)), 12)
+
 
 if __name__ == "__main__":
     unittest.main()
