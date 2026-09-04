@@ -9,6 +9,17 @@ from .extractors import SUPPORTED_EXTENSIONS, extract_text
 from .search_db import SearchDatabase
 
 
+DEFAULT_IGNORED_DIR_NAMES = {
+    ".git",
+    ".svn",
+    ".hg",
+    "__pycache__",
+    "node_modules",
+    "$recycle.bin",
+    "system volume information",
+}
+
+
 @dataclass(slots=True)
 class IndexStats:
     scanned: int = 0
@@ -17,26 +28,33 @@ class IndexStats:
     skipped: int = 0
     removed: int = 0
 
+    def merge(self, other: "IndexStats") -> None:
+        self.scanned += other.scanned
+        self.indexed += other.indexed
+        self.unchanged += other.unchanged
+        self.skipped += other.skipped
+        self.removed += other.removed
+
 
 class IndexCancelled(Exception):
     pass
 
 
 class DirectoryIndexer:
-    """Incremental local indexer.
-
-    The indexer only reparses files whose size or modification time changed.
-    Missing files under the indexed root are removed after a successful scan.
-    """
+    """Incremental local indexer tuned for ordinary office folders."""
 
     def __init__(
         self,
         database: SearchDatabase,
         *,
         max_file_size: int = 200 * 1024 * 1024,
+        ignored_dir_names: set[str] | None = None,
     ) -> None:
         self.database = database
         self.max_file_size = max_file_size
+        self.ignored_dir_names = {
+            name.casefold() for name in (ignored_dir_names or DEFAULT_IGNORED_DIR_NAMES)
+        }
         self._cancel = threading.Event()
 
     def cancel(self) -> None:
@@ -73,6 +91,8 @@ class DirectoryIndexer:
                     size=stat.st_size,
                 ):
                     stats.unchanged += 1
+                    if on_progress and stats.scanned % 250 == 0:
+                        on_progress(path, stats)
                     continue
 
                 if on_progress:
@@ -95,15 +115,36 @@ class DirectoryIndexer:
                 self.database.record_index_error(normalized, type(exc).__name__)
 
         stats.removed = self.database.remove_missing_under_root(str(root), seen_paths)
-        self.database.save_index_root(str(root))
+        self.database.add_index_root(str(root))
         return stats
 
     def _iter_supported_files(self, root: Path) -> Iterable[Path]:
-        for path in root.rglob("*"):
+        # pathlib.rglob() cannot prune subtrees. A small explicit stack avoids
+        # descending into known high-noise folders such as .git/node_modules.
+        stack = [root]
+        while stack:
             if self._cancel.is_set():
                 raise IndexCancelled()
+            directory = stack.pop()
             try:
-                if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS:
-                    yield path
+                entries = list(directory.iterdir())
             except OSError:
                 continue
+
+            for path in entries:
+                if self._cancel.is_set():
+                    raise IndexCancelled()
+                try:
+                    if path.is_dir():
+                        if path.name.casefold() not in self.ignored_dir_names:
+                            stack.append(path)
+                        continue
+                    if not path.is_file():
+                        continue
+                    name = path.name
+                    if name.startswith("~$") or name.endswith(".tmp"):
+                        continue
+                    if path.suffix.lower() in SUPPORTED_EXTENSIONS:
+                        yield path
+                except OSError:
+                    continue
