@@ -109,6 +109,39 @@ class SearchDatabase:
                 tokens.extend(run[i : i + 2] for i in range(len(run) - 1))
         return " ".join(tokens)
 
+    def backfill_aux_indexes(self) -> bool:
+        """Backfill newer auxiliary indexes from stored FTS text, without reopening files."""
+        changed = False
+        with self.connect() as conn:
+            base_count = int(conn.execute("SELECT COUNT(*) FROM file_fts").fetchone()[0])
+            cjk2_count = int(conn.execute("SELECT COUNT(*) FROM file_fts_cjk2").fetchone()[0])
+            if cjk2_count != base_count:
+                rows = conn.execute("SELECT path, filename, content FROM file_fts").fetchall()
+                conn.execute("DELETE FROM file_fts_cjk2")
+                conn.executemany(
+                    "INSERT INTO file_fts_cjk2(path, filename_tokens, content_tokens) VALUES (?, ?, ?)",
+                    [
+                        (
+                            str(row["path"]),
+                            self._cjk_bigrams(str(row["filename"] or "")),
+                            self._cjk_bigrams(str(row["content"] or "")),
+                        )
+                        for row in rows
+                    ],
+                )
+                changed = True
+
+            if self._trigram_available:
+                tri_count = int(conn.execute("SELECT COUNT(*) FROM file_fts_tri").fetchone()[0])
+                if tri_count != base_count:
+                    conn.execute("DELETE FROM file_fts_tri")
+                    conn.execute(
+                        "INSERT INTO file_fts_tri(path, filename, content) "
+                        "SELECT path, filename, content FROM file_fts"
+                    )
+                    changed = True
+        return changed
+
     def upsert_document(
         self,
         *,
