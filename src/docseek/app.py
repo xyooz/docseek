@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
 )
 
 from .indexer import DirectoryIndexer, IndexCancelled, IndexStats
+from .query_parser import parse_query
 from .search_db import SearchDatabase, SearchResult
 from .settings_dialog import IndexSettingsDialog
 from .watcher import WatchManager
@@ -37,6 +38,7 @@ from .watcher import WatchManager
 
 APP_DIR = Path.home() / ".docseek"
 DB_PATH = APP_DIR / "docseek.db"
+PAGE_SIZE = 100
 
 FILE_FILTERS = [
     ("全部类型", None),
@@ -76,6 +78,7 @@ class IndexWorker(QRunnable):
             database = SearchDatabase(self.db_path)
             self.indexer = DirectoryIndexer(database)
             total = IndexStats()
+            database.backfill_aux_indexes()
 
             for root in self.roots:
                 if not root.exists() or not root.is_dir():
@@ -107,6 +110,9 @@ class MainWindow(QMainWindow):
         self.current_worker: IndexWorker | None = None
         self.current_results: list[SearchResult] = []
         self.auto_refresh_pending = False
+        self.search_offset = 0
+        self.has_more_results = False
+        self.loading_more = False
 
         self.watch_signals = WatchSignals()
         self.watch_signals.changed.connect(self._queue_live_refresh)
@@ -114,7 +120,12 @@ class MainWindow(QMainWindow):
 
         self.search_input = QLineEdit()
         self.search_input.setClearButtonEnabled(True)
-        self.search_input.setPlaceholderText("搜索文件名或正文，例如：客户经理 信贷")
+        self.search_input.setPlaceholderText(
+            '搜索文件名或正文，例如：信贷 ext:pdf path:制度 或 "客户经理"'
+        )
+        self.search_input.setToolTip(
+            "支持：ext:pdf 限定类型，path:制度 限定路径，引号用于短语搜索"
+        )
         self.search_input.setMinimumHeight(38)
 
         self.type_filter = QComboBox()
@@ -205,6 +216,7 @@ class MainWindow(QMainWindow):
         self.results.cellDoubleClicked.connect(lambda _row, _column: self._open_selected())
         self.results.itemSelectionChanged.connect(self._show_preview)
         self.results.customContextMenuRequested.connect(self._show_context_menu)
+        self.results.verticalScrollBar().valueChanged.connect(self._on_results_scroll)
 
         open_action = QAction("打开", self)
         open_action.setShortcut("Ctrl+O")
@@ -336,42 +348,74 @@ class MainWindow(QMainWindow):
         )
 
     def _perform_search(self) -> None:
-        query = self.search_input.text().strip()
+        self.search_offset = 0
+        self.has_more_results = False
+        self.current_results = []
         self.results.setRowCount(0)
         self.preview.clear()
-        self.current_results = []
-        if not query:
+        self._load_next_page(select_first=True)
+
+    def _load_next_page(self, *, select_first: bool = False) -> None:
+        if self.loading_more:
+            return
+
+        raw_query = self.search_input.text().strip()
+        parsed = parse_query(raw_query)
+        if not parsed.terms:
             self._refresh_status()
             return
 
-        extension = self.type_filter.currentData()
+        extension = parsed.extension or self.type_filter.currentData()
+        self.loading_more = True
         try:
-            rows = self.database.search(query, limit=150, extension=extension)
+            rows = self.database.search(
+                parsed.text,
+                limit=PAGE_SIZE,
+                offset=self.search_offset,
+                extension=extension,
+                path_contains=parsed.path_contains,
+            )
         except Exception as exc:
             self.statusBar().showMessage(f"搜索失败：{exc}", 8000)
             return
+        finally:
+            self.loading_more = False
 
-        self.current_results = rows
-        self.results.setRowCount(len(rows))
-        for row_index, row in enumerate(rows):
-            name_item = QTableWidgetItem(row.filename)
-            name_item.setData(Qt.UserRole, row.path)
-            ext_item = QTableWidgetItem(row.extension.lstrip(".").upper())
-            size_item = QTableWidgetItem(self._human_size(row.size))
-            time_item = QTableWidgetItem(
-                datetime.fromtimestamp(row.modified_time).strftime("%Y-%m-%d %H:%M")
-            )
-            path_item = QTableWidgetItem(row.path)
+        start_row = len(self.current_results)
+        self.current_results.extend(rows)
+        self.results.setRowCount(len(self.current_results))
+        for offset, row in enumerate(rows):
+            self._populate_result_row(start_row + offset, row)
 
-            self.results.setItem(row_index, 0, name_item)
-            self.results.setItem(row_index, 1, ext_item)
-            self.results.setItem(row_index, 2, size_item)
-            self.results.setItem(row_index, 3, time_item)
-            self.results.setItem(row_index, 4, path_item)
-
-        self.statusBar().showMessage(f"找到 {len(rows)} 条结果（最多显示 150 条）")
-        if rows:
+        self.search_offset += len(rows)
+        self.has_more_results = len(rows) == PAGE_SIZE
+        suffix = " · 向下滚动继续加载" if self.has_more_results else ""
+        self.statusBar().showMessage(
+            f"已显示 {len(self.current_results)} 条结果{suffix}"
+        )
+        if select_first and self.current_results:
             self.results.selectRow(0)
+
+    def _populate_result_row(self, row_index: int, row: SearchResult) -> None:
+        name_item = QTableWidgetItem(row.filename)
+        name_item.setData(Qt.UserRole, row.path)
+        ext_item = QTableWidgetItem(row.extension.lstrip(".").upper())
+        size_item = QTableWidgetItem(self._human_size(row.size))
+        time_item = QTableWidgetItem(
+            datetime.fromtimestamp(row.modified_time).strftime("%Y-%m-%d %H:%M")
+        )
+        path_item = QTableWidgetItem(row.path)
+
+        self.results.setItem(row_index, 0, name_item)
+        self.results.setItem(row_index, 1, ext_item)
+        self.results.setItem(row_index, 2, size_item)
+        self.results.setItem(row_index, 3, time_item)
+        self.results.setItem(row_index, 4, path_item)
+
+    def _on_results_scroll(self, value: int) -> None:
+        scrollbar = self.results.verticalScrollBar()
+        if self.has_more_results and value >= scrollbar.maximum() - 2:
+            self._load_next_page()
 
     def _show_preview(self) -> None:
         row_index = self.results.currentRow()
