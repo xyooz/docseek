@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 from docseek.chunk_store import ChunkStore
+from docseek.index_issues import IndexIssueStore
 from docseek.indexer import DirectoryIndexer
 from docseek.search_db import SearchDatabase
 
@@ -16,6 +17,7 @@ class DirectoryIndexerTests(unittest.TestCase):
         self.root.mkdir()
         self.db = SearchDatabase(Path(self.temp_dir.name) / "docseek.db")
         self.chunks = ChunkStore(self.db.db_path)
+        self.issues = IndexIssueStore(self.db.db_path)
 
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
@@ -66,6 +68,33 @@ class DirectoryIndexerTests(unittest.TestCase):
         rows = self.chunks.search("信贷")
         self.assertEqual([row.filename for row in rows], ["legacy.txt"])
         self.assertTrue(rows[0].location.startswith("行 "))
+
+    def test_oversized_new_file_is_persisted_as_issue(self) -> None:
+        target = self.root / "large.txt"
+        target.write_text("超过限制的文件内容", encoding="utf-8")
+
+        stats = DirectoryIndexer(self.db, max_file_size=4).scan(self.root)
+
+        self.assertEqual(stats.indexed, 0)
+        self.assertEqual(stats.skipped, 1)
+        issues = self.issues.list()
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(issues[0].path, str(target.resolve()))
+        self.assertEqual(issues[0].error_code, "file_too_large")
+        self.assertEqual(self.db.count_files(), 0)
+
+    def test_issue_is_cleared_after_successful_retry(self) -> None:
+        target = self.root / "retry.txt"
+        target.write_text("客户经理信贷资料", encoding="utf-8")
+
+        DirectoryIndexer(self.db, max_file_size=4).scan(self.root)
+        self.assertEqual(self.issues.count(), 1)
+
+        stats = DirectoryIndexer(self.db, max_file_size=1024 * 1024).scan(self.root)
+
+        self.assertEqual(stats.indexed, 1)
+        self.assertEqual(self.issues.count(), 0)
+        self.assertEqual([row.filename for row in self.chunks.search("信贷")], ["retry.txt"])
 
 
 if __name__ == "__main__":
