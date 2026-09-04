@@ -100,14 +100,24 @@ class WatchManager:
         self._timer: threading.Timer | None = None
         self._pending_paths: set[str] = set()
         self._full_rescan = False
+        self._config: tuple[tuple[str, ...], tuple[str, ...]] | None = None
 
     def start(self, roots: list[str], excluded_paths: list[str] | None = None) -> None:
+        resolved_roots = tuple(sorted(str(_safe_resolve(Path(path))) for path in roots))
+        resolved_excluded = tuple(
+            sorted(str(_safe_resolve(Path(path))) for path in (excluded_paths or []))
+        )
+        config = (resolved_roots, resolved_excluded)
+
+        if self._observer is not None and self._config == config:
+            return
+
         self.stop()
-        excluded = [_safe_resolve(Path(path)) for path in (excluded_paths or [])]
+        excluded = [Path(path) for path in resolved_excluded]
         observer = Observer()
         handler = _DocSeekEventHandler(self._queue_path, self._queue_rescan, excluded)
         scheduled = 0
-        for root in roots:
+        for root in resolved_roots:
             path = Path(root)
             if not path.exists() or not path.is_dir():
                 continue
@@ -120,10 +130,12 @@ class WatchManager:
             observer.daemon = True
             observer.start()
             self._observer = observer
+            self._config = config
 
     def stop(self) -> None:
         observer = self._observer
         self._observer = None
+        self._config = None
         if observer is not None:
             observer.stop()
             observer.join(timeout=2)
