@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Iterable
 
 from .chunks import DocumentChunk
+from .schema import ensure_schema_compatible, mark_schema_current
 
 
 _CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
@@ -52,6 +53,7 @@ class ChunkStore:
 
     def _init_schema(self) -> None:
         with self.connect() as conn:
+            ensure_schema_compatible(conn)
             conn.executescript(
                 """
                 CREATE VIRTUAL TABLE IF NOT EXISTS chunk_fts USING fts5(
@@ -90,6 +92,7 @@ class ChunkStore:
                 self._trigram_available = True
             except sqlite3.OperationalError:
                 self._trigram_available = False
+            mark_schema_current(conn)
 
     @staticmethod
     def _cjk_bigrams(text: str) -> str:
