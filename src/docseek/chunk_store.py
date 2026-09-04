@@ -220,16 +220,32 @@ class ChunkStore:
             snippet_expr = f"snippet({table}, 4, '[[HIT]]', '[[/HIT]]', ' … ', 36)"
             score_expr = f"bm25({table}, 0.0, 0.0, 0.0, 5.0, 1.0)"
 
-        clauses = [f"{table} MATCH ?"]
-        params: list[object] = [fts_query]
+        clauses = [f"{table} MATCH :fts_query"]
+        params: dict[str, object] = {
+            "fts_query": fts_query,
+            "raw_query": query,
+            "limit": max(1, limit),
+            "offset": max(0, offset),
+        }
         if extension:
-            clauses.append("f.extension = ?")
-            params.append(extension)
+            clauses.append("f.extension = :extension")
+            params["extension"] = extension
         if path_contains:
-            clauses.append("LOWER(f.path) LIKE ?")
-            params.append(f"%{path_contains.casefold()}%")
+            clauses.append("LOWER(f.path) LIKE :path_contains")
+            params["path_contains"] = f"%{path_contains.casefold()}%"
 
-        params.extend([max(1, limit), max(0, offset)])
+        filename_boost_expr = """
+            CASE
+                WHEN LOWER(SUBSTR(f.filename, 1, LENGTH(f.filename) - LENGTH(f.extension))) = LOWER(:raw_query)
+                    THEN -8.0
+                WHEN LOWER(f.filename) LIKE LOWER(:raw_query) || '%'
+                    THEN -4.0
+                WHEN INSTR(LOWER(f.filename), LOWER(:raw_query)) > 0
+                    THEN -2.0
+                ELSE 0.0
+            END
+        """
+
         sql = f"""
             WITH hits AS (
                 SELECT
@@ -241,7 +257,8 @@ class ChunkStore:
                     CAST({table}.ordinal AS INTEGER) AS ordinal,
                     {table}.location AS location,
                     {snippet_expr} AS snippet,
-                    {score_expr} AS score
+                    {score_expr} AS bm25_score,
+                    {filename_boost_expr} AS filename_boost
                 FROM {table}
                 JOIN files f ON f.path = {table}.path
                 WHERE {' AND '.join(clauses)}
@@ -249,19 +266,20 @@ class ChunkStore:
             ranked AS (
                 SELECT
                     *,
+                    bm25_score + filename_boost AS relevance_score,
                     ROW_NUMBER() OVER (
                         PARTITION BY path
-                        ORDER BY score ASC, ordinal ASC
+                        ORDER BY bm25_score + filename_boost ASC, ordinal ASC
                     ) AS file_rank
                 FROM hits
             )
             SELECT
                 path, filename, extension, modified_time, size,
-                location, snippet, score
+                location, snippet, relevance_score AS score
             FROM ranked
             WHERE file_rank = 1
-            ORDER BY score ASC, modified_time DESC, path ASC
-            LIMIT ? OFFSET ?
+            ORDER BY relevance_score ASC, modified_time DESC, path ASC
+            LIMIT :limit OFFSET :offset
         """
         with self.connect() as conn:
             rows = conn.execute(sql, params).fetchall()
