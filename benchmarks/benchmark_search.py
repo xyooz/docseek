@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import statistics
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -18,6 +19,14 @@ DEFAULT_QUERIES = [
     "身份证有效期",
     "customer manager",
 ]
+
+
+def _database_bytes(db_path: Path) -> int:
+    total = 0
+    for candidate in (db_path, Path(f"{db_path}-wal"), Path(f"{db_path}-shm")):
+        if candidate.exists():
+            total += candidate.stat().st_size
+    return total
 
 
 def build_synthetic_index(db_path: Path, *, files: int, chunks_per_file: int) -> tuple[float, int]:
@@ -49,7 +58,7 @@ def build_synthetic_index(db_path: Path, *, files: int, chunks_per_file: int) ->
             chunks=chunks,
         )
     elapsed = time.perf_counter() - started
-    return elapsed, db_path.stat().st_size
+    return elapsed, _database_bytes(db_path)
 
 
 def benchmark_queries(
@@ -84,6 +93,9 @@ def benchmark_queries(
 
 
 def main() -> None:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
     parser = argparse.ArgumentParser(description="DocSeek synthetic indexing/search benchmark")
     parser.add_argument("--files", type=int, default=1000, help="number of synthetic files")
     parser.add_argument("--chunks", type=int, default=3, help="chunks per file")
@@ -102,8 +114,9 @@ def main() -> None:
     else:
         db_path = args.db.expanduser().resolve()
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        if db_path.exists():
-            db_path.unlink()
+        for candidate in (db_path, Path(f"{db_path}-wal"), Path(f"{db_path}-shm")):
+            if candidate.exists():
+                candidate.unlink()
 
     index_seconds, db_bytes = build_synthetic_index(
         db_path,
