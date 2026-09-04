@@ -21,8 +21,10 @@ jobs:
       - name: Install
         run: python -m pip install -e .
       - name: Compile
-        run: python -m compileall -q src tests
+        run: python -m compileall -q src tests benchmarks
       - name: Smoke import desktop app
         run: python -c "import docseek.app"
+      - name: Benchmark smoke
+        run: python benchmarks/benchmark_search.py --files 20 --chunks 2 --iterations 1 --limit 10
       - name: Test
         run: python -m unittest discover -s tests -v
