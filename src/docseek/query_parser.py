@@ -28,6 +28,20 @@ class ParsedQuery:
     def text(self) -> str:
         return " ".join(self.terms)
 
+    @property
+    def has_filters(self) -> bool:
+        return any(
+            value is not None
+            for value in (
+                self.extension,
+                self.path_contains,
+                self.modified_after,
+                self.modified_before,
+                self.min_size,
+                self.max_size,
+            )
+        )
+
 
 def _split_tokens(raw: str) -> list[str]:
     """Split search text while preserving Windows backslashes and quoted spaces."""
@@ -85,6 +99,7 @@ def parse_query(raw: str) -> ParsedQuery:
     - ``size:>10MB`` / ``size:<=500KB``
     - quoted phrases such as ``"客户经理"``
 
+    Filters may be used without any keyword, allowing metadata-only browsing.
     Unknown or malformed ``key:value`` tokens remain normal search text so the
     search box never becomes fragile just because a filter was mistyped.
     """
