@@ -112,7 +112,8 @@ class ChunkStore:
         size: int,
         chunks: Iterable[DocumentChunk],
     ) -> int:
-        chunk_rows = list(chunks)
+        count = 0
+        filename_bigrams = self._cjk_bigrams(filename)
         with self.connect() as conn:
             conn.execute(
                 """
@@ -128,7 +129,7 @@ class ChunkStore:
                 (path, filename, extension, modified_time, size),
             )
             self._delete_chunks(conn, path)
-            for chunk in chunk_rows:
+            for chunk in chunks:
                 values = (path, chunk.ordinal, chunk.location, filename, chunk.content)
                 conn.execute(
                     "INSERT INTO chunk_fts(path, ordinal, location, filename, content) VALUES (?, ?, ?, ?, ?)",
@@ -140,7 +141,7 @@ class ChunkStore:
                         path,
                         chunk.ordinal,
                         chunk.location,
-                        self._cjk_bigrams(filename),
+                        filename_bigrams,
                         self._cjk_bigrams(chunk.content),
                     ),
                 )
@@ -149,7 +150,8 @@ class ChunkStore:
                         "INSERT INTO chunk_fts_tri(path, ordinal, location, filename, content) VALUES (?, ?, ?, ?, ?)",
                         values,
                     )
-        return len(chunk_rows)
+                count += 1
+        return count
 
     def remove_document(self, path: str) -> None:
         with self.connect() as conn:
@@ -227,8 +229,6 @@ class ChunkStore:
             clauses.append("LOWER(f.path) LIKE ?")
             params.append(f"%{path_contains.casefold()}%")
 
-        # Fetch more chunk hits than requested, then collapse to one best hit per file.
-        # This keeps the UI file-oriented while preserving precise chunk location.
         fetch_limit = max(limit * 5, 250)
         params.extend([fetch_limit, max(0, offset * 3)])
         sql = f"""
