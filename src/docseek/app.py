@@ -29,9 +29,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .chunk_store import ChunkSearchResult, ChunkStore
 from .indexer import DirectoryIndexer, IndexCancelled, IndexStats
 from .query_parser import parse_query
-from .search_db import SearchDatabase, SearchResult
+from .search_db import SearchDatabase
 from .settings_dialog import IndexSettingsDialog
 from .watcher import WatchManager
 
@@ -78,7 +79,6 @@ class IndexWorker(QRunnable):
             database = SearchDatabase(self.db_path)
             self.indexer = DirectoryIndexer(database)
             total = IndexStats()
-            database.backfill_aux_indexes()
 
             for root in self.roots:
                 if not root.exists() or not root.is_dir():
@@ -103,16 +103,18 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("DocSeek — 本地文档全文检索")
-        self.resize(1240, 790)
+        self.resize(1300, 800)
 
         self.database = SearchDatabase(DB_PATH)
+        self.chunk_store = ChunkStore(DB_PATH)
         self.thread_pool = QThreadPool.globalInstance()
         self.current_worker: IndexWorker | None = None
-        self.current_results: list[SearchResult] = []
+        self.current_results: list[ChunkSearchResult] = []
         self.auto_refresh_pending = False
         self.search_offset = 0
         self.has_more_results = False
         self.loading_more = False
+        self.seen_result_paths: set[str] = set()
 
         self.watch_signals = WatchSignals()
         self.watch_signals.changed.connect(self._queue_live_refresh)
@@ -150,8 +152,10 @@ class MainWindow(QMainWindow):
         self.scope_label = QLabel()
         self.scope_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
 
-        self.results = QTableWidget(0, 5)
-        self.results.setHorizontalHeaderLabels(["文件名", "类型", "大小", "修改时间", "路径"])
+        self.results = QTableWidget(0, 6)
+        self.results.setHorizontalHeaderLabels(
+            ["文件名", "命中位置", "类型", "大小", "修改时间", "路径"]
+        )
         self.results.setSelectionBehavior(QTableWidget.SelectRows)
         self.results.setSelectionMode(QTableWidget.SingleSelection)
         self.results.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -161,20 +165,21 @@ class MainWindow(QMainWindow):
         self.results.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self.results.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
         self.results.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        self.results.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
+        self.results.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        self.results.horizontalHeader().setSectionResizeMode(5, QHeaderView.Stretch)
         self.results.setContextMenuPolicy(Qt.CustomContextMenu)
         self.results.setAlternatingRowColors(True)
 
         self.preview = QTextBrowser()
         self.preview.setOpenExternalLinks(False)
-        self.preview.setPlaceholderText("选择一条结果，这里会显示命中的正文上下文。")
+        self.preview.setPlaceholderText("选择一条结果，这里会显示命中的正文上下文和具体位置。")
 
         splitter = QSplitter(Qt.Horizontal)
         splitter.addWidget(self.results)
         splitter.addWidget(self.preview)
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 2)
-        splitter.setSizes([770, 470])
+        splitter.setSizes([820, 480])
 
         top_bar = QHBoxLayout()
         top_bar.addWidget(self.search_input, 1)
@@ -307,9 +312,10 @@ class MainWindow(QMainWindow):
         self._refresh_scope()
         self._restart_watcher()
         extra = f"，排除 {stats.excluded}" if stats.excluded else ""
+        chunk_info = f"，生成 {stats.chunks} 个内容块" if stats.chunks else ""
         self.statusBar().showMessage(
             f"索引完成：更新 {stats.indexed}，未变化 {stats.unchanged}，"
-            f"删除 {stats.removed}，跳过 {stats.skipped}{extra}",
+            f"删除 {stats.removed}，跳过 {stats.skipped}{chunk_info}{extra}",
             10000,
         )
         self._perform_search()
@@ -351,6 +357,7 @@ class MainWindow(QMainWindow):
         self.search_offset = 0
         self.has_more_results = False
         self.current_results = []
+        self.seen_result_paths.clear()
         self.results.setRowCount(0)
         self.preview.clear()
         self._load_next_page(select_first=True)
@@ -368,7 +375,7 @@ class MainWindow(QMainWindow):
         extension = parsed.extension or self.type_filter.currentData()
         self.loading_more = True
         try:
-            rows = self.database.search(
+            rows = self.chunk_store.search(
                 parsed.text,
                 limit=PAGE_SIZE,
                 offset=self.search_offset,
@@ -381,24 +388,29 @@ class MainWindow(QMainWindow):
         finally:
             self.loading_more = False
 
+        unique_rows = [row for row in rows if row.path not in self.seen_result_paths]
+        for row in unique_rows:
+            self.seen_result_paths.add(row.path)
+
         start_row = len(self.current_results)
-        self.current_results.extend(rows)
+        self.current_results.extend(unique_rows)
         self.results.setRowCount(len(self.current_results))
-        for offset, row in enumerate(rows):
+        for offset, row in enumerate(unique_rows):
             self._populate_result_row(start_row + offset, row)
 
-        self.search_offset += len(rows)
+        self.search_offset += max(len(rows), 1)
         self.has_more_results = len(rows) == PAGE_SIZE
         suffix = " · 向下滚动继续加载" if self.has_more_results else ""
         self.statusBar().showMessage(
-            f"已显示 {len(self.current_results)} 条结果{suffix}"
+            f"已显示 {len(self.current_results)} 个文件{suffix}"
         )
         if select_first and self.current_results:
             self.results.selectRow(0)
 
-    def _populate_result_row(self, row_index: int, row: SearchResult) -> None:
+    def _populate_result_row(self, row_index: int, row: ChunkSearchResult) -> None:
         name_item = QTableWidgetItem(row.filename)
         name_item.setData(Qt.UserRole, row.path)
+        location_item = QTableWidgetItem(row.location)
         ext_item = QTableWidgetItem(row.extension.lstrip(".").upper())
         size_item = QTableWidgetItem(self._human_size(row.size))
         time_item = QTableWidgetItem(
@@ -407,10 +419,11 @@ class MainWindow(QMainWindow):
         path_item = QTableWidgetItem(row.path)
 
         self.results.setItem(row_index, 0, name_item)
-        self.results.setItem(row_index, 1, ext_item)
-        self.results.setItem(row_index, 2, size_item)
-        self.results.setItem(row_index, 3, time_item)
-        self.results.setItem(row_index, 4, path_item)
+        self.results.setItem(row_index, 1, location_item)
+        self.results.setItem(row_index, 2, ext_item)
+        self.results.setItem(row_index, 3, size_item)
+        self.results.setItem(row_index, 4, time_item)
+        self.results.setItem(row_index, 5, path_item)
 
     def _on_results_scroll(self, value: int) -> None:
         scrollbar = self.results.verticalScrollBar()
@@ -428,9 +441,11 @@ class MainWindow(QMainWindow):
         safe_snippet = safe_snippet.replace("[[HIT]]", "<mark>").replace("[[/HIT]]", "</mark>")
         safe_filename = html.escape(row.filename)
         safe_path = html.escape(row.path)
+        safe_location = html.escape(row.location)
         self.preview.setHtml(
             f"<h3>{safe_filename}</h3>"
             f"<p><b>{html.escape(row.extension.lstrip('.').upper())}</b> · {self._human_size(row.size)}</p>"
+            f"<p><b>命中位置：</b>{safe_location}</p>"
             f"<p style='color:#666'>{safe_path}</p><hr>"
             f"<p style='line-height:1.7'>{safe_snippet}</p>"
         )
