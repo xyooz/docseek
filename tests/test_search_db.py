@@ -29,6 +29,18 @@ class SearchDatabaseTests(unittest.TestCase):
         self.assertEqual(rows[0].filename, "guide.docx")
         self.assertEqual(rows[0].extension, ".docx")
 
+    def test_two_character_cjk_search(self) -> None:
+        self.db.upsert_document(
+            path=r"C:\docs\credit.docx",
+            filename="业务手册.docx",
+            extension=".docx",
+            modified_time=100.0,
+            size=1024,
+            content="客户经理办理信贷业务时需要查看客户资料。",
+        )
+        rows = self.db.search("信贷")
+        self.assertEqual([row.filename for row in rows], ["业务手册.docx"])
+
     def test_extension_filter(self) -> None:
         self.db.upsert_document(
             path=r"C:\docs\a.pdf",
@@ -61,6 +73,22 @@ class SearchDatabaseTests(unittest.TestCase):
         self.assertEqual(len(roots), 2)
         self.assertIn(str(root_a.resolve()), roots)
         self.assertIn(str(root_b.resolve()), roots)
+
+    def test_excluded_paths_are_persisted_without_duplicates(self) -> None:
+        excluded = Path(self.temp_dir.name) / "private"
+        excluded.mkdir()
+        self.db.add_excluded_path(str(excluded))
+        self.db.add_excluded_path(str(excluded))
+        self.assertEqual(self.db.get_excluded_paths(), [str(excluded.resolve())])
+        self.db.remove_excluded_path(str(excluded))
+        self.assertEqual(self.db.get_excluded_paths(), [])
+
+    def test_max_file_size_setting_is_bounded(self) -> None:
+        self.assertEqual(self.db.get_max_file_size_mb(), 200)
+        self.db.set_max_file_size_mb(512)
+        self.assertEqual(self.db.get_max_file_size_mb(), 512)
+        self.db.set_max_file_size_mb(99999)
+        self.assertEqual(self.db.get_max_file_size_mb(), 4096)
 
     def test_unchanged_detection(self) -> None:
         path = r"C:\docs\stable.pdf"
