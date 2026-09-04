@@ -11,6 +11,7 @@ from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, QTimer, Signal
 from PySide6.QtGui import QAction, QGuiApplication
 from PySide6.QtWidgets import (
     QApplication,
+    QComboBox,
     QFileDialog,
     QHBoxLayout,
     QHeaderView,
@@ -30,10 +31,21 @@ from PySide6.QtWidgets import (
 
 from .indexer import DirectoryIndexer, IndexCancelled, IndexStats
 from .search_db import SearchDatabase, SearchResult
+from .watcher import WatchManager
 
 
 APP_DIR = Path.home() / ".docseek"
 DB_PATH = APP_DIR / "docseek.db"
+
+
+FILE_FILTERS = [
+    ("全部类型", None),
+    ("PDF", ".pdf"),
+    ("Word", ".docx"),
+    ("Excel", ".xlsx"),
+    ("PowerPoint", ".pptx"),
+    ("文本", ".txt"),
+]
 
 
 class IndexSignals(QObject):
@@ -43,10 +55,14 @@ class IndexSignals(QObject):
     failed = Signal(str)
 
 
+class WatchSignals(QObject):
+    changed = Signal()
+
+
 class IndexWorker(QRunnable):
-    def __init__(self, root: Path, db_path: Path) -> None:
+    def __init__(self, roots: list[Path], db_path: Path) -> None:
         super().__init__()
-        self.root = root
+        self.roots = roots
         self.db_path = db_path
         self.signals = IndexSignals()
         self.indexer: DirectoryIndexer | None = None
@@ -59,12 +75,21 @@ class IndexWorker(QRunnable):
         try:
             database = SearchDatabase(self.db_path)
             self.indexer = DirectoryIndexer(database)
+            total = IndexStats()
 
-            def report(path: Path, stats: IndexStats) -> None:
-                self.signals.progress.emit(str(path), stats.scanned, stats.indexed)
+            for root in self.roots:
+                if not root.exists() or not root.is_dir():
+                    continue
 
-            stats = self.indexer.scan(self.root, on_progress=report)
-            self.signals.finished.emit(stats)
+                def report(path: Path, stats: IndexStats) -> None:
+                    self.signals.progress.emit(
+                        str(path), total.scanned + stats.scanned, total.indexed + stats.indexed
+                    )
+
+                stats = self.indexer.scan(root, on_progress=report)
+                total.merge(stats)
+
+            self.signals.finished.emit(total)
         except IndexCancelled:
             self.signals.cancelled.emit()
         except Exception as exc:
@@ -75,29 +100,42 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("DocSeek — 本地文档全文检索")
-        self.resize(1180, 760)
+        self.resize(1220, 780)
 
         self.database = SearchDatabase(DB_PATH)
         self.thread_pool = QThreadPool.globalInstance()
         self.current_worker: IndexWorker | None = None
         self.current_results: list[SearchResult] = []
+        self.auto_refresh_pending = False
+
+        self.watch_signals = WatchSignals()
+        self.watch_signals.changed.connect(self._queue_live_refresh)
+        self.watch_manager = WatchManager(self.watch_signals.changed.emit)
 
         self.search_input = QLineEdit()
         self.search_input.setClearButtonEnabled(True)
         self.search_input.setPlaceholderText("搜索文件名或正文，例如：客户经理 信贷")
         self.search_input.setMinimumHeight(38)
 
-        self.choose_button = QPushButton("索引目录")
+        self.type_filter = QComboBox()
+        for label, extension in FILE_FILTERS:
+            self.type_filter.addItem(label, extension)
+        self.type_filter.setMinimumHeight(38)
+        self.type_filter.setMinimumWidth(105)
+
+        self.choose_button = QPushButton("添加目录")
         self.choose_button.setMinimumHeight(38)
-        self.cancel_button = QPushButton("停止索引")
+        self.refresh_button = QPushButton("刷新索引")
+        self.refresh_button.setMinimumHeight(38)
+        self.cancel_button = QPushButton("停止")
         self.cancel_button.setMinimumHeight(38)
         self.cancel_button.setVisible(False)
 
         self.scope_label = QLabel()
         self.scope_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
 
-        self.results = QTableWidget(0, 4)
-        self.results.setHorizontalHeaderLabels(["文件名", "类型", "修改时间", "路径"])
+        self.results = QTableWidget(0, 5)
+        self.results.setHorizontalHeaderLabels(["文件名", "类型", "大小", "修改时间", "路径"])
         self.results.setSelectionBehavior(QTableWidget.SelectRows)
         self.results.setSelectionMode(QTableWidget.SingleSelection)
         self.results.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -106,8 +144,10 @@ class MainWindow(QMainWindow):
         self.results.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         self.results.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self.results.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        self.results.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
+        self.results.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.results.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
         self.results.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.results.setAlternatingRowColors(True)
 
         self.preview = QTextBrowser()
         self.preview.setOpenExternalLinks(False)
@@ -118,11 +158,13 @@ class MainWindow(QMainWindow):
         splitter.addWidget(self.preview)
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 2)
-        splitter.setSizes([720, 460])
+        splitter.setSizes([760, 460])
 
         top_bar = QHBoxLayout()
         top_bar.addWidget(self.search_input, 1)
+        top_bar.addWidget(self.type_filter)
         top_bar.addWidget(self.choose_button)
+        top_bar.addWidget(self.refresh_button)
         top_bar.addWidget(self.cancel_button)
 
         layout = QVBoxLayout()
@@ -139,12 +181,19 @@ class MainWindow(QMainWindow):
 
         self.search_timer = QTimer(self)
         self.search_timer.setSingleShot(True)
-        self.search_timer.setInterval(220)
+        self.search_timer.setInterval(180)
         self.search_timer.timeout.connect(self._perform_search)
+
+        self.live_refresh_timer = QTimer(self)
+        self.live_refresh_timer.setSingleShot(True)
+        self.live_refresh_timer.setInterval(1200)
+        self.live_refresh_timer.timeout.connect(self._run_live_refresh)
 
         self.search_input.textChanged.connect(self.search_timer.start)
         self.search_input.returnPressed.connect(self._perform_search)
+        self.type_filter.currentIndexChanged.connect(self._perform_search)
         self.choose_button.clicked.connect(self._choose_directory)
+        self.refresh_button.clicked.connect(self._refresh_all_roots)
         self.cancel_button.clicked.connect(self._cancel_index)
         self.results.cellDoubleClicked.connect(lambda _row, _column: self._open_selected())
         self.results.itemSelectionChanged.connect(self._show_preview)
@@ -160,24 +209,52 @@ class MainWindow(QMainWindow):
         reveal_action.triggered.connect(self._reveal_selected)
         self.addAction(reveal_action)
 
+        focus_action = QAction("聚焦搜索框", self)
+        focus_action.setShortcut("Ctrl+L")
+        focus_action.triggered.connect(self.search_input.setFocus)
+        self.addAction(focus_action)
+
         self._refresh_scope()
         self._refresh_status()
+        self._restart_watcher()
         self.search_input.setFocus()
+
+    def closeEvent(self, event) -> None:  # noqa: N802
+        self.watch_manager.stop()
+        super().closeEvent(event)
 
     def _choose_directory(self) -> None:
         initial = self.database.get_index_root() or str(Path.home())
         selected = QFileDialog.getExistingDirectory(self, "选择需要索引的目录", initial)
         if not selected:
             return
+        self._start_index([Path(selected)])
+
+    def _refresh_all_roots(self) -> None:
+        roots = [Path(root) for root in self.database.get_index_roots()]
+        if not roots:
+            self.statusBar().showMessage("请先添加一个索引目录", 5000)
+            return
+        self._start_index(roots)
+
+    def _start_index(self, roots: list[Path], *, automatic: bool = False) -> None:
+        if self.current_worker is not None:
+            if automatic:
+                self.auto_refresh_pending = True
+            return
 
         self.choose_button.setEnabled(False)
-        self.cancel_button.setVisible(True)
-        self.current_worker = IndexWorker(Path(selected), DB_PATH)
+        self.refresh_button.setEnabled(False)
+        self.cancel_button.setVisible(not automatic)
+        self.current_worker = IndexWorker(roots, DB_PATH)
         self.current_worker.signals.progress.connect(self._index_progress)
         self.current_worker.signals.finished.connect(self._index_finished)
         self.current_worker.signals.cancelled.connect(self._index_cancelled)
         self.current_worker.signals.failed.connect(self._index_failed)
         self.thread_pool.start(self.current_worker)
+
+        if automatic:
+            self.statusBar().showMessage("检测到文件变化，正在后台更新索引…")
 
     def _cancel_index(self) -> None:
         if self.current_worker:
@@ -193,12 +270,16 @@ class MainWindow(QMainWindow):
     def _index_finished(self, stats: IndexStats) -> None:
         self._finish_index_ui()
         self._refresh_scope()
+        self._restart_watcher()
         self.statusBar().showMessage(
             f"索引完成：更新 {stats.indexed}，未变化 {stats.unchanged}，"
             f"删除 {stats.removed}，跳过 {stats.skipped}",
-            12000,
+            10000,
         )
         self._perform_search()
+        if self.auto_refresh_pending:
+            self.auto_refresh_pending = False
+            self._queue_live_refresh()
 
     def _index_cancelled(self) -> None:
         self._finish_index_ui()
@@ -210,9 +291,21 @@ class MainWindow(QMainWindow):
 
     def _finish_index_ui(self) -> None:
         self.choose_button.setEnabled(True)
+        self.refresh_button.setEnabled(True)
         self.cancel_button.setVisible(False)
         self.current_worker = None
         self._refresh_status()
+
+    def _queue_live_refresh(self) -> None:
+        self.live_refresh_timer.start()
+
+    def _run_live_refresh(self) -> None:
+        roots = [Path(root) for root in self.database.get_index_roots()]
+        if roots:
+            self._start_index(roots, automatic=True)
+
+    def _restart_watcher(self) -> None:
+        self.watch_manager.start(self.database.get_index_roots())
 
     def _perform_search(self) -> None:
         query = self.search_input.text().strip()
@@ -223,8 +316,9 @@ class MainWindow(QMainWindow):
             self._refresh_status()
             return
 
+        extension = self.type_filter.currentData()
         try:
-            rows = self.database.search(query, limit=150)
+            rows = self.database.search(query, limit=150, extension=extension)
         except Exception as exc:
             self.statusBar().showMessage(f"搜索失败：{exc}", 8000)
             return
@@ -235,6 +329,7 @@ class MainWindow(QMainWindow):
             name_item = QTableWidgetItem(row.filename)
             name_item.setData(Qt.UserRole, row.path)
             ext_item = QTableWidgetItem(row.extension.lstrip(".").upper())
+            size_item = QTableWidgetItem(self._human_size(row.size))
             time_item = QTableWidgetItem(
                 datetime.fromtimestamp(row.modified_time).strftime("%Y-%m-%d %H:%M")
             )
@@ -242,8 +337,9 @@ class MainWindow(QMainWindow):
 
             self.results.setItem(row_index, 0, name_item)
             self.results.setItem(row_index, 1, ext_item)
-            self.results.setItem(row_index, 2, time_item)
-            self.results.setItem(row_index, 3, path_item)
+            self.results.setItem(row_index, 2, size_item)
+            self.results.setItem(row_index, 3, time_item)
+            self.results.setItem(row_index, 4, path_item)
 
         self.statusBar().showMessage(f"找到 {len(rows)} 条结果（最多显示 150 条）")
         if rows:
@@ -258,12 +354,11 @@ class MainWindow(QMainWindow):
         row = self.current_results[row_index]
         safe_snippet = html.escape(row.snippet)
         safe_snippet = safe_snippet.replace("[[HIT]]", "<mark>").replace("[[/HIT]]", "</mark>")
-        size = self._human_size(row.size)
         safe_filename = html.escape(row.filename)
         safe_path = html.escape(row.path)
         self.preview.setHtml(
             f"<h3>{safe_filename}</h3>"
-            f"<p><b>{html.escape(row.extension.lstrip('.').upper())}</b> · {size}</p>"
+            f"<p><b>{html.escape(row.extension.lstrip('.').upper())}</b> · {self._human_size(row.size)}</p>"
             f"<p style='color:#666'>{safe_path}</p><hr>"
             f"<p style='line-height:1.7'>{safe_snippet}</p>"
         )
@@ -310,10 +405,17 @@ class MainWindow(QMainWindow):
         menu.exec(self.results.viewport().mapToGlobal(point))
 
     def _refresh_scope(self) -> None:
-        root = self.database.get_index_root()
+        roots = self.database.get_index_roots()
+        if not roots:
+            self.scope_label.setText("尚未建立索引，请先添加一个工作目录")
+            return
+        if len(roots) == 1:
+            self.scope_label.setText(f"搜索范围：{roots[0]}  ·  自动监测变化")
+            return
         self.scope_label.setText(
-            f"搜索范围：{root}" if root else "尚未建立索引，请先选择一个工作目录"
+            f"搜索范围：{len(roots)} 个目录  ·  自动监测变化  ·  最近添加：{roots[-1]}"
         )
+        self.scope_label.setToolTip("\n".join(roots))
 
     def _refresh_status(self) -> None:
         count = self.database.count_files()
