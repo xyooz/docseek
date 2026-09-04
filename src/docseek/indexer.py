@@ -54,6 +54,10 @@ class DirectoryIndexer:
         excluded_paths: list[str] | None = None,
     ) -> None:
         self.database = database
+        # Schema upgrades may introduce new auxiliary indexes. Rebuild them from
+        # already stored FTS text here, on the worker thread, without reopening
+        # Word/PDF/Excel files or blocking the UI thread.
+        self.database.backfill_aux_indexes()
         if max_file_size is None:
             max_file_size = database.get_max_file_size_mb() * 1024 * 1024
         self.max_file_size = max_file_size
