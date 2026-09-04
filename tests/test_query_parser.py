@@ -12,12 +12,22 @@ class QueryParserTests(unittest.TestCase):
         self.assertEqual(parsed.terms, ("客户经理", "信贷"))
         self.assertIsNone(parsed.extension)
         self.assertIsNone(parsed.path_contains)
+        self.assertFalse(parsed.has_filters)
 
     def test_extension_and_path_filters(self) -> None:
         parsed = parse_query('信贷 ext:PDF path:"业务 制度"')
         self.assertEqual(parsed.terms, ("信贷",))
         self.assertEqual(parsed.extension, ".pdf")
         self.assertEqual(parsed.path_contains, "业务 制度")
+        self.assertTrue(parsed.has_filters)
+
+    def test_pure_filter_query_has_no_terms_but_is_searchable(self) -> None:
+        parsed = parse_query("ext:pdf after:2026-01-01 size:>10MB")
+        self.assertEqual(parsed.terms, ())
+        self.assertTrue(parsed.has_filters)
+        self.assertEqual(parsed.extension, ".pdf")
+        self.assertIsNotNone(parsed.modified_after)
+        self.assertEqual(parsed.min_size, 10 * 1024 * 1024 + 1)
 
     def test_windows_backslashes_are_preserved(self) -> None:
         parsed = parse_query(r'信贷 path:"D:\工作资料\业务 制度"')
