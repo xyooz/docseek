@@ -34,6 +34,12 @@ class ChunkSearchResult:
     score: float
 
 
+@dataclass(slots=True)
+class SearchPage:
+    items: list[ChunkSearchResult]
+    total_count: int
+
+
 class ChunkStore:
     """Location-aware FTS index with one file split into multiple bounded chunks."""
 
@@ -226,7 +232,7 @@ class ChunkStore:
             clauses.append("f.size <= :max_size")
             params["max_size"] = max(0, int(max_size))
 
-    def browse(
+    def browse_page(
         self,
         *,
         limit: int = 100,
@@ -237,7 +243,7 @@ class ChunkStore:
         modified_before: float | None = None,
         min_size: int | None = None,
         max_size: int | None = None,
-    ) -> list[ChunkSearchResult]:
+    ) -> SearchPage:
         clauses: list[str] = []
         params: dict[str, object] = {
             "limit": max(1, int(limit)),
@@ -257,7 +263,8 @@ class ChunkStore:
         sql = f"""
             SELECT
                 f.path, f.filename, f.extension, f.modified_time, f.size,
-                '' AS location, '' AS snippet, 0.0 AS score
+                '' AS location, '' AS snippet, 0.0 AS score,
+                COUNT(*) OVER() AS total_count
             FROM files f
             {where}
             ORDER BY f.modified_time DESC, LOWER(f.filename) ASC, f.path ASC
@@ -265,7 +272,13 @@ class ChunkStore:
         """
         with self.connect() as conn:
             rows = conn.execute(sql, params).fetchall()
-        return [
+            total_count = int(rows[0]["total_count"]) if rows else 0
+            if not rows and int(params["offset"]) > 0:
+                count_sql = f"SELECT COUNT(*) AS n FROM files f {where}"
+                count_params = {key: value for key, value in params.items() if key not in {"limit", "offset"}}
+                total_count = int(conn.execute(count_sql, count_params).fetchone()["n"])
+
+        items = [
             ChunkSearchResult(
                 path=str(row["path"]),
                 filename=str(row["filename"]),
@@ -278,8 +291,32 @@ class ChunkStore:
             )
             for row in rows
         ]
+        return SearchPage(items=items, total_count=total_count)
 
-    def search(
+    def browse(
+        self,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+        extension: str | None = None,
+        path_contains: str | None = None,
+        modified_after: float | None = None,
+        modified_before: float | None = None,
+        min_size: int | None = None,
+        max_size: int | None = None,
+    ) -> list[ChunkSearchResult]:
+        return self.browse_page(
+            limit=limit,
+            offset=offset,
+            extension=extension,
+            path_contains=path_contains,
+            modified_after=modified_after,
+            modified_before=modified_before,
+            min_size=min_size,
+            max_size=max_size,
+        ).items
+
+    def search_page(
         self,
         query: str,
         *,
@@ -291,10 +328,10 @@ class ChunkStore:
         modified_before: float | None = None,
         min_size: int | None = None,
         max_size: int | None = None,
-    ) -> list[ChunkSearchResult]:
+    ) -> SearchPage:
         query = query.strip()
         if not query:
-            return self.browse(
+            return self.browse_page(
                 limit=limit,
                 offset=offset,
                 extension=extension,
@@ -376,19 +413,52 @@ class ChunkStore:
                         ORDER BY bm25_score + filename_boost ASC, ordinal ASC
                     ) AS file_rank
                 FROM hits
+            ),
+            file_hits AS (
+                SELECT
+                    path, filename, extension, modified_time, size,
+                    location, snippet, relevance_score
+                FROM ranked
+                WHERE file_rank = 1
             )
             SELECT
                 path, filename, extension, modified_time, size,
-                location, snippet, relevance_score AS score
-            FROM ranked
-            WHERE file_rank = 1
+                location, snippet, relevance_score AS score,
+                COUNT(*) OVER() AS total_count
+            FROM file_hits
             ORDER BY relevance_score ASC, modified_time DESC, path ASC
             LIMIT :limit OFFSET :offset
         """
         with self.connect() as conn:
             rows = conn.execute(sql, params).fetchall()
+            total_count = int(rows[0]["total_count"]) if rows else 0
+            if not rows and int(params["offset"]) > 0:
+                count_sql = f"""
+                    WITH hits AS (
+                        SELECT
+                            f.path,
+                            CAST({table}.ordinal AS INTEGER) AS ordinal,
+                            {score_expr} AS bm25_score,
+                            {filename_boost_expr} AS filename_boost
+                        FROM {table}
+                        JOIN files f ON f.path = {table}.path
+                        WHERE {' AND '.join(clauses)}
+                    ),
+                    ranked AS (
+                        SELECT
+                            path,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY path
+                                ORDER BY bm25_score + filename_boost ASC, ordinal ASC
+                            ) AS file_rank
+                        FROM hits
+                    )
+                    SELECT COUNT(*) AS n FROM ranked WHERE file_rank = 1
+                """
+                count_params = {key: value for key, value in params.items() if key not in {"limit", "offset"}}
+                total_count = int(conn.execute(count_sql, count_params).fetchone()["n"])
 
-        results: list[ChunkSearchResult] = []
+        items: list[ChunkSearchResult] = []
         for row in rows:
             snippet = str(row["snippet"] or "")
             if is_short_cjk:
@@ -397,7 +467,7 @@ class ChunkStore:
                     str(row["location"]),
                     query,
                 )
-            results.append(
+            items.append(
                 ChunkSearchResult(
                     path=str(row["path"]),
                     filename=str(row["filename"]),
@@ -409,7 +479,32 @@ class ChunkStore:
                     score=float(row["score"]),
                 )
             )
-        return results
+        return SearchPage(items=items, total_count=total_count)
+
+    def search(
+        self,
+        query: str,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+        extension: str | None = None,
+        path_contains: str | None = None,
+        modified_after: float | None = None,
+        modified_before: float | None = None,
+        min_size: int | None = None,
+        max_size: int | None = None,
+    ) -> list[ChunkSearchResult]:
+        return self.search_page(
+            query,
+            limit=limit,
+            offset=offset,
+            extension=extension,
+            path_contains=path_contains,
+            modified_after=modified_after,
+            modified_before=modified_before,
+            min_size=min_size,
+            max_size=max_size,
+        ).items
 
     def _plain_chunk_snippet(self, path: str, location: str, query: str, radius: int = 52) -> str:
         with self.connect() as conn:
