@@ -74,6 +74,13 @@ class DirectoryIndexer:
     def cancel(self) -> None:
         self._cancel.set()
 
+    @staticmethod
+    def _normalize(path: Path) -> str:
+        try:
+            return str(path.resolve())
+        except OSError:
+            return str(path.absolute())
+
     def _has_chunk_index(self, path: str) -> bool:
         with self.chunk_store.connect() as conn:
             row = conn.execute(
@@ -81,6 +88,16 @@ class DirectoryIndexer:
                 (path,),
             ).fetchone()
         return row is not None
+
+    def _has_file_record(self, path: str) -> bool:
+        with self.chunk_store.connect() as conn:
+            row = conn.execute("SELECT 1 FROM files WHERE path = ? LIMIT 1", (path,)).fetchone()
+        return row is not None
+
+    def _remove_indexed_path(self, path: str, stats: IndexStats) -> None:
+        if self._has_file_record(path):
+            self.chunk_store.remove_document(path)
+            stats.removed += 1
 
     @staticmethod
     def _error_code(exc: Exception) -> str:
@@ -91,6 +108,117 @@ class DirectoryIndexer:
         if isinstance(exc, OSError):
             return "os_error"
         return type(exc).__name__
+
+    @staticmethod
+    def _is_supported_candidate(path: Path) -> bool:
+        name = path.name
+        return (
+            not name.startswith("~$")
+            and not name.endswith(".tmp")
+            and path.suffix.lower() in SUPPORTED_EXTENSIONS
+        )
+
+    def _index_existing_file(
+        self,
+        path: Path,
+        normalized: str,
+        stats: IndexStats,
+        *,
+        on_progress: Callable[[Path, IndexStats], None] | None = None,
+    ) -> None:
+        stat = path.stat()
+        if stat.st_size > self.max_file_size:
+            self._remove_indexed_path(normalized, stats)
+            stats.skipped += 1
+            actual_mb = stat.st_size / (1024 * 1024)
+            limit_mb = self.max_file_size / (1024 * 1024)
+            self.issues.record(
+                normalized,
+                "file_too_large",
+                f"文件大小 {actual_mb:.1f} MB，当前索引上限 {limit_mb:.0f} MB",
+            )
+            return
+
+        unchanged = self.database.is_unchanged(
+            normalized,
+            modified_time=stat.st_mtime,
+            size=stat.st_size,
+        )
+        if unchanged and self._has_chunk_index(normalized):
+            self.issues.clear(normalized)
+            stats.unchanged += 1
+            return
+
+        if on_progress:
+            on_progress(path, stats)
+
+        chunk_count = self.chunk_store.replace_document(
+            path=normalized,
+            filename=path.name,
+            extension=path.suffix.lower(),
+            modified_time=stat.st_mtime,
+            size=stat.st_size,
+            chunks=iter_document_chunks(path),
+        )
+        self.issues.clear(normalized)
+        stats.indexed += 1
+        stats.chunks += chunk_count
+
+    def update_paths(
+        self,
+        paths: Iterable[Path],
+        *,
+        on_progress: Callable[[Path, IndexStats], None] | None = None,
+    ) -> IndexStats:
+        """Update only the changed filesystem paths reported by the watcher."""
+        stats = IndexStats()
+        processed: set[str] = set()
+
+        for path in paths:
+            if self._cancel.is_set():
+                raise IndexCancelled()
+
+            normalized = self._normalize(path)
+            if normalized in processed:
+                continue
+            processed.add(normalized)
+            stats.scanned += 1
+
+            try:
+                if self._is_excluded(path):
+                    self._remove_indexed_path(normalized, stats)
+                    self.issues.clear(normalized)
+                    stats.excluded += 1
+                    continue
+
+                if not self._is_supported_candidate(path):
+                    self._remove_indexed_path(normalized, stats)
+                    self.issues.clear(normalized)
+                    continue
+
+                try:
+                    path.stat()
+                except FileNotFoundError:
+                    self._remove_indexed_path(normalized, stats)
+                    self.issues.clear(normalized)
+                    continue
+
+                self._index_existing_file(
+                    path,
+                    normalized,
+                    stats,
+                    on_progress=on_progress,
+                )
+            except IndexCancelled:
+                raise
+            except FileNotFoundError:
+                self._remove_indexed_path(normalized, stats)
+                self.issues.clear(normalized)
+            except Exception as exc:
+                stats.skipped += 1
+                self.issues.record(normalized, self._error_code(exc), str(exc))
+
+        return stats
 
     def scan(
         self,
@@ -107,63 +235,34 @@ class DirectoryIndexer:
                 raise IndexCancelled()
 
             stats.scanned += 1
-            normalized = str(path.resolve())
+            normalized = self._normalize(path)
             seen_paths.add(normalized)
 
             try:
-                stat = path.stat()
-                if stat.st_size > self.max_file_size:
-                    stats.skipped += 1
-                    actual_mb = stat.st_size / (1024 * 1024)
-                    limit_mb = self.max_file_size / (1024 * 1024)
-                    self.issues.record(
-                        normalized,
-                        "file_too_large",
-                        f"文件大小 {actual_mb:.1f} MB，当前索引上限 {limit_mb:.0f} MB",
-                    )
-                    continue
-
-                unchanged = self.database.is_unchanged(
+                self._index_existing_file(
+                    path,
                     normalized,
-                    modified_time=stat.st_mtime,
-                    size=stat.st_size,
+                    stats,
+                    on_progress=on_progress,
                 )
-                # Existing pre-chunk databases must be migrated even when the
-                # source file itself has not changed.
-                if unchanged and self._has_chunk_index(normalized):
-                    self.issues.clear(normalized)
-                    stats.unchanged += 1
-                    if on_progress and stats.scanned % 250 == 0:
-                        on_progress(path, stats)
-                    continue
-
-                if on_progress:
+                if on_progress and stats.scanned % 250 == 0:
                     on_progress(path, stats)
-
-                chunk_count = self.chunk_store.replace_document(
-                    path=normalized,
-                    filename=path.name,
-                    extension=path.suffix.lower(),
-                    modified_time=stat.st_mtime,
-                    size=stat.st_size,
-                    chunks=iter_document_chunks(path),
-                )
-                self.issues.clear(normalized)
-                stats.indexed += 1
-                stats.chunks += chunk_count
             except IndexCancelled:
                 raise
             except Exception as exc:
                 stats.skipped += 1
                 self.issues.record(normalized, self._error_code(exc), str(exc))
 
-        stats.removed = self.chunk_store.remove_missing_under_root(str(root), seen_paths)
+        stats.removed += self.chunk_store.remove_missing_under_root(str(root), seen_paths)
         self.issues.clear_under_root_if_missing(str(root), seen_paths)
         self.database.add_index_root(str(root))
         return stats
 
     def _is_excluded(self, path: Path) -> bool:
-        resolved = path.resolve()
+        try:
+            resolved = path.resolve()
+        except OSError:
+            resolved = path.absolute()
         for excluded in self.excluded_paths:
             if resolved == excluded:
                 return True
@@ -180,7 +279,7 @@ class DirectoryIndexer:
             if self._cancel.is_set():
                 raise IndexCancelled()
             directory = stack.pop()
-            normalized_dir = str(directory.resolve())
+            normalized_dir = self._normalize(directory)
             try:
                 if self._is_excluded(directory):
                     self.issues.clear(normalized_dir)
@@ -198,7 +297,7 @@ class DirectoryIndexer:
                     raise IndexCancelled()
                 try:
                     if self._is_excluded(path):
-                        self.issues.clear(str(path.resolve()))
+                        self.issues.clear(self._normalize(path))
                         stats.excluded += 1
                         continue
                     if path.is_dir():
@@ -207,16 +306,10 @@ class DirectoryIndexer:
                         continue
                     if not path.is_file():
                         continue
-                    name = path.name
-                    if name.startswith("~$") or name.endswith(".tmp"):
-                        continue
-                    if path.suffix.lower() in SUPPORTED_EXTENSIONS:
+                    if self._is_supported_candidate(path):
                         yield path
                 except OSError as exc:
                     stats.skipped += 1
-                    try:
-                        issue_path = str(path.resolve())
-                    except OSError:
-                        issue_path = str(path)
+                    issue_path = self._normalize(path)
                     self.issues.record(issue_path, self._error_code(exc), str(exc))
                     continue
