@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import fitz
+import pymupdf
 from docx import Document
 from openpyxl import load_workbook
 from pptx import Presentation
@@ -83,7 +83,7 @@ def _extract_pptx(path: Path) -> str:
 
 def _extract_pdf(path: Path) -> str:
     chunks: list[str] = []
-    with fitz.open(path) as document:
+    with pymupdf.open(path) as document:
         for page_no, page in enumerate(document, start=1):
             text = page.get_text("text")
             if text:
