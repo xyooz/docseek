@@ -429,7 +429,7 @@ class MainWindow(QMainWindow):
 
         self.loading_more = True
         try:
-            rows = self.chunk_store.search(
+            page = self.chunk_store.search_page(
                 parsed.text,
                 limit=PAGE_SIZE,
                 offset=self.search_offset,
@@ -440,6 +440,7 @@ class MainWindow(QMainWindow):
                 min_size=parsed.min_size,
                 max_size=parsed.max_size,
             )
+            rows = page.items
         except Exception as exc:
             self.statusBar().showMessage(f"搜索失败：{exc}", 8000)
             return
@@ -457,11 +458,11 @@ class MainWindow(QMainWindow):
             self._populate_result_row(start_row + offset, row)
 
         self.search_offset += len(rows)
-        self.has_more_results = len(rows) == PAGE_SIZE
+        self.has_more_results = self.search_offset < page.total_count
         suffix = " · 向下滚动继续加载" if self.has_more_results else ""
         mode = "筛选结果" if not parsed.terms else "搜索结果"
         self.statusBar().showMessage(
-            f"{mode}：已显示 {len(self.current_results)} 个文件{suffix}"
+            f"{mode}：已显示 {len(self.current_results):,} / 共 {page.total_count:,} 个文件{suffix}"
         )
         if select_first and self.current_results:
             self.results.selectRow(0)
