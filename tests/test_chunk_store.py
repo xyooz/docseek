@@ -96,6 +96,23 @@ class ChunkStoreTests(unittest.TestCase):
         self.assertEqual(len(paths), 12)
         self.assertEqual(len(set(paths)), 12)
 
+    def test_exact_filename_stem_ranks_above_body_only_match(self) -> None:
+        self._insert_sample(
+            path=r"C:\docs\credit_manual.pdf",
+            filename="信贷.pdf",
+            extension=".pdf",
+            chunks=[DocumentChunk(0, "第 1 页", "普通业务说明")],
+        )
+        self._insert_sample(
+            path=r"C:\docs\other.pdf",
+            filename="其他制度.pdf",
+            extension=".pdf",
+            chunks=[DocumentChunk(0, "第 1 页", "信贷 信贷 信贷 信贷 信贷")],
+        )
+
+        rows = self.store.search("信贷")
+        self.assertEqual(rows[0].filename, "信贷.pdf")
+
 
 if __name__ == "__main__":
     unittest.main()
