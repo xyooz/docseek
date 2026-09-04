@@ -61,6 +61,42 @@ class SearchDatabaseTests(unittest.TestCase):
         rows = self.db.search("客户服务", extension=".pdf")
         self.assertEqual([row.filename for row in rows], ["a.pdf"])
 
+    def test_path_filter(self) -> None:
+        self.db.upsert_document(
+            path=r"C:\制度\信贷\a.pdf",
+            filename="a.pdf",
+            extension=".pdf",
+            modified_time=100.0,
+            size=10,
+            content="客户服务操作指引",
+        )
+        self.db.upsert_document(
+            path=r"C:\培训\b.pdf",
+            filename="b.pdf",
+            extension=".pdf",
+            modified_time=90.0,
+            size=10,
+            content="客户服务操作指引",
+        )
+        rows = self.db.search("客户服务", path_contains="制度")
+        self.assertEqual([row.filename for row in rows], ["a.pdf"])
+
+    def test_paged_search_does_not_repeat_rows(self) -> None:
+        for index in range(5):
+            self.db.upsert_document(
+                path=fr"C:\docs\{index}.txt",
+                filename=f"{index}.txt",
+                extension=".txt",
+                modified_time=float(100 - index),
+                size=10,
+                content="统一测试关键词",
+            )
+        first = self.db.search("统一测试关键词", limit=2, offset=0)
+        second = self.db.search("统一测试关键词", limit=2, offset=2)
+        self.assertEqual(len(first), 2)
+        self.assertEqual(len(second), 2)
+        self.assertTrue({row.path for row in first}.isdisjoint({row.path for row in second}))
+
     def test_multiple_roots_are_persisted_without_duplicates(self) -> None:
         root_a = Path(self.temp_dir.name) / "A"
         root_b = Path(self.temp_dir.name) / "B"
