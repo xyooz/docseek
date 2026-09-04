@@ -200,6 +200,10 @@ class ChunkStore:
         offset: int = 0,
         extension: str | None = None,
         path_contains: str | None = None,
+        modified_after: float | None = None,
+        modified_before: float | None = None,
+        min_size: int | None = None,
+        max_size: int | None = None,
     ) -> list[ChunkSearchResult]:
         query = query.strip()
         if not query:
@@ -233,6 +237,18 @@ class ChunkStore:
         if path_contains:
             clauses.append("LOWER(f.path) LIKE :path_contains")
             params["path_contains"] = f"%{path_contains.casefold()}%"
+        if modified_after is not None:
+            clauses.append("f.modified_time >= :modified_after")
+            params["modified_after"] = float(modified_after)
+        if modified_before is not None:
+            clauses.append("f.modified_time < :modified_before")
+            params["modified_before"] = float(modified_before)
+        if min_size is not None:
+            clauses.append("f.size >= :min_size")
+            params["min_size"] = max(0, int(min_size))
+        if max_size is not None:
+            clauses.append("f.size <= :max_size")
+            params["max_size"] = max(0, int(max_size))
 
         filename_boost_expr = """
             CASE
