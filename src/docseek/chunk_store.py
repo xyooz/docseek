@@ -192,6 +192,90 @@ class ChunkStore:
     def _cjk_only(query: str) -> str:
         return "".join(ch for ch in query if _CJK_RE.match(ch))
 
+    @staticmethod
+    def _append_metadata_filters(
+        clauses: list[str],
+        params: dict[str, object],
+        *,
+        extension: str | None,
+        path_contains: str | None,
+        modified_after: float | None,
+        modified_before: float | None,
+        min_size: int | None,
+        max_size: int | None,
+    ) -> None:
+        if extension:
+            clauses.append("f.extension = :extension")
+            params["extension"] = extension
+        if path_contains:
+            clauses.append("LOWER(f.path) LIKE :path_contains")
+            params["path_contains"] = f"%{path_contains.casefold()}%"
+        if modified_after is not None:
+            clauses.append("f.modified_time >= :modified_after")
+            params["modified_after"] = float(modified_after)
+        if modified_before is not None:
+            clauses.append("f.modified_time < :modified_before")
+            params["modified_before"] = float(modified_before)
+        if min_size is not None:
+            clauses.append("f.size >= :min_size")
+            params["min_size"] = max(0, int(min_size))
+        if max_size is not None:
+            clauses.append("f.size <= :max_size")
+            params["max_size"] = max(0, int(max_size))
+
+    def browse(
+        self,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+        extension: str | None = None,
+        path_contains: str | None = None,
+        modified_after: float | None = None,
+        modified_before: float | None = None,
+        min_size: int | None = None,
+        max_size: int | None = None,
+    ) -> list[ChunkSearchResult]:
+        clauses: list[str] = []
+        params: dict[str, object] = {
+            "limit": max(1, int(limit)),
+            "offset": max(0, int(offset)),
+        }
+        self._append_metadata_filters(
+            clauses,
+            params,
+            extension=extension,
+            path_contains=path_contains,
+            modified_after=modified_after,
+            modified_before=modified_before,
+            min_size=min_size,
+            max_size=max_size,
+        )
+        where = "WHERE " + " AND ".join(clauses) if clauses else ""
+        sql = f"""
+            SELECT
+                f.path, f.filename, f.extension, f.modified_time, f.size,
+                '' AS location, '' AS snippet, 0.0 AS score
+            FROM files f
+            {where}
+            ORDER BY f.modified_time DESC, LOWER(f.filename) ASC, f.path ASC
+            LIMIT :limit OFFSET :offset
+        """
+        with self.connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [
+            ChunkSearchResult(
+                path=str(row["path"]),
+                filename=str(row["filename"]),
+                extension=str(row["extension"]),
+                modified_time=float(row["modified_time"]),
+                size=int(row["size"]),
+                location="",
+                snippet="",
+                score=0.0,
+            )
+            for row in rows
+        ]
+
     def search(
         self,
         query: str,
@@ -207,7 +291,16 @@ class ChunkStore:
     ) -> list[ChunkSearchResult]:
         query = query.strip()
         if not query:
-            return []
+            return self.browse(
+                limit=limit,
+                offset=offset,
+                extension=extension,
+                path_contains=path_contains,
+                modified_after=modified_after,
+                modified_before=modified_before,
+                min_size=min_size,
+                max_size=max_size,
+            )
 
         compact_cjk = self._cjk_only(query)
         is_short_cjk = compact_cjk and len(compact_cjk) <= 2 and compact_cjk == "".join(query.split())
@@ -231,24 +324,16 @@ class ChunkStore:
             "limit": max(1, limit),
             "offset": max(0, offset),
         }
-        if extension:
-            clauses.append("f.extension = :extension")
-            params["extension"] = extension
-        if path_contains:
-            clauses.append("LOWER(f.path) LIKE :path_contains")
-            params["path_contains"] = f"%{path_contains.casefold()}%"
-        if modified_after is not None:
-            clauses.append("f.modified_time >= :modified_after")
-            params["modified_after"] = float(modified_after)
-        if modified_before is not None:
-            clauses.append("f.modified_time < :modified_before")
-            params["modified_before"] = float(modified_before)
-        if min_size is not None:
-            clauses.append("f.size >= :min_size")
-            params["min_size"] = max(0, int(min_size))
-        if max_size is not None:
-            clauses.append("f.size <= :max_size")
-            params["max_size"] = max(0, int(max_size))
+        self._append_metadata_filters(
+            clauses,
+            params,
+            extension=extension,
+            path_contains=path_contains,
+            modified_after=modified_after,
+            modified_before=modified_before,
+            min_size=min_size,
+            max_size=max_size,
+        )
 
         filename_boost_expr = """
             CASE
