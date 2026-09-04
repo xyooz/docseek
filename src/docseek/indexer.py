@@ -94,6 +94,31 @@ class DirectoryIndexer:
             row = conn.execute("SELECT 1 FROM files WHERE path = ? LIMIT 1", (path,)).fetchone()
         return row is not None
 
+    def _load_index_state(self) -> dict[str, tuple[float, int, bool]]:
+        """Load metadata/chunk presence once for a full reconciliation scan.
+
+        Full scans are dominated by unchanged files. Querying SQLite twice per
+        unchanged path becomes expensive at tens of thousands of files, so the
+        scan keeps a compact in-memory snapshot instead.
+        """
+        with self.chunk_store.connect() as conn:
+            file_rows = conn.execute(
+                "SELECT path, modified_time, size FROM files"
+            ).fetchall()
+            chunk_rows = conn.execute(
+                "SELECT DISTINCT path FROM chunk_fts"
+            ).fetchall()
+
+        chunk_paths = {str(row["path"]) for row in chunk_rows}
+        return {
+            str(row["path"]): (
+                float(row["modified_time"]),
+                int(row["size"]),
+                str(row["path"]) in chunk_paths,
+            )
+            for row in file_rows
+        }
+
     def _remove_indexed_path(self, path: str, stats: IndexStats) -> None:
         if self._has_file_record(path):
             self.chunk_store.remove_document(path)
@@ -125,6 +150,8 @@ class DirectoryIndexer:
         stats: IndexStats,
         *,
         on_progress: Callable[[Path, IndexStats], None] | None = None,
+        prefetched_state: tuple[float, int, bool] | None = None,
+        state_prefetched: bool = False,
     ) -> None:
         stat = path.stat()
         if stat.st_size > self.max_file_size:
@@ -139,12 +166,22 @@ class DirectoryIndexer:
             )
             return
 
-        unchanged = self.database.is_unchanged(
-            normalized,
-            modified_time=stat.st_mtime,
-            size=stat.st_size,
-        )
-        if unchanged and self._has_chunk_index(normalized):
+        if state_prefetched:
+            unchanged = (
+                prefetched_state is not None
+                and float(prefetched_state[0]) == float(stat.st_mtime)
+                and int(prefetched_state[1]) == int(stat.st_size)
+            )
+            has_chunk = bool(prefetched_state[2]) if prefetched_state is not None else False
+        else:
+            unchanged = self.database.is_unchanged(
+                normalized,
+                modified_time=stat.st_mtime,
+                size=stat.st_size,
+            )
+            has_chunk = self._has_chunk_index(normalized) if unchanged else False
+
+        if unchanged and has_chunk:
             self.issues.clear(normalized)
             stats.unchanged += 1
             return
@@ -229,6 +266,7 @@ class DirectoryIndexer:
         root = root.resolve()
         stats = IndexStats()
         seen_paths: set[str] = set()
+        index_state = self._load_index_state()
 
         for path in self._iter_supported_files(root, stats):
             if self._cancel.is_set():
@@ -244,6 +282,8 @@ class DirectoryIndexer:
                     normalized,
                     stats,
                     on_progress=on_progress,
+                    prefetched_state=index_state.get(normalized),
+                    state_prefetched=True,
                 )
                 if on_progress and stats.scanned % 250 == 0:
                     on_progress(path, stats)
