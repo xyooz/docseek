@@ -5,9 +5,13 @@ from pathlib import Path
 import fitz
 from docx import Document
 from openpyxl import load_workbook
+from pptx import Presentation
 
 
-SUPPORTED_EXTENSIONS = {".txt", ".md", ".log", ".csv", ".docx", ".xlsx", ".pdf"}
+SUPPORTED_EXTENSIONS = {
+    ".txt", ".md", ".log", ".csv",
+    ".docx", ".xlsx", ".pptx", ".pdf",
+}
 
 
 def extract_text(path: Path) -> str:
@@ -19,6 +23,8 @@ def extract_text(path: Path) -> str:
         return _extract_docx(path)
     if suffix == ".xlsx":
         return _extract_xlsx(path)
+    if suffix == ".pptx":
+        return _extract_pptx(path)
     if suffix == ".pdf":
         return _extract_pdf(path)
 
@@ -58,11 +64,28 @@ def _extract_xlsx(path: Path) -> str:
     return "\n".join(chunks)
 
 
+def _extract_pptx(path: Path) -> str:
+    presentation = Presentation(path)
+    chunks: list[str] = []
+    for index, slide in enumerate(presentation.slides, start=1):
+        slide_chunks: list[str] = []
+        for shape in slide.shapes:
+            if hasattr(shape, "text") and shape.text:
+                slide_chunks.append(shape.text)
+            if getattr(shape, "has_table", False):
+                for row in shape.table.rows:
+                    slide_chunks.append("\t".join(cell.text for cell in row.cells))
+        if slide_chunks:
+            chunks.append(f"[Slide: {index}]")
+            chunks.extend(slide_chunks)
+    return "\n".join(chunks)
+
+
 def _extract_pdf(path: Path) -> str:
     chunks: list[str] = []
     with fitz.open(path) as document:
-        for page in document:
+        for page_no, page in enumerate(document, start=1):
             text = page.get_text("text")
             if text:
-                chunks.append(text)
+                chunks.append(f"[Page: {page_no}]\n{text}")
     return "\n".join(chunks)
