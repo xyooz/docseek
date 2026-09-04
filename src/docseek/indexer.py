@@ -27,6 +27,7 @@ class IndexStats:
     unchanged: int = 0
     skipped: int = 0
     removed: int = 0
+    excluded: int = 0
 
     def merge(self, other: "IndexStats") -> None:
         self.scanned += other.scanned
@@ -34,6 +35,7 @@ class IndexStats:
         self.unchanged += other.unchanged
         self.skipped += other.skipped
         self.removed += other.removed
+        self.excluded += other.excluded
 
 
 class IndexCancelled(Exception):
@@ -47,14 +49,19 @@ class DirectoryIndexer:
         self,
         database: SearchDatabase,
         *,
-        max_file_size: int = 200 * 1024 * 1024,
+        max_file_size: int | None = None,
         ignored_dir_names: set[str] | None = None,
+        excluded_paths: list[str] | None = None,
     ) -> None:
         self.database = database
+        if max_file_size is None:
+            max_file_size = database.get_max_file_size_mb() * 1024 * 1024
         self.max_file_size = max_file_size
         self.ignored_dir_names = {
             name.casefold() for name in (ignored_dir_names or DEFAULT_IGNORED_DIR_NAMES)
         }
+        raw_excluded = excluded_paths if excluded_paths is not None else database.get_excluded_paths()
+        self.excluded_paths = [Path(path).resolve() for path in raw_excluded]
         self._cancel = threading.Event()
 
     def cancel(self) -> None:
@@ -70,7 +77,7 @@ class DirectoryIndexer:
         stats = IndexStats()
         seen_paths: set[str] = set()
 
-        for path in self._iter_supported_files(root):
+        for path in self._iter_supported_files(root, stats):
             if self._cancel.is_set():
                 raise IndexCancelled()
 
@@ -118,15 +125,28 @@ class DirectoryIndexer:
         self.database.add_index_root(str(root))
         return stats
 
-    def _iter_supported_files(self, root: Path) -> Iterable[Path]:
-        # pathlib.rglob() cannot prune subtrees. A small explicit stack avoids
-        # descending into known high-noise folders such as .git/node_modules.
+    def _is_excluded(self, path: Path) -> bool:
+        resolved = path.resolve()
+        for excluded in self.excluded_paths:
+            if resolved == excluded:
+                return True
+            try:
+                resolved.relative_to(excluded)
+                return True
+            except ValueError:
+                continue
+        return False
+
+    def _iter_supported_files(self, root: Path, stats: IndexStats) -> Iterable[Path]:
         stack = [root]
         while stack:
             if self._cancel.is_set():
                 raise IndexCancelled()
             directory = stack.pop()
             try:
+                if self._is_excluded(directory):
+                    stats.excluded += 1
+                    continue
                 entries = list(directory.iterdir())
             except OSError:
                 continue
@@ -135,6 +155,9 @@ class DirectoryIndexer:
                 if self._cancel.is_set():
                     raise IndexCancelled()
                 try:
+                    if self._is_excluded(path):
+                        stats.excluded += 1
+                        continue
                     if path.is_dir():
                         if path.name.casefold() not in self.ignored_dir_names:
                             stack.append(path)
