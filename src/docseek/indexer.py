@@ -5,7 +5,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
 
-from .extractors import SUPPORTED_EXTENSIONS, extract_text
+from .chunk_store import ChunkStore
+from .chunks import iter_document_chunks
+from .extractors import SUPPORTED_EXTENSIONS
 from .search_db import SearchDatabase
 
 
@@ -24,6 +26,7 @@ DEFAULT_IGNORED_DIR_NAMES = {
 class IndexStats:
     scanned: int = 0
     indexed: int = 0
+    chunks: int = 0
     unchanged: int = 0
     skipped: int = 0
     removed: int = 0
@@ -32,6 +35,7 @@ class IndexStats:
     def merge(self, other: "IndexStats") -> None:
         self.scanned += other.scanned
         self.indexed += other.indexed
+        self.chunks += other.chunks
         self.unchanged += other.unchanged
         self.skipped += other.skipped
         self.removed += other.removed
@@ -43,7 +47,7 @@ class IndexCancelled(Exception):
 
 
 class DirectoryIndexer:
-    """Incremental local indexer tuned for ordinary office folders."""
+    """Incremental local indexer using bounded, location-aware chunks."""
 
     def __init__(
         self,
@@ -54,10 +58,7 @@ class DirectoryIndexer:
         excluded_paths: list[str] | None = None,
     ) -> None:
         self.database = database
-        # Schema upgrades may introduce new auxiliary indexes. Rebuild them from
-        # already stored FTS text here, on the worker thread, without reopening
-        # Word/PDF/Excel files or blocking the UI thread.
-        self.database.backfill_aux_indexes()
+        self.chunk_store = ChunkStore(database.db_path)
         if max_file_size is None:
             max_file_size = database.get_max_file_size_mb() * 1024 * 1024
         self.max_file_size = max_file_size
@@ -109,23 +110,23 @@ class DirectoryIndexer:
                 if on_progress:
                     on_progress(path, stats)
 
-                content = extract_text(path)
-                self.database.upsert_document(
+                chunk_count = self.chunk_store.replace_document(
                     path=normalized,
                     filename=path.name,
                     extension=path.suffix.lower(),
                     modified_time=stat.st_mtime,
                     size=stat.st_size,
-                    content=content,
+                    chunks=iter_document_chunks(path),
                 )
                 stats.indexed += 1
+                stats.chunks += chunk_count
             except IndexCancelled:
                 raise
             except Exception as exc:
                 stats.skipped += 1
                 self.database.record_index_error(normalized, type(exc).__name__)
 
-        stats.removed = self.database.remove_missing_under_root(str(root), seen_paths)
+        stats.removed = self.chunk_store.remove_missing_under_root(str(root), seen_paths)
         self.database.add_index_root(str(root))
         return stats
 
