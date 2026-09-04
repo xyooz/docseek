@@ -256,15 +256,16 @@ class MainWindow(QMainWindow):
             return
 
         row = self.current_results[row_index]
-        snippet = row.snippet.replace("<b>", "<mark>").replace("</b>", "</mark>")
+        safe_snippet = html.escape(row.snippet)
+        safe_snippet = safe_snippet.replace("[[HIT]]", "<mark>").replace("[[/HIT]]", "</mark>")
         size = self._human_size(row.size)
         safe_filename = html.escape(row.filename)
         safe_path = html.escape(row.path)
         self.preview.setHtml(
             f"<h3>{safe_filename}</h3>"
-            f"<p><b>{row.extension.lstrip('.').upper()}</b> · {size}</p>"
+            f"<p><b>{html.escape(row.extension.lstrip('.').upper())}</b> · {size}</p>"
             f"<p style='color:#666'>{safe_path}</p><hr>"
-            f"<p style='line-height:1.7'>{snippet}</p>"
+            f"<p style='line-height:1.7'>{safe_snippet}</p>"
         )
 
     def _selected_path(self) -> str | None:
