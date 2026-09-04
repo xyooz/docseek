@@ -12,12 +12,7 @@ _CJK_RUN_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]+")
 
 
 class _ClosingConnection(sqlite3.Connection):
-    """sqlite3 connection whose context manager also closes the file handle.
-
-    sqlite3.Connection.__exit__ commits/rolls back but does not close the
-    connection. That can leave the database file locked on Windows until GC.
-    DocSeek uses short-lived connections, so deterministic close is preferable.
-    """
+    """sqlite3 connection whose context manager also closes the file handle."""
 
     def __exit__(self, exc_type, exc_value, traceback) -> bool:
         try:
@@ -129,7 +124,6 @@ class SearchDatabase:
         return " ".join(tokens)
 
     def backfill_aux_indexes(self) -> bool:
-        """Backfill newer auxiliary indexes from stored FTS text, without reopening files."""
         changed = False
         with self.connect() as conn:
             base_count = int(conn.execute("SELECT COUNT(*) FROM file_fts").fetchone()[0])
@@ -190,13 +184,11 @@ class SearchDatabase:
                 "INSERT INTO file_fts(path, filename, content) VALUES (?, ?, ?)",
                 (path, filename, content),
             )
-
             conn.execute("DELETE FROM file_fts_cjk2 WHERE path = ?", (path,))
             conn.execute(
                 "INSERT INTO file_fts_cjk2(path, filename_tokens, content_tokens) VALUES (?, ?, ?)",
                 (path, self._cjk_bigrams(filename), self._cjk_bigrams(content)),
             )
-
             if self._trigram_available:
                 conn.execute("DELETE FROM file_fts_tri WHERE path = ?", (path,))
                 conn.execute(
@@ -352,20 +344,47 @@ class SearchDatabase:
     def _cjk_only_compact(query: str) -> str:
         return "".join(ch for ch in query if _CJK_RE.match(ch))
 
+    @staticmethod
+    def _append_filters(
+        params: list[object],
+        *,
+        extension: str | None,
+        path_contains: str | None,
+    ) -> str:
+        clauses: list[str] = []
+        if extension:
+            clauses.append("f.extension = ?")
+            params.append(extension)
+        if path_contains:
+            clauses.append("f.path LIKE ? ESCAPE '\\'")
+            escaped = path_contains.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            params.append(f"%{escaped}%")
+        return " AND " + " AND ".join(clauses) if clauses else ""
+
     def search(
         self,
         query: str,
         *,
         limit: int = 100,
+        offset: int = 0,
         extension: str | None = None,
+        path_contains: str | None = None,
     ) -> list[SearchResult]:
         query = query.strip()
+        limit = max(1, min(int(limit), 500))
+        offset = max(0, int(offset))
         if not query:
             return []
 
         compact_cjk = self._cjk_only_compact(query)
         if compact_cjk and len(compact_cjk) <= 2 and compact_cjk == "".join(query.split()):
-            return self._search_cjk_short(compact_cjk, limit=limit, extension=extension)
+            return self._search_cjk_short(
+                compact_cjk,
+                limit=limit,
+                offset=offset,
+                extension=extension,
+                path_contains=path_contains,
+            )
 
         compact = "".join(query.split())
         use_trigram = self._trigram_available and self._is_cjk_query(query) and len(compact) >= 3
@@ -373,11 +392,12 @@ class SearchDatabase:
         fts_query = self._build_fts_query(query)
 
         params: list[object] = [fts_query]
-        ext_clause = ""
-        if extension:
-            ext_clause = " AND f.extension = ?"
-            params.append(extension)
-        params.append(limit)
+        filter_clause = self._append_filters(
+            params,
+            extension=extension,
+            path_contains=path_contains,
+        )
+        params.extend([limit, offset])
 
         sql = f"""
             SELECT
@@ -386,9 +406,9 @@ class SearchDatabase:
                 bm25({table}, 0.0, 5.0, 1.0) AS score
             FROM {table}
             JOIN files f ON f.path = {table}.path
-            WHERE {table} MATCH ? {ext_clause}
+            WHERE {table} MATCH ? {filter_clause}
             ORDER BY score ASC, f.modified_time DESC
-            LIMIT ?
+            LIMIT ? OFFSET ?
         """
 
         try:
@@ -397,7 +417,13 @@ class SearchDatabase:
         except sqlite3.OperationalError:
             if not use_trigram:
                 raise
-            return self._search_unicode(query, limit=limit, extension=extension)
+            return self._search_unicode(
+                query,
+                limit=limit,
+                offset=offset,
+                extension=extension,
+                path_contains=path_contains,
+            )
         return [self._row_to_result(row) for row in rows]
 
     def _search_cjk_short(
@@ -405,14 +431,17 @@ class SearchDatabase:
         query: str,
         *,
         limit: int,
+        offset: int,
         extension: str | None,
+        path_contains: str | None,
     ) -> list[SearchResult]:
         params: list[object] = [f'"{query}"']
-        ext_clause = ""
-        if extension:
-            ext_clause = " AND f.extension = ?"
-            params.append(extension)
-        params.append(limit)
+        filter_clause = self._append_filters(
+            params,
+            extension=extension,
+            path_contains=path_contains,
+        )
+        params.extend([limit, offset])
 
         sql = f"""
             SELECT
@@ -421,9 +450,9 @@ class SearchDatabase:
                 bm25(file_fts_cjk2, 0.0, 5.0, 1.0) AS score
             FROM file_fts_cjk2
             JOIN files f ON f.path = file_fts_cjk2.path
-            WHERE file_fts_cjk2 MATCH ? {ext_clause}
+            WHERE file_fts_cjk2 MATCH ? {filter_clause}
             ORDER BY score ASC, f.modified_time DESC
-            LIMIT ?
+            LIMIT ? OFFSET ?
         """
         with self.connect() as conn:
             rows = conn.execute(sql, params).fetchall()
@@ -454,24 +483,27 @@ class SearchDatabase:
         query: str,
         *,
         limit: int,
+        offset: int,
         extension: str | None,
+        path_contains: str | None,
     ) -> list[SearchResult]:
         fts_query = self._build_fts_query(query)
         params: list[object] = [fts_query]
-        ext_clause = ""
-        if extension:
-            ext_clause = " AND f.extension = ?"
-            params.append(extension)
-        params.append(limit)
+        filter_clause = self._append_filters(
+            params,
+            extension=extension,
+            path_contains=path_contains,
+        )
+        params.extend([limit, offset])
         sql = f"""
             SELECT f.path, f.filename, f.extension, f.modified_time, f.size,
                    snippet(file_fts, 2, '[[HIT]]', '[[/HIT]]', ' … ', 36) AS snippet,
                    bm25(file_fts, 0.0, 5.0, 1.0) AS score
             FROM file_fts
             JOIN files f ON f.path = file_fts.path
-            WHERE file_fts MATCH ? {ext_clause}
+            WHERE file_fts MATCH ? {filter_clause}
             ORDER BY score ASC, f.modified_time DESC
-            LIMIT ?
+            LIMIT ? OFFSET ?
         """
         with self.connect() as conn:
             rows = conn.execute(sql, params).fetchall()
