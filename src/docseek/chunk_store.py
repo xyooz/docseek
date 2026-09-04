@@ -51,7 +51,6 @@ class ChunkStore:
     def connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=10, factory=_ClosingConnection)
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA temp_store=MEMORY")
         conn.execute("PRAGMA cache_size=-32768")
@@ -59,6 +58,10 @@ class ChunkStore:
 
     def _init_schema(self) -> None:
         with self.connect() as conn:
+            # Switching journal mode is comparatively expensive on Windows.
+            # Do it once when the store is initialized, not on every per-file
+            # connection used during indexing or searching.
+            conn.execute("PRAGMA journal_mode=WAL")
             ensure_schema_compatible(conn)
             conn.executescript(
                 """
