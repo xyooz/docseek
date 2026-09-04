@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 
 from docseek.chunk_store import ChunkStore
@@ -22,15 +23,16 @@ class SchemaVersionTests(unittest.TestCase):
         SearchDatabase(self.db_path)
         ChunkStore(self.db_path)
 
-        with sqlite3.connect(self.db_path) as conn:
+        with closing(sqlite3.connect(self.db_path)) as conn:
             version = int(conn.execute("PRAGMA user_version").fetchone()[0])
 
         self.assertEqual(version, CURRENT_SCHEMA_VERSION)
 
     def test_newer_database_is_rejected(self) -> None:
         SearchDatabase(self.db_path)
-        with sqlite3.connect(self.db_path) as conn:
+        with closing(sqlite3.connect(self.db_path)) as conn:
             conn.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION + 10}")
+            conn.commit()
 
         with self.assertRaises(UnsupportedSchemaVersion):
             ChunkStore(self.db_path)
