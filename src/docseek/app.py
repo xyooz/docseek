@@ -34,7 +34,7 @@ from .indexer import DirectoryIndexer, IndexCancelled, IndexStats
 from .query_parser import parse_query
 from .search_db import SearchDatabase
 from .settings_dialog import IndexSettingsDialog
-from .watcher import WatchManager
+from .watcher import WatchBatch, WatchManager
 
 
 APP_DIR = Path.home() / ".docseek"
@@ -59,16 +59,27 @@ class IndexSignals(QObject):
 
 
 class WatchSignals(QObject):
-    changed = Signal()
+    changed = Signal(object)
 
 
 class IndexWorker(QRunnable):
-    def __init__(self, roots: list[Path], db_path: Path) -> None:
+    def __init__(
+        self,
+        *,
+        db_path: Path,
+        roots: list[Path] | None = None,
+        paths: list[Path] | None = None,
+    ) -> None:
         super().__init__()
         self.roots = roots
+        self.paths = paths
         self.db_path = db_path
         self.signals = IndexSignals()
         self.indexer: DirectoryIndexer | None = None
+
+    @property
+    def is_full_scan(self) -> bool:
+        return self.paths is None
 
     def cancel(self) -> None:
         if self.indexer:
@@ -78,9 +89,19 @@ class IndexWorker(QRunnable):
         try:
             database = SearchDatabase(self.db_path)
             self.indexer = DirectoryIndexer(database)
-            total = IndexStats()
 
-            for root in self.roots:
+            if self.paths is not None:
+                stats = self.indexer.update_paths(
+                    self.paths,
+                    on_progress=lambda path, current: self.signals.progress.emit(
+                        str(path), current.scanned, current.indexed
+                    ),
+                )
+                self.signals.finished.emit(stats)
+                return
+
+            total = IndexStats()
+            for root in self.roots or []:
                 if not root.exists() or not root.is_dir():
                     continue
 
@@ -110,24 +131,25 @@ class MainWindow(QMainWindow):
         self.thread_pool = QThreadPool.globalInstance()
         self.current_worker: IndexWorker | None = None
         self.current_results: list[ChunkSearchResult] = []
-        self.auto_refresh_pending = False
         self.search_offset = 0
         self.has_more_results = False
         self.loading_more = False
         self.seen_result_paths: set[str] = set()
+        self.pending_watch_paths: set[str] = set()
+        self.watch_full_rescan_pending = False
 
         self.watch_signals = WatchSignals()
-        self.watch_signals.changed.connect(self._queue_live_refresh)
+        self.watch_signals.changed.connect(self._on_watch_batch)
         self.watch_manager = WatchManager(self.watch_signals.changed.emit)
 
         self.search_input = QLineEdit()
         self.search_input.setClearButtonEnabled(True)
         self.search_input.setPlaceholderText(
-            '搜索文件名或正文，例如：信贷 ext:pdf after:2026-01-01 size:>10MB'
+            '搜索正文或直接筛选，例如：信贷 ext:pdf，或 ext:pdf after:2026-01-01'
         )
         self.search_input.setToolTip(
             "支持：ext:pdf 类型 · path:制度 路径 · after:2026-01-01 / before:2026-09-01 日期 · "
-            "size:>10MB 大小 · 引号用于短语搜索"
+            "size:>10MB 大小 · 引号用于短语；筛选条件可单独使用"
         )
         self.search_input.setMinimumHeight(38)
 
@@ -207,11 +229,6 @@ class MainWindow(QMainWindow):
         self.search_timer.setInterval(180)
         self.search_timer.timeout.connect(self._perform_search)
 
-        self.live_refresh_timer = QTimer(self)
-        self.live_refresh_timer.setSingleShot(True)
-        self.live_refresh_timer.setInterval(1200)
-        self.live_refresh_timer.timeout.connect(self._run_live_refresh)
-
         self.search_input.textChanged.connect(self.search_timer.start)
         self.search_input.returnPressed.connect(self._perform_search)
         self.type_filter.currentIndexChanged.connect(self._perform_search)
@@ -277,25 +294,40 @@ class MainWindow(QMainWindow):
             return
         self._start_index(roots)
 
-    def _start_index(self, roots: list[Path], *, automatic: bool = False) -> None:
-        if self.current_worker is not None:
-            if automatic:
-                self.auto_refresh_pending = True
-            return
-
+    def _launch_worker(self, worker: IndexWorker, *, automatic: bool) -> None:
         self.choose_button.setEnabled(False)
         self.refresh_button.setEnabled(False)
         self.settings_button.setEnabled(False)
         self.cancel_button.setVisible(not automatic)
-        self.current_worker = IndexWorker(roots, DB_PATH)
-        self.current_worker.signals.progress.connect(self._index_progress)
-        self.current_worker.signals.finished.connect(self._index_finished)
-        self.current_worker.signals.cancelled.connect(self._index_cancelled)
-        self.current_worker.signals.failed.connect(self._index_failed)
-        self.thread_pool.start(self.current_worker)
+        self.current_worker = worker
+        worker.signals.progress.connect(self._index_progress)
+        worker.signals.finished.connect(self._index_finished)
+        worker.signals.cancelled.connect(self._index_cancelled)
+        worker.signals.failed.connect(self._index_failed)
+        self.thread_pool.start(worker)
 
+    def _start_index(self, roots: list[Path], *, automatic: bool = False) -> None:
+        if self.current_worker is not None:
+            if automatic:
+                self.watch_full_rescan_pending = True
+                self.pending_watch_paths.clear()
+            return
+
+        worker = IndexWorker(db_path=DB_PATH, roots=roots)
+        self._launch_worker(worker, automatic=automatic)
         if automatic:
-            self.statusBar().showMessage("检测到变化，正在后台更新索引…")
+            self.statusBar().showMessage("检测到目录结构变化，正在后台校准索引…")
+
+    def _start_path_update(self, paths: list[Path]) -> None:
+        if not paths:
+            return
+        if self.current_worker is not None:
+            self.pending_watch_paths.update(str(path) for path in paths)
+            return
+
+        worker = IndexWorker(db_path=DB_PATH, paths=paths)
+        self._launch_worker(worker, automatic=True)
+        self.statusBar().showMessage(f"检测到文件变化，正在增量更新 {len(paths)} 个文件…")
 
     def _cancel_index(self) -> None:
         if self.current_worker:
@@ -305,13 +337,17 @@ class MainWindow(QMainWindow):
     def _index_progress(self, path: str, scanned: int, indexed: int) -> None:
         filename = Path(path).name
         self.statusBar().showMessage(
-            f"正在索引：{filename}  ·  已扫描 {scanned}  ·  更新 {indexed}"
+            f"正在索引：{filename}  ·  已处理 {scanned}  ·  更新 {indexed}"
         )
 
     def _index_finished(self, stats: IndexStats) -> None:
+        worker = self.current_worker
+        was_full_scan = worker.is_full_scan if worker is not None else False
         self._finish_index_ui()
         self._refresh_scope()
-        self._restart_watcher()
+        if was_full_scan:
+            self._restart_watcher()
+
         extra = f"，排除 {stats.excluded}" if stats.excluded else ""
         chunk_info = f"，生成 {stats.chunks} 个内容块" if stats.chunks else ""
         self.statusBar().showMessage(
@@ -320,17 +356,17 @@ class MainWindow(QMainWindow):
             10000,
         )
         self._perform_search()
-        if self.auto_refresh_pending:
-            self.auto_refresh_pending = False
-            self._queue_live_refresh()
+        self._drain_watch_queue()
 
     def _index_cancelled(self) -> None:
         self._finish_index_ui()
         self.statusBar().showMessage("索引已停止", 6000)
+        self._drain_watch_queue()
 
     def _index_failed(self, message: str) -> None:
         self._finish_index_ui()
         self.statusBar().showMessage(f"索引失败：{message}", 10000)
+        self._drain_watch_queue()
 
     def _finish_index_ui(self) -> None:
         self.choose_button.setEnabled(True)
@@ -340,13 +376,30 @@ class MainWindow(QMainWindow):
         self.current_worker = None
         self._refresh_status()
 
-    def _queue_live_refresh(self) -> None:
-        self.live_refresh_timer.start()
+    def _on_watch_batch(self, batch: WatchBatch) -> None:
+        if batch.full_rescan:
+            self.watch_full_rescan_pending = True
+            self.pending_watch_paths.clear()
+        elif not self.watch_full_rescan_pending:
+            self.pending_watch_paths.update(batch.paths)
+        self._drain_watch_queue()
 
-    def _run_live_refresh(self) -> None:
-        roots = [Path(root) for root in self.database.get_index_roots()]
-        if roots:
-            self._start_index(roots, automatic=True)
+    def _drain_watch_queue(self) -> None:
+        if self.current_worker is not None:
+            return
+
+        if self.watch_full_rescan_pending:
+            self.watch_full_rescan_pending = False
+            self.pending_watch_paths.clear()
+            roots = [Path(root) for root in self.database.get_index_roots()]
+            if roots:
+                self._start_index(roots, automatic=True)
+            return
+
+        if self.pending_watch_paths:
+            paths = [Path(path) for path in sorted(self.pending_watch_paths)]
+            self.pending_watch_paths.clear()
+            self._start_path_update(paths)
 
     def _restart_watcher(self) -> None:
         self.watch_manager.start(
@@ -369,11 +422,11 @@ class MainWindow(QMainWindow):
 
         raw_query = self.search_input.text().strip()
         parsed = parse_query(raw_query)
-        if not parsed.terms:
+        extension = parsed.extension or self.type_filter.currentData()
+        if not parsed.terms and not parsed.has_filters and extension is None:
             self._refresh_status()
             return
 
-        extension = parsed.extension or self.type_filter.currentData()
         self.loading_more = True
         try:
             rows = self.chunk_store.search(
@@ -406,8 +459,9 @@ class MainWindow(QMainWindow):
         self.search_offset += len(rows)
         self.has_more_results = len(rows) == PAGE_SIZE
         suffix = " · 向下滚动继续加载" if self.has_more_results else ""
+        mode = "筛选结果" if not parsed.terms else "搜索结果"
         self.statusBar().showMessage(
-            f"已显示 {len(self.current_results)} 个文件{suffix}"
+            f"{mode}：已显示 {len(self.current_results)} 个文件{suffix}"
         )
         if select_first and self.current_results:
             self.results.selectRow(0)
@@ -415,7 +469,7 @@ class MainWindow(QMainWindow):
     def _populate_result_row(self, row_index: int, row: ChunkSearchResult) -> None:
         name_item = QTableWidgetItem(row.filename)
         name_item.setData(Qt.UserRole, row.path)
-        location_item = QTableWidgetItem(row.location)
+        location_item = QTableWidgetItem(row.location or "—")
         ext_item = QTableWidgetItem(row.extension.lstrip(".").upper())
         size_item = QTableWidgetItem(self._human_size(row.size))
         time_item = QTableWidgetItem(
@@ -442,17 +496,28 @@ class MainWindow(QMainWindow):
             return
 
         row = self.current_results[row_index]
-        safe_snippet = html.escape(row.snippet)
-        safe_snippet = safe_snippet.replace("[[HIT]]", "<mark>").replace("[[/HIT]]", "</mark>")
         safe_filename = html.escape(row.filename)
         safe_path = html.escape(row.path)
-        safe_location = html.escape(row.location)
-        self.preview.setHtml(
+        metadata = (
             f"<h3>{safe_filename}</h3>"
             f"<p><b>{html.escape(row.extension.lstrip('.').upper())}</b> · {self._human_size(row.size)}</p>"
-            f"<p><b>命中位置：</b>{safe_location}</p>"
-            f"<p style='color:#666'>{safe_path}</p><hr>"
-            f"<p style='line-height:1.7'>{safe_snippet}</p>"
+            f"<p style='color:#666'>{safe_path}</p>"
+        )
+
+        if not row.snippet:
+            self.preview.setHtml(
+                metadata
+                + "<hr><p style='color:#666'>当前为筛选浏览结果。输入正文关键词后，可显示具体命中位置和上下文。</p>"
+            )
+            return
+
+        safe_snippet = html.escape(row.snippet)
+        safe_snippet = safe_snippet.replace("[[HIT]]", "<mark>").replace("[[/HIT]]", "</mark>")
+        safe_location = html.escape(row.location)
+        self.preview.setHtml(
+            metadata
+            + f"<p><b>命中位置：</b>{safe_location}</p><hr>"
+            + f"<p style='line-height:1.7'>{safe_snippet}</p>"
         )
 
     def _selected_path(self) -> str | None:
