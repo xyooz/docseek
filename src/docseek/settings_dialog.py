@@ -16,6 +16,8 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
+from .index_issues import IndexIssueStore
+from .index_issues_dialog import IndexIssuesDialog
 from .search_db import SearchDatabase
 
 
@@ -23,8 +25,9 @@ class IndexSettingsDialog(QDialog):
     def __init__(self, database: SearchDatabase, parent=None) -> None:
         super().__init__(parent)
         self.database = database
+        self.issue_store = IndexIssueStore(database.db_path)
         self.setWindowTitle("索引设置")
-        self.resize(680, 520)
+        self.resize(700, 580)
 
         self.root_list = QListWidget()
         self.root_list.addItems(database.get_index_roots())
@@ -76,6 +79,17 @@ class IndexSettingsDialog(QDialog):
         advanced_layout.addRow("单文件索引上限", self.max_size)
         advanced_group.setLayout(advanced_layout)
 
+        self.issue_summary = QLabel()
+        self.issue_button = QPushButton()
+        self.issue_button.clicked.connect(self._show_index_issues)
+        self._refresh_issue_summary()
+
+        issues_group = QGroupBox("索引状态")
+        issues_layout = QHBoxLayout()
+        issues_layout.addWidget(self.issue_summary, 1)
+        issues_layout.addWidget(self.issue_button)
+        issues_group.setLayout(issues_layout)
+
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
@@ -84,6 +98,7 @@ class IndexSettingsDialog(QDialog):
         layout.addWidget(roots_group)
         layout.addWidget(exclude_group)
         layout.addWidget(advanced_group)
+        layout.addWidget(issues_group)
         layout.addWidget(buttons)
         self.setLayout(layout)
 
@@ -119,6 +134,21 @@ class IndexSettingsDialog(QDialog):
         row = self.exclude_list.currentRow()
         if row >= 0:
             self.exclude_list.takeItem(row)
+
+    def _refresh_issue_summary(self) -> None:
+        count = self.issue_store.count()
+        if count:
+            self.issue_summary.setText(f"有 {count} 个文件或目录未正常建立索引。")
+            self.issue_button.setText(f"查看问题 ({count})")
+        else:
+            self.issue_summary.setText("当前没有发现索引问题。")
+            self.issue_button.setText("查看问题")
+        self.issue_button.setEnabled(count > 0)
+
+    def _show_index_issues(self) -> None:
+        dialog = IndexIssuesDialog(self.issue_store, self)
+        dialog.exec()
+        self._refresh_issue_summary()
 
     def accept(self) -> None:
         roots = set(self._items(self.root_list))
