@@ -72,6 +72,14 @@ class DirectoryIndexer:
     def cancel(self) -> None:
         self._cancel.set()
 
+    def _has_chunk_index(self, path: str) -> bool:
+        with self.chunk_store.connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM chunk_fts WHERE path = ? LIMIT 1",
+                (path,),
+            ).fetchone()
+        return row is not None
+
     def scan(
         self,
         root: Path,
@@ -97,11 +105,14 @@ class DirectoryIndexer:
                     self.database.record_index_error(normalized, "file_too_large")
                     continue
 
-                if self.database.is_unchanged(
+                unchanged = self.database.is_unchanged(
                     normalized,
                     modified_time=stat.st_mtime,
                     size=stat.st_size,
-                ):
+                )
+                # Existing pre-chunk databases must be migrated even when the
+                # source file itself has not changed.
+                if unchanged and self._has_chunk_index(normalized):
                     stats.unchanged += 1
                     if on_progress and stats.scanned % 250 == 0:
                         on_progress(path, stats)
