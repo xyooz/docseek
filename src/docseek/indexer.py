@@ -8,6 +8,7 @@ from typing import Callable, Iterable
 from .chunk_store import ChunkStore
 from .chunks import iter_document_chunks
 from .extractors import SUPPORTED_EXTENSIONS
+from .index_issues import IndexIssueStore
 from .search_db import SearchDatabase
 
 
@@ -59,6 +60,7 @@ class DirectoryIndexer:
     ) -> None:
         self.database = database
         self.chunk_store = ChunkStore(database.db_path)
+        self.issues = IndexIssueStore(database.db_path)
         if max_file_size is None:
             max_file_size = database.get_max_file_size_mb() * 1024 * 1024
         self.max_file_size = max_file_size
@@ -79,6 +81,16 @@ class DirectoryIndexer:
                 (path,),
             ).fetchone()
         return row is not None
+
+    @staticmethod
+    def _error_code(exc: Exception) -> str:
+        if isinstance(exc, PermissionError):
+            return "permission_denied"
+        if isinstance(exc, FileNotFoundError):
+            return "file_not_found"
+        if isinstance(exc, OSError):
+            return "os_error"
+        return type(exc).__name__
 
     def scan(
         self,
@@ -102,7 +114,13 @@ class DirectoryIndexer:
                 stat = path.stat()
                 if stat.st_size > self.max_file_size:
                     stats.skipped += 1
-                    self.database.record_index_error(normalized, "file_too_large")
+                    actual_mb = stat.st_size / (1024 * 1024)
+                    limit_mb = self.max_file_size / (1024 * 1024)
+                    self.issues.record(
+                        normalized,
+                        "file_too_large",
+                        f"文件大小 {actual_mb:.1f} MB，当前索引上限 {limit_mb:.0f} MB",
+                    )
                     continue
 
                 unchanged = self.database.is_unchanged(
@@ -113,6 +131,7 @@ class DirectoryIndexer:
                 # Existing pre-chunk databases must be migrated even when the
                 # source file itself has not changed.
                 if unchanged and self._has_chunk_index(normalized):
+                    self.issues.clear(normalized)
                     stats.unchanged += 1
                     if on_progress and stats.scanned % 250 == 0:
                         on_progress(path, stats)
@@ -129,15 +148,17 @@ class DirectoryIndexer:
                     size=stat.st_size,
                     chunks=iter_document_chunks(path),
                 )
+                self.issues.clear(normalized)
                 stats.indexed += 1
                 stats.chunks += chunk_count
             except IndexCancelled:
                 raise
             except Exception as exc:
                 stats.skipped += 1
-                self.database.record_index_error(normalized, type(exc).__name__)
+                self.issues.record(normalized, self._error_code(exc), str(exc))
 
         stats.removed = self.chunk_store.remove_missing_under_root(str(root), seen_paths)
+        self.issues.clear_under_root_if_missing(str(root), seen_paths)
         self.database.add_index_root(str(root))
         return stats
 
@@ -159,12 +180,17 @@ class DirectoryIndexer:
             if self._cancel.is_set():
                 raise IndexCancelled()
             directory = stack.pop()
+            normalized_dir = str(directory.resolve())
             try:
                 if self._is_excluded(directory):
+                    self.issues.clear(normalized_dir)
                     stats.excluded += 1
                     continue
                 entries = list(directory.iterdir())
-            except OSError:
+                self.issues.clear(normalized_dir)
+            except OSError as exc:
+                stats.skipped += 1
+                self.issues.record(normalized_dir, self._error_code(exc), str(exc))
                 continue
 
             for path in entries:
@@ -172,6 +198,7 @@ class DirectoryIndexer:
                     raise IndexCancelled()
                 try:
                     if self._is_excluded(path):
+                        self.issues.clear(str(path.resolve()))
                         stats.excluded += 1
                         continue
                     if path.is_dir():
@@ -185,5 +212,11 @@ class DirectoryIndexer:
                         continue
                     if path.suffix.lower() in SUPPORTED_EXTENSIONS:
                         yield path
-                except OSError:
+                except OSError as exc:
+                    stats.skipped += 1
+                    try:
+                        issue_path = str(path.resolve())
+                    except OSError:
+                        issue_path = str(path)
+                    self.issues.record(issue_path, self._error_code(exc), str(exc))
                     continue
