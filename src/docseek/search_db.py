@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 
@@ -100,7 +100,6 @@ class SearchDatabase:
 
     @staticmethod
     def _cjk_bigrams(text: str) -> str:
-        """Return whitespace-separated CJK bigrams for exact two-char lookup."""
         tokens: list[str] = []
         for match in _CJK_RUN_RE.finditer(text):
             run = match.group(0)
@@ -175,20 +174,28 @@ class SearchDatabase:
                 conn.execute("DELETE FROM file_fts_tri WHERE path = ?", (path,))
             conn.execute("DELETE FROM files WHERE path = ?", (path,))
 
-    def remove_missing_under_root(self, root: str, existing_paths: set[str]) -> int:
-        root_path = Path(root)
+    def _paths_under_root(self, root: str) -> list[str]:
+        root_path = Path(root).resolve()
         with self.connect() as conn:
             rows = conn.execute("SELECT path FROM files").fetchall()
-            missing: list[str] = []
-            for row in rows:
-                candidate = Path(str(row["path"]))
-                try:
-                    candidate.relative_to(root_path)
-                except ValueError:
-                    continue
-                if str(candidate) not in existing_paths:
-                    missing.append(str(candidate))
+        selected: list[str] = []
+        for row in rows:
+            candidate = Path(str(row["path"]))
+            try:
+                candidate.relative_to(root_path)
+            except ValueError:
+                continue
+            selected.append(str(candidate))
+        return selected
 
+    def purge_root(self, root: str) -> int:
+        paths = self._paths_under_root(root)
+        for path in paths:
+            self.remove_document(path)
+        return len(paths)
+
+    def remove_missing_under_root(self, root: str, existing_paths: set[str]) -> int:
+        missing = [path for path in self._paths_under_root(root) if path not in existing_paths]
         for path in missing:
             self.remove_document(path)
         return len(missing)
@@ -205,6 +212,9 @@ class SearchDatabase:
         resolved = str(Path(root).resolve())
         roots = [item for item in self.get_index_roots() if item != resolved]
         self._set_setting("index_roots", json.dumps(roots, ensure_ascii=False))
+        current_legacy = self._get_setting("index_root")
+        if current_legacy == resolved:
+            self._set_setting("index_root", roots[-1] if roots else "")
 
     def get_index_roots(self) -> list[str]:
         raw = self._get_setting("index_roots")
@@ -367,10 +377,25 @@ class SearchDatabase:
             rows = conn.execute(sql, params).fetchall()
 
         results = [self._row_to_result(row) for row in rows]
-        # The auxiliary bigram index intentionally stores tokens instead of the
-        # original body. Generate a small readable context only for the limited
-        # result set, avoiding any full-database LIKE scan.
-        return results
+        return [replace(item, snippet=self._plain_snippet(item.path, query)) for item in results]
+
+    def _plain_snippet(self, path: str, query: str, radius: int = 52) -> str:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT content FROM file_fts WHERE path = ? LIMIT 1",
+                (path,),
+            ).fetchone()
+        if not row:
+            return ""
+        content = str(row["content"] or "")
+        position = content.casefold().find(query.casefold())
+        if position < 0:
+            return content[: radius * 2].replace("\n", " ")
+        start = max(0, position - radius)
+        end = min(len(content), position + len(query) + radius)
+        snippet = content[start:end].replace("\n", " ")
+        highlighted = snippet.replace(query, f"[[HIT]]{query}[[/HIT]]")
+        return ("… " if start else "") + highlighted + (" …" if end < len(content) else "")
 
     def _search_unicode(
         self,
