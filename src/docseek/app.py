@@ -123,10 +123,11 @@ class MainWindow(QMainWindow):
         self.search_input = QLineEdit()
         self.search_input.setClearButtonEnabled(True)
         self.search_input.setPlaceholderText(
-            '搜索文件名或正文，例如：信贷 ext:pdf path:制度 或 "客户经理"'
+            '搜索文件名或正文，例如：信贷 ext:pdf after:2026-01-01 size:>10MB'
         )
         self.search_input.setToolTip(
-            "支持：ext:pdf 限定类型，path:制度 限定路径，引号用于短语搜索"
+            "支持：ext:pdf 类型 · path:制度 路径 · after:2026-01-01 / before:2026-09-01 日期 · "
+            "size:>10MB 大小 · 引号用于短语搜索"
         )
         self.search_input.setMinimumHeight(38)
 
@@ -381,6 +382,10 @@ class MainWindow(QMainWindow):
                 offset=self.search_offset,
                 extension=extension,
                 path_contains=parsed.path_contains,
+                modified_after=parsed.modified_after,
+                modified_before=parsed.modified_before,
+                min_size=parsed.min_size,
+                max_size=parsed.max_size,
             )
         except Exception as exc:
             self.statusBar().showMessage(f"搜索失败：{exc}", 8000)
@@ -398,7 +403,7 @@ class MainWindow(QMainWindow):
         for offset, row in enumerate(unique_rows):
             self._populate_result_row(start_row + offset, row)
 
-        self.search_offset += max(len(rows), 1)
+        self.search_offset += len(rows)
         self.has_more_results = len(rows) == PAGE_SIZE
         suffix = " · 向下滚动继续加载" if self.has_more_results else ""
         self.statusBar().showMessage(
