@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from docseek.chunk_store import ChunkStore
 from docseek.indexer import DirectoryIndexer
 from docseek.search_db import SearchDatabase
 
@@ -14,6 +15,7 @@ class DirectoryIndexerTests(unittest.TestCase):
         self.root = Path(self.temp_dir.name) / "root"
         self.root.mkdir()
         self.db = SearchDatabase(Path(self.temp_dir.name) / "docseek.db")
+        self.chunks = ChunkStore(self.db.db_path)
 
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
@@ -30,8 +32,8 @@ class DirectoryIndexerTests(unittest.TestCase):
 
         self.assertEqual(stats.indexed, 1)
         self.assertGreaterEqual(stats.excluded, 1)
-        self.assertEqual([row.filename for row in self.db.search("信贷")], ["visible.txt"])
-        self.assertEqual(self.db.search("内部资料"), [])
+        self.assertEqual([row.filename for row in self.chunks.search("信贷")], ["visible.txt"])
+        self.assertEqual(self.chunks.search("内部资料"), [])
 
     def test_second_scan_skips_unchanged_file(self) -> None:
         target = self.root / "guide.txt"
@@ -41,8 +43,29 @@ class DirectoryIndexerTests(unittest.TestCase):
         second = DirectoryIndexer(self.db).scan(self.root)
 
         self.assertEqual(first.indexed, 1)
+        self.assertGreaterEqual(first.chunks, 1)
         self.assertEqual(second.indexed, 0)
         self.assertEqual(second.unchanged, 1)
+
+    def test_pre_chunk_file_is_migrated_even_when_unchanged(self) -> None:
+        target = self.root / "legacy.txt"
+        target.write_text("历史制度材料 信贷", encoding="utf-8")
+        stat = target.stat()
+        self.db.upsert_document(
+            path=str(target.resolve()),
+            filename=target.name,
+            extension=".txt",
+            modified_time=stat.st_mtime,
+            size=stat.st_size,
+            content="历史制度材料 信贷",
+        )
+
+        stats = DirectoryIndexer(self.db).scan(self.root)
+
+        self.assertEqual(stats.indexed, 1)
+        rows = self.chunks.search("信贷")
+        self.assertEqual([row.filename for row in rows], ["legacy.txt"])
+        self.assertTrue(rows[0].location.startswith("行 "))
 
 
 if __name__ == "__main__":
