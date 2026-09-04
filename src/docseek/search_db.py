@@ -11,6 +11,21 @@ _CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
 _CJK_RUN_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]+")
 
 
+class _ClosingConnection(sqlite3.Connection):
+    """sqlite3 connection whose context manager also closes the file handle.
+
+    sqlite3.Connection.__exit__ commits/rolls back but does not close the
+    connection. That can leave the database file locked on Windows until GC.
+    DocSeek uses short-lived connections, so deterministic close is preferable.
+    """
+
+    def __exit__(self, exc_type, exc_value, traceback) -> bool:
+        try:
+            return super().__exit__(exc_type, exc_value, traceback)
+        finally:
+            self.close()
+
+
 @dataclass(slots=True)
 class SearchResult:
     path: str
@@ -30,7 +45,11 @@ class SearchDatabase:
         self._init_schema()
 
     def connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path, timeout=10)
+        conn = sqlite3.connect(
+            self.db_path,
+            timeout=10,
+            factory=_ClosingConnection,
+        )
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
