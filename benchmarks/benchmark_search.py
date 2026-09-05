@@ -10,6 +10,7 @@ from pathlib import Path
 from docseek.chunk_store import ChunkStore
 from docseek.chunk_writer import ChunkBatchWriter
 from docseek.chunks import DocumentChunk
+from docseek.exact_search import ExactGroupedSearchEngine
 from docseek.progressive_search import ProgressiveSearchEngine
 from docseek.search_db import SearchDatabase
 
@@ -95,11 +96,11 @@ def _latency_stats(samples_ms: list[float]) -> tuple[float, float]:
     return statistics.median(samples_ms), ordered[p95_index]
 
 
-def _recall(exact_paths: list[str], quick_paths: list[str]) -> float:
-    if not exact_paths:
-        return 1.0 if not quick_paths else 0.0
-    exact = set(exact_paths)
-    return len(exact.intersection(quick_paths)) / len(exact)
+def _recall(reference_paths: list[str], candidate_paths: list[str]) -> float:
+    if not reference_paths:
+        return 1.0 if not candidate_paths else 0.0
+    reference = set(reference_paths)
+    return len(reference.intersection(candidate_paths)) / len(reference)
 
 
 def benchmark_queries(
@@ -112,38 +113,49 @@ def benchmark_queries(
     candidate_multiplier: int,
 ) -> dict[str, dict[str, float]]:
     store = ChunkStore(db_path)
+    grouped = ExactGroupedSearchEngine(store)
     progressive = ProgressiveSearchEngine(store)
     results: dict[str, dict[str, float]] = {}
 
     for query in queries:
-        exact_cold_started = time.perf_counter()
-        exact_page = store.search_page(query, limit=limit)
-        exact_cold_ms = (time.perf_counter() - exact_cold_started) * 1000
+        started = time.perf_counter()
+        window_page = store.search_page(query, limit=limit)
+        window_cold_ms = (time.perf_counter() - started) * 1000
 
-        progressive_cold_started = time.perf_counter()
+        started = time.perf_counter()
+        grouped_page = grouped.search_page(query, limit=limit)
+        grouped_cold_ms = (time.perf_counter() - started) * 1000
+
+        started = time.perf_counter()
         quick_page = progressive.search_topk(
             query,
             limit=limit,
             candidate_multiplier=candidate_multiplier,
         )
-        progressive_cold_ms = (time.perf_counter() - progressive_cold_started) * 1000
+        progressive_cold_ms = (time.perf_counter() - started) * 1000
 
         for _ in range(warmups):
             store.search_page(query, limit=limit)
+            grouped.search_page(query, limit=limit)
             progressive.search_topk(
                 query,
                 limit=limit,
                 candidate_multiplier=candidate_multiplier,
             )
 
-        exact_samples: list[float] = []
+        window_samples: list[float] = []
+        grouped_samples: list[float] = []
         quick_samples: list[float] = []
         count_samples: list[float] = []
         exact_count = 0
         for _ in range(iterations):
             started = time.perf_counter()
-            exact_page = store.search_page(query, limit=limit)
-            exact_samples.append((time.perf_counter() - started) * 1000)
+            window_page = store.search_page(query, limit=limit)
+            window_samples.append((time.perf_counter() - started) * 1000)
+
+            started = time.perf_counter()
+            grouped_page = grouped.search_page(query, limit=limit)
+            grouped_samples.append((time.perf_counter() - started) * 1000)
 
             started = time.perf_counter()
             quick_page = progressive.search_topk(
@@ -154,18 +166,27 @@ def benchmark_queries(
             quick_samples.append((time.perf_counter() - started) * 1000)
 
             started = time.perf_counter()
-            exact_count = progressive.count_files(query)
+            exact_count = grouped.count_files(query)
             count_samples.append((time.perf_counter() - started) * 1000)
 
-        exact_p50, exact_p95 = _latency_stats(exact_samples)
+        window_p50, window_p95 = _latency_stats(window_samples)
+        grouped_p50, grouped_p95 = _latency_stats(grouped_samples)
         quick_p50, quick_p95 = _latency_stats(quick_samples)
         count_p50, count_p95 = _latency_stats(count_samples)
-        exact_paths = [row.path for row in exact_page.items]
+        window_paths = [row.path for row in window_page.items]
+        grouped_paths = [row.path for row in grouped_page.items]
         quick_paths = [row.path for row in quick_page.items]
+        exact_match = float(
+            window_paths == grouped_paths
+            and window_page.total_count == grouped_page.total_count
+        )
         results[query] = {
-            "exact_cold_ms": exact_cold_ms,
-            "exact_p50_ms": exact_p50,
-            "exact_p95_ms": exact_p95,
+            "window_cold_ms": window_cold_ms,
+            "window_p50_ms": window_p50,
+            "window_p95_ms": window_p95,
+            "grouped_cold_ms": grouped_cold_ms,
+            "grouped_p50_ms": grouped_p50,
+            "grouped_p95_ms": grouped_p95,
             "quick_cold_ms": progressive_cold_ms,
             "quick_p50_ms": quick_p50,
             "quick_p95_ms": quick_p95,
@@ -174,7 +195,8 @@ def benchmark_queries(
             "returned": float(len(quick_page.items)),
             "total_count": float(exact_count),
             "candidates": float(quick_page.candidates_scanned),
-            "recall": _recall(exact_paths, quick_paths),
+            "progressive_recall": _recall(window_paths, quick_paths),
+            "grouped_exact_match": exact_match,
         }
     return results
 
@@ -244,15 +266,17 @@ def main() -> None:
         f"index_amplification={amplification:.2f}x"
     )
     print()
-    print("query latency: exact page vs progressive top-k vs exact count")
+    print("query latency: exact-window vs exact-grouped vs progressive top-k")
     for query, stats in query_stats.items():
         print(
             f"- {query!r}: "
-            f"exact(cold={stats['exact_cold_ms']:.2f}, p50={stats['exact_p50_ms']:.2f}, p95={stats['exact_p95_ms']:.2f}) ms; "
+            f"window(cold={stats['window_cold_ms']:.2f}, p50={stats['window_p50_ms']:.2f}, p95={stats['window_p95_ms']:.2f}) ms; "
+            f"grouped(cold={stats['grouped_cold_ms']:.2f}, p50={stats['grouped_p50_ms']:.2f}, p95={stats['grouped_p95_ms']:.2f}) ms; "
             f"topk(cold={stats['quick_cold_ms']:.2f}, p50={stats['quick_p50_ms']:.2f}, p95={stats['quick_p95_ms']:.2f}) ms; "
             f"count(p50={stats['count_p50_ms']:.2f}, p95={stats['count_p95_ms']:.2f}) ms; "
-            f"returned={int(stats['returned'])}/{int(stats['total_count'])} candidates={int(stats['candidates'])} "
-            f"recall@{args.limit}={stats['recall'] * 100:.1f}%"
+            f"exact_match={'yes' if stats['grouped_exact_match'] else 'NO'}; "
+            f"topk_recall@{args.limit}={stats['progressive_recall'] * 100:.1f}%; "
+            f"returned={int(stats['returned'])}/{int(stats['total_count'])} candidates={int(stats['candidates'])}"
         )
 
     if temp_dir is not None:
