@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -62,15 +63,48 @@ class DirectoryIndexer:
         self.database = database
         self.chunk_store = ChunkStore(database.db_path)
         self.issues = IndexIssueStore(database.db_path)
+
+        configured_max_mb, configured_excluded = self._load_runtime_settings()
         if max_file_size is None:
-            max_file_size = database.get_max_file_size_mb() * 1024 * 1024
+            max_file_size = configured_max_mb * 1024 * 1024
         self.max_file_size = max_file_size
         self.ignored_dir_names = {
             name.casefold() for name in (ignored_dir_names or DEFAULT_IGNORED_DIR_NAMES)
         }
-        raw_excluded = excluded_paths if excluded_paths is not None else database.get_excluded_paths()
+        raw_excluded = excluded_paths if excluded_paths is not None else configured_excluded
         self.excluded_paths = [Path(path).resolve() for path in raw_excluded]
         self._cancel = threading.Event()
+
+    def _load_runtime_settings(self) -> tuple[int, list[str]]:
+        """Read indexer settings with one lightweight metadata connection.
+
+        The legacy SearchDatabase connection still owns compatibility FTS
+        tables and historically executed journal-mode setup on every connect.
+        Indexing is latency-sensitive, so runtime settings are read directly
+        from the shared metadata table instead of paying those legacy costs for
+        every watcher batch.
+        """
+        with self.chunk_store.connect() as conn:
+            rows = conn.execute(
+                "SELECT key, value FROM settings WHERE key IN ('max_file_size_mb', 'excluded_paths')"
+            ).fetchall()
+        values = {str(row["key"]): str(row["value"]) for row in rows}
+
+        try:
+            max_mb = max(1, min(int(values.get("max_file_size_mb", "200")), 4096))
+        except ValueError:
+            max_mb = 200
+
+        excluded: list[str] = []
+        raw_excluded = values.get("excluded_paths")
+        if raw_excluded:
+            try:
+                parsed = json.loads(raw_excluded)
+            except json.JSONDecodeError:
+                parsed = []
+            if isinstance(parsed, list):
+                excluded = [str(item) for item in parsed if item]
+        return max_mb, excluded
 
     def cancel(self) -> None:
         self._cancel.set()
@@ -94,6 +128,16 @@ class DirectoryIndexer:
         with self.chunk_store.connect() as conn:
             row = conn.execute("SELECT 1 FROM files WHERE path = ? LIMIT 1", (path,)).fetchone()
         return row is not None
+
+    def _is_unchanged(self, path: str, *, modified_time: float, size: int) -> bool:
+        with self.chunk_store.connect() as conn:
+            row = conn.execute(
+                "SELECT modified_time, size FROM files WHERE path = ?",
+                (path,),
+            ).fetchone()
+        if row is None:
+            return False
+        return float(row["modified_time"]) == float(modified_time) and int(row["size"]) == int(size)
 
     def _load_index_state(self) -> dict[str, tuple[float, int, bool]]:
         """Load metadata/chunk presence once for a full reconciliation scan."""
@@ -174,7 +218,7 @@ class DirectoryIndexer:
             )
             has_chunk = bool(prefetched_state[2]) if prefetched_state is not None else False
         else:
-            unchanged = self.database.is_unchanged(
+            unchanged = self._is_unchanged(
                 normalized,
                 modified_time=stat.st_mtime,
                 size=stat.st_size,
@@ -302,14 +346,10 @@ class DirectoryIndexer:
                     writer.flush()
                     raise
                 except Exception as exc:
-                    # Release any batched writer lock before persisting the
-                    # problem through IndexIssueStore's separate connection.
                     writer.flush()
                     stats.skipped += 1
                     self.issues.record(normalized, self._error_code(exc), str(exc))
 
-        # Clearing successful-file issues in one transaction removes another
-        # per-file SQLite commit from large reconciliation scans.
         self.issues.clear_many(successful_paths)
         stats.removed += self.chunk_store.remove_missing_under_root(str(root), seen_paths)
         self.issues.clear_under_root_if_missing(str(root), seen_paths)
