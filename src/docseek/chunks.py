@@ -29,11 +29,36 @@ def iter_document_chunks(
     xlsx_rows_per_chunk: int = 200,
     on_progress: ChunkProgressCallback | None = None,
 ) -> Iterator[DocumentChunk]:
-    """Yield bounded, location-aware chunks without building one giant body string.
+    """Public extraction entrypoint used by the production indexer.
 
-    Direct OOXML/PDF/text formats stay on the established parsers. Other known
-    formats are delegated lazily to the adapter registry so the production
-    indexer can gain mature optional backends without a flag-day rewrite.
+    Every supported format now passes through the capability-aware broker and
+    streaming DocIR layer before being converted back to the existing v7
+    ``DocumentChunk`` contract. The compatibility conversion is lossless, so
+    this architectural upgrade does not change FTS text, locations or require a
+    schema migration.
+    """
+    from .extraction_broker import DEFAULT_EXTRACTION_BROKER
+
+    yield from DEFAULT_EXTRACTION_BROKER.iter_chunks(
+        path,
+        target_chars=target_chars,
+        spreadsheet_rows_per_chunk=xlsx_rows_per_chunk,
+        on_progress=on_progress,
+    )
+
+
+def _iter_direct_document_chunks(
+    path: Path,
+    *,
+    target_chars: int = 12_000,
+    spreadsheet_rows_per_chunk: int = 200,
+    on_progress: ChunkProgressCallback | None = None,
+) -> Iterator[DocumentChunk]:
+    """Mature built-in parsers used only by ``DirectDocumentAdapter``.
+
+    Keeping this function separate from the public broker entrypoint prevents
+    adapter recursion while preserving the already-tested low-memory streaming
+    implementations.
     """
     suffix = path.suffix.lower()
     if suffix in TEXT_EXTENSIONS:
@@ -43,7 +68,7 @@ def iter_document_chunks(
     elif suffix == ".xlsx":
         yield from _iter_xlsx_chunks(
             path,
-            rows_per_chunk=xlsx_rows_per_chunk,
+            rows_per_chunk=spreadsheet_rows_per_chunk,
             on_progress=on_progress,
         )
     elif suffix == ".pptx":
@@ -51,15 +76,7 @@ def iter_document_chunks(
     elif suffix == ".pdf":
         yield from _iter_pdf_chunks(path)
     else:
-        # Local import avoids a module cycle: document_adapters itself reuses
-        # the direct helpers in this module for OOXML produced by compatible
-        # parsers/vendor fallbacks.
-        from .document_adapters import DEFAULT_ADAPTER_REGISTRY
-
-        adapter = DEFAULT_ADAPTER_REGISTRY.adapter_for(path)
-        if adapter.name == "direct":  # defensive; direct cases are handled above.
-            raise ValueError(f"Unsupported direct file type: {suffix}")
-        yield from adapter.iter_chunks(path, on_progress=on_progress)
+        raise ValueError(f"Unsupported direct file type: {suffix}")
 
 
 def _iter_text_chunks(path: Path, *, target_chars: int) -> Iterator[DocumentChunk]:
