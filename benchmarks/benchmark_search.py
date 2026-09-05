@@ -66,28 +66,37 @@ def benchmark_queries(
     *,
     queries: list[str],
     iterations: int,
+    warmups: int,
     limit: int,
 ) -> dict[str, dict[str, float]]:
     store = ChunkStore(db_path)
     results: dict[str, dict[str, float]] = {}
 
     for query in queries:
+        cold_started = time.perf_counter()
+        cold_page = store.search_page(query, limit=limit)
+        cold_ms = (time.perf_counter() - cold_started) * 1000
+
+        for _ in range(warmups):
+            store.search_page(query, limit=limit)
+
         samples_ms: list[float] = []
-        result_count = 0
+        page = cold_page
         for _ in range(iterations):
             started = time.perf_counter()
-            rows = store.search(query, limit=limit)
+            page = store.search_page(query, limit=limit)
             samples_ms.append((time.perf_counter() - started) * 1000)
-            result_count = len(rows)
 
         ordered = sorted(samples_ms)
         p95_index = min(len(ordered) - 1, max(0, int(len(ordered) * 0.95) - 1))
         results[query] = {
+            "cold_ms": cold_ms,
             "p50_ms": statistics.median(samples_ms),
             "p95_ms": ordered[p95_index],
             "min_ms": min(samples_ms),
             "max_ms": max(samples_ms),
-            "returned": float(result_count),
+            "returned": float(len(page.items)),
+            "total_count": float(page.total_count),
         }
     return results
 
@@ -99,13 +108,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="DocSeek synthetic indexing/search benchmark")
     parser.add_argument("--files", type=int, default=1000, help="number of synthetic files")
     parser.add_argument("--chunks", type=int, default=3, help="chunks per file")
-    parser.add_argument("--iterations", type=int, default=20, help="search repetitions per query")
+    parser.add_argument("--iterations", type=int, default=20, help="timed repetitions per query")
+    parser.add_argument("--warmups", type=int, default=1, help="untimed warmups after the cold query")
     parser.add_argument("--limit", type=int, default=100, help="result page size")
     parser.add_argument("--db", type=Path, default=None, help="optional persistent benchmark database")
     args = parser.parse_args()
 
-    if args.files < 1 or args.chunks < 1 or args.iterations < 1 or args.limit < 1:
-        parser.error("--files, --chunks, --iterations and --limit must all be >= 1")
+    if args.files < 1 or args.chunks < 1 or args.iterations < 1 or args.limit < 1 or args.warmups < 0:
+        parser.error("--files, --chunks, --iterations and --limit must be >= 1; --warmups must be >= 0")
 
     temp_dir: tempfile.TemporaryDirectory[str] | None = None
     if args.db is None:
@@ -127,6 +137,7 @@ def main() -> None:
         db_path,
         queries=DEFAULT_QUERIES,
         iterations=args.iterations,
+        warmups=args.warmups,
         limit=args.limit,
     )
 
@@ -135,13 +146,13 @@ def main() -> None:
     print(f"index_time={index_seconds:.3f}s files_per_second={args.files / index_seconds:.1f}")
     print(f"database_size={db_bytes / (1024 * 1024):.2f} MiB")
     print()
-    print("query latency")
+    print("query latency (cold + warmed steady-state)")
     for query, stats in query_stats.items():
         print(
-            f"- {query!r}: p50={stats['p50_ms']:.2f} ms "
-            f"p95={stats['p95_ms']:.2f} ms "
+            f"- {query!r}: cold={stats['cold_ms']:.2f} ms "
+            f"p50={stats['p50_ms']:.2f} ms p95={stats['p95_ms']:.2f} ms "
             f"min={stats['min_ms']:.2f} ms max={stats['max_ms']:.2f} ms "
-            f"returned={int(stats['returned'])}"
+            f"returned={int(stats['returned'])}/{int(stats['total_count'])}"
         )
 
     if temp_dir is not None:
