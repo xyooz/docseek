@@ -55,10 +55,15 @@ class ExtractionBrokerTests(unittest.TestCase):
     def test_format_capabilities_keep_mature_backend_preferences(self) -> None:
         xlsx = get_format_capability(".xlsx")
         xls = get_format_capability(".xls")
+        doc = get_format_capability(".doc")
         wps = get_format_capability(".wps")
 
         self.assertEqual(xlsx.modes, (SupportMode.DIRECT,))
-        self.assertEqual(xls.modes, (SupportMode.CALAMINE, SupportMode.WPS_LOCAL))
+        self.assertEqual(
+            xls.modes,
+            (SupportMode.CALAMINE, SupportMode.TIKA_NATIVE, SupportMode.WPS_LOCAL),
+        )
+        self.assertEqual(doc.modes, (SupportMode.TIKA_NATIVE, SupportMode.WPS_LOCAL))
         self.assertEqual(wps.modes, (SupportMode.WPS_LOCAL,))
 
     def test_registry_prefers_higher_priority_available_adapter(self) -> None:
