@@ -25,7 +25,10 @@ class SearchWorkerTests(unittest.TestCase):
             extension=".pdf",
             modified_time=1.0,
             size=100,
-            chunks=[DocumentChunk(0, "第 1 页", "客户经理办理信贷业务")],
+            chunks=[
+                DocumentChunk(0, "第 1 页", "客户经理办理信贷业务"),
+                DocumentChunk(1, "第 2 页", "客户经理办理信贷业务"),
+            ],
         )
 
     def tearDown(self) -> None:
@@ -63,11 +66,11 @@ class SearchWorkerTests(unittest.TestCase):
         errors: list[tuple[int, str]] = []
         worker.signals.failed.connect(lambda generation, message: errors.append((generation, message)))
 
-        class FailingStore:
+        class FailingEngine:
             def search_page(self, *args, **kwargs):
                 raise RuntimeError("synthetic failure")
 
-        with patch("docseek.search_worker.get_thread_search_store", return_value=FailingStore()):
+        with patch("docseek.search_worker.ExactGroupedSearchEngine", return_value=FailingEngine()):
             worker.run()
 
         self.assertEqual(errors, [(3011, "synthetic failure")])
@@ -96,6 +99,26 @@ class SearchWorkerTests(unittest.TestCase):
         self.assertEqual(response.page.total_count, 1)
         self.assertEqual(response.page.items[0].filename, "manual.pdf")
         self.assertGreaterEqual(response.elapsed_ms, 0.0)
+
+    def test_worker_applies_page_hint_to_best_chunk(self) -> None:
+        request = SearchRequest(
+            generation=5001,
+            query="信贷 page:2",
+            limit=100,
+            offset=0,
+        )
+        worker = SearchWorker(self.store, request)
+        responses: list[SearchResponse] = []
+        errors: list[tuple[int, str]] = []
+        worker.signals.finished.connect(responses.append)
+        worker.signals.failed.connect(lambda generation, message: errors.append((generation, message)))
+
+        worker.run()
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(responses), 1)
+        self.assertEqual(responses[0].page.items[0].location, "第 2 页")
+        self.assertNotIn("page:2", responses[0].page.items[0].snippet)
 
 
 if __name__ == "__main__":

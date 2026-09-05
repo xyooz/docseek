@@ -1,32 +1,49 @@
 from __future__ import annotations
 
 from .chunk_store import ChunkSearchResult, ChunkStore, SearchPage
+from .structure_ranking import parse_structure_query
 
 
 class ExactGroupedSearchEngine:
-    """Exact file-level search with late file-metadata evaluation.
+    """Exact file-level search with late metadata and optional structure hints.
 
-    FTS ranking is chunk-level, while filename boosts and all supported metadata
+    FTS ranking is chunk-level, while filename boosts and supported metadata
     filters are file-level. Those file-level values are constant for every chunk
     of the same document, so evaluating them before choosing the best chunk only
     repeats work.
 
-    This engine therefore:
-
-    1. matches FTS rows and keeps only ``chunk_id/file_id/ordinal/bm25``;
-    2. chooses the minimum BM25 chunk per file, breaking ties by ordinal;
-    3. joins ``files`` exactly once per surviving file;
-    4. applies metadata filters and the filename boost at file level;
-    5. sorts and paginates the exact file-level result set.
-
-    Moving file-level work after chunk collapse does not change search semantics:
-    metadata filters accept or reject the whole file, and filename boost is the
-    same constant for every chunk in a file, so neither can change which chunk is
-    the file's best content hit.
+    Explicit ``page:N``, ``slide:N`` and ``sheet:name`` hints are schema-free:
+    they are removed from the FTS text and add a small boost to matching
+    ``chunks.location`` values while the best chunk is selected. Queries without
+    structure hints preserve the existing exact BM25 + filename semantics.
     """
 
     def __init__(self, store: ChunkStore) -> None:
         self.store = store
+
+    @staticmethod
+    def _structure_boost_expr() -> str:
+        return """
+            CASE
+                WHEN :page_hint IS NOT NULL
+                 AND REPLACE(c.location, ' ', '') = '第' || CAST(:page_hint AS TEXT) || '页'
+                    THEN -3.0
+                ELSE 0.0
+            END
+            + CASE
+                WHEN :slide_hint IS NOT NULL
+                 AND REPLACE(c.location, ' ', '') = '幻灯片' || CAST(:slide_hint AS TEXT)
+                    THEN -3.0
+                ELSE 0.0
+            END
+            + CASE
+                WHEN :sheet_hint IS NOT NULL
+                 AND LOWER(REPLACE(c.location, ' ', '')) LIKE
+                     LOWER('工作表' || REPLACE(:sheet_hint, ' ', '') || '·行%')
+                    THEN -2.5
+                ELSE 0.0
+            END
+        """
 
     def search_page(
         self,
@@ -54,11 +71,17 @@ class ExactGroupedSearchEngine:
                 max_size=max_size,
             )
 
-        table, fts_query = self.store._select_index(query)
+        structured = parse_structure_query(query)
+        content_query = structured.text
+        table, fts_query = self.store._select_index(content_query)
         score_expr = f"bm25({table}, 5.0, 1.0)"
+        structure_boost_expr = self._structure_boost_expr()
         params: dict[str, object] = {
             "fts_query": fts_query,
-            "raw_query": self.store._plain_query_text(query),
+            "raw_query": self.store._plain_query_text(content_query),
+            "page_hint": structured.hints.page,
+            "slide_hint": structured.hints.slide,
+            "sheet_hint": structured.hints.sheet,
             "limit": max(1, int(limit)),
             "offset": max(0, int(offset)),
         }
@@ -98,33 +121,33 @@ class ExactGroupedSearchEngine:
                     c.id AS chunk_id,
                     c.file_id AS file_id,
                     c.ordinal AS ordinal,
-                    {score_expr} AS bm25_score
+                    {score_expr} + ({structure_boost_expr}) AS chunk_score
                 FROM {table}
                 JOIN chunks c ON c.id = {table}.rowid
                 WHERE {table} MATCH :fts_query
             ),
             best_scores AS (
-                SELECT file_id, MIN(bm25_score) AS bm25_score
+                SELECT file_id, MIN(chunk_score) AS chunk_score
                 FROM hits
                 GROUP BY file_id
             ),
             best_ordinals AS (
                 SELECT
                     h.file_id,
-                    b.bm25_score,
+                    b.chunk_score,
                     MIN(h.ordinal) AS ordinal
                 FROM hits h
                 JOIN best_scores b
                   ON b.file_id = h.file_id
-                 AND b.bm25_score = h.bm25_score
-                GROUP BY h.file_id, b.bm25_score
+                 AND b.chunk_score = h.chunk_score
+                GROUP BY h.file_id, b.chunk_score
             ),
             winners AS (
-                SELECT h.chunk_id, h.file_id, h.bm25_score
+                SELECT h.chunk_id, h.file_id, h.chunk_score
                 FROM hits h
                 JOIN best_ordinals b
                   ON b.file_id = h.file_id
-                 AND b.bm25_score = h.bm25_score
+                 AND b.chunk_score = h.chunk_score
                  AND b.ordinal = h.ordinal
             ),
             file_hits AS (
@@ -136,7 +159,7 @@ class ExactGroupedSearchEngine:
                     f.extension,
                     f.modified_time,
                     f.size,
-                    w.bm25_score + ({filename_boost_expr}) AS relevance_score
+                    w.chunk_score + ({filename_boost_expr}) AS relevance_score
                 FROM winners w
                 JOIN files f ON f.id = w.file_id
                 {metadata_where}
@@ -188,7 +211,7 @@ class ExactGroupedSearchEngine:
                 size=int(row["size"]),
                 location=str(row["location"] or ""),
                 snippet=self.store._snippet_from_content(
-                    self.store.decode_content(row["raw_content"]), query
+                    self.store.decode_content(row["raw_content"]), content_query
                 ),
                 score=float(row["score"]),
             )
@@ -219,7 +242,8 @@ class ExactGroupedSearchEngine:
                 max_size=max_size,
             ).total_count
 
-        table, fts_query = self.store._select_index(query)
+        content_query = parse_structure_query(query).text
+        table, fts_query = self.store._select_index(content_query)
         metadata_clauses: list[str] = []
         params: dict[str, object] = {"fts_query": fts_query}
         self.store._append_metadata_filters(

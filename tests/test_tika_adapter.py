@@ -35,13 +35,18 @@ class TikaNativeAdapterTests(unittest.TestCase):
     def test_flat_tika_output_is_generic_docir_not_fake_writer_structure(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "legacy.rtf"
-            path.write_text(r"{\rtf1\ansi legacy policy text}", encoding="ascii")
+            path.write_text(
+                r"{\rtf1\ansi\deff0 {\fonttbl {\f0 Arial;}}"
+                r"\f0\fs24 legacy policy text}",
+                encoding="ascii",
+            )
 
             registry = DocumentAdapterRegistry((TikaNativeAdapter(),))
             broker = ContentExtractionBroker(registry)
             blocks = list(broker.iter_blocks(path))
 
         self.assertTrue(blocks)
+        self.assertIn("legacy policy text", "\n".join(block.text for block in blocks).lower())
         self.assertTrue(all(block.kind == BlockKind.GENERIC for block in blocks))
         self.assertTrue(all(block.locator.page is None for block in blocks))
         self.assertTrue(all(block.locator.slide is None for block in blocks))
