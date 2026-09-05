@@ -4,19 +4,25 @@ from .chunk_store import ChunkSearchResult, ChunkStore, SearchPage
 
 
 class ExactGroupedSearchEngine:
-    """Exact file-level search using compact grouped minima.
+    """Exact file-level search with late file-metadata evaluation.
 
-    ``ChunkStore.search_page`` uses ``ROW_NUMBER() OVER`` across every matching
-    chunk. This engine preserves the same exact ordering rule with two grouped
-    minima while keeping the materialized hit set intentionally narrow:
+    FTS ranking is chunk-level, while filename boosts and all supported metadata
+    filters are file-level. Those file-level values are constant for every chunk
+    of the same document, so evaluating them before choosing the best chunk only
+    repeats work.
 
-    1. minimum relevance score per integer ``file_id``;
-    2. minimum chunk ordinal among chunks tied at that score.
+    This engine therefore:
 
-    File metadata and raw chunk text are joined only after the hit stream has
-    collapsed to one winning chunk per file. This avoids copying long paths,
-    filenames and other metadata into every matching chunk row, which matters
-    for broad queries over large office-document indexes.
+    1. matches FTS rows and keeps only ``chunk_id/file_id/ordinal/bm25``;
+    2. chooses the minimum BM25 chunk per file, breaking ties by ordinal;
+    3. joins ``files`` exactly once per surviving file;
+    4. applies metadata filters and the filename boost at file level;
+    5. sorts and paginates the exact file-level result set.
+
+    Moving file-level work after chunk collapse does not change search semantics:
+    metadata filters accept or reject the whole file, and filename boost is the
+    same constant for every chunk in a file, so neither can change which chunk is
+    the file's best content hit.
     """
 
     def __init__(self, store: ChunkStore) -> None:
@@ -50,15 +56,16 @@ class ExactGroupedSearchEngine:
 
         table, fts_query = self.store._select_index(query)
         score_expr = f"bm25({table}, 5.0, 1.0)"
-        clauses = [f"{table} MATCH :fts_query"]
         params: dict[str, object] = {
             "fts_query": fts_query,
             "raw_query": self.store._plain_query_text(query),
             "limit": max(1, int(limit)),
             "offset": max(0, int(offset)),
         }
+
+        metadata_clauses: list[str] = []
         self.store._append_metadata_filters(
-            clauses,
+            metadata_clauses,
             params,
             extension=extension,
             path_contains=path_contains,
@@ -66,6 +73,11 @@ class ExactGroupedSearchEngine:
             modified_before=modified_before,
             min_size=min_size,
             max_size=max_size,
+        )
+        metadata_where = (
+            "WHERE " + " AND ".join(metadata_clauses)
+            if metadata_clauses
+            else ""
         )
 
         filename_boost_expr = """
@@ -86,50 +98,56 @@ class ExactGroupedSearchEngine:
                     c.id AS chunk_id,
                     c.file_id AS file_id,
                     c.ordinal AS ordinal,
-                    ({score_expr}) + ({filename_boost_expr}) AS relevance_score
+                    {score_expr} AS bm25_score
                 FROM {table}
                 JOIN chunks c ON c.id = {table}.rowid
-                JOIN files f ON f.id = c.file_id
-                WHERE {' AND '.join(clauses)}
+                WHERE {table} MATCH :fts_query
             ),
             best_scores AS (
-                SELECT file_id, MIN(relevance_score) AS relevance_score
+                SELECT file_id, MIN(bm25_score) AS bm25_score
                 FROM hits
                 GROUP BY file_id
             ),
             best_ordinals AS (
                 SELECT
                     h.file_id,
-                    b.relevance_score,
+                    b.bm25_score,
                     MIN(h.ordinal) AS ordinal
                 FROM hits h
                 JOIN best_scores b
                   ON b.file_id = h.file_id
-                 AND b.relevance_score = h.relevance_score
-                GROUP BY h.file_id, b.relevance_score
+                 AND b.bm25_score = h.bm25_score
+                GROUP BY h.file_id, b.bm25_score
             ),
-            file_hits AS (
-                SELECT h.chunk_id, h.file_id, h.relevance_score
+            winners AS (
+                SELECT h.chunk_id, h.file_id, h.bm25_score
                 FROM hits h
                 JOIN best_ordinals b
                   ON b.file_id = h.file_id
-                 AND b.relevance_score = h.relevance_score
+                 AND b.bm25_score = h.bm25_score
                  AND b.ordinal = h.ordinal
             ),
-            paged AS (
+            file_hits AS (
                 SELECT
-                    h.chunk_id,
-                    h.file_id,
-                    h.relevance_score,
+                    w.chunk_id,
+                    w.file_id,
                     f.path,
                     f.filename,
                     f.extension,
                     f.modified_time,
                     f.size,
+                    w.bm25_score + ({filename_boost_expr}) AS relevance_score
+                FROM winners w
+                JOIN files f ON f.id = w.file_id
+                {metadata_where}
+            ),
+            paged AS (
+                SELECT
+                    chunk_id, file_id, path, filename, extension,
+                    modified_time, size, relevance_score,
                     COUNT(*) OVER() AS total_count
-                FROM file_hits h
-                JOIN files f ON f.id = h.file_id
-                ORDER BY h.relevance_score ASC, f.modified_time DESC, f.path ASC
+                FROM file_hits
+                ORDER BY relevance_score ASC, modified_time DESC, path ASC
                 LIMIT :limit OFFSET :offset
             )
             SELECT
@@ -200,10 +218,10 @@ class ExactGroupedSearchEngine:
             ).total_count
 
         table, fts_query = self.store._select_index(query)
-        clauses = [f"{table} MATCH :fts_query"]
+        metadata_clauses: list[str] = []
         params: dict[str, object] = {"fts_query": fts_query}
         self.store._append_metadata_filters(
-            clauses,
+            metadata_clauses,
             params,
             extension=extension,
             path_contains=path_contains,
@@ -212,12 +230,22 @@ class ExactGroupedSearchEngine:
             min_size=min_size,
             max_size=max_size,
         )
+        metadata_where = (
+            "WHERE " + " AND ".join(metadata_clauses)
+            if metadata_clauses
+            else ""
+        )
         sql = f"""
-            SELECT COUNT(DISTINCT c.file_id) AS n
-            FROM {table}
-            JOIN chunks c ON c.id = {table}.rowid
-            JOIN files f ON f.id = c.file_id
-            WHERE {' AND '.join(clauses)}
+            WITH matched_files AS (
+                SELECT DISTINCT c.file_id
+                FROM {table}
+                JOIN chunks c ON c.id = {table}.rowid
+                WHERE {table} MATCH :fts_query
+            )
+            SELECT COUNT(*) AS n
+            FROM matched_files m
+            JOIN files f ON f.id = m.file_id
+            {metadata_where}
         """
         with self.store.connect() as conn:
             row = conn.execute(sql, params).fetchone()
