@@ -98,6 +98,7 @@ class ChunkBatchWriter:
         modified_time: float,
         size: int,
         chunks: Iterable[DocumentChunk],
+        extraction_revision: int | None = None,
     ) -> int:
         conn = self._require_connection()
         self._ensure_transaction(conn)
@@ -161,6 +162,16 @@ class ChunkBatchWriter:
                     ),
                 )
                 count += 1
+
+            if extraction_revision is not None:
+                conn.execute(
+                    """
+                    INSERT INTO extraction_state(path, revision)
+                    VALUES (?, ?)
+                    ON CONFLICT(path) DO UPDATE SET revision=excluded.revision
+                    """,
+                    (path, int(extraction_revision)),
+                )
         except Exception:
             conn.execute(f"ROLLBACK TO {savepoint}")
             conn.execute(f"RELEASE {savepoint}")
