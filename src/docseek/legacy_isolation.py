@@ -105,14 +105,23 @@ def iter_legacy_chunks_isolated(
             kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
 
         process = subprocess.Popen(command, **kwargs)  # type: ignore[arg-type]
-        code = wait_for_worker(
-            process,
-            timeout_seconds=timeout_seconds,
-            cancelled=cancelled,
-        )
+        try:
+            code = wait_for_worker(
+                process,
+                timeout_seconds=timeout_seconds,
+                cancelled=cancelled,
+            )
+        except BaseException:
+            if process.stderr is not None:
+                process.stderr.close()
+            raise
+
         stderr = b""
         if process.stderr is not None:
-            stderr = process.stderr.read()[-4000:]
+            try:
+                stderr = process.stderr.read()[-4000:]
+            finally:
+                process.stderr.close()
 
         if code != 0:
             detail = ""
