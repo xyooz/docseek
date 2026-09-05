@@ -9,6 +9,7 @@ from docseek.chunk_store import ChunkStore
 from docseek.chunks import DocumentChunk
 from docseek.search_db import SearchDatabase
 from docseek.search_session import close_thread_search_store, get_thread_search_store
+from docseek.search_sort import SORT_FILENAME
 from docseek.search_worker import SearchRequest, SearchResponse, SearchWorker
 
 
@@ -119,6 +120,38 @@ class SearchWorkerTests(unittest.TestCase):
         self.assertEqual(len(responses), 1)
         self.assertEqual(responses[0].page.items[0].location, "第 2 页")
         self.assertNotIn("page:2", responses[0].page.items[0].snippet)
+
+    def test_worker_propagates_filename_sort_mode(self) -> None:
+        self.store.replace_document(
+            path=r"C:\docs\alpha.pdf",
+            filename="alpha.pdf",
+            extension=".pdf",
+            modified_time=2.0,
+            size=100,
+            chunks=[DocumentChunk(0, "第 1 页", "客户经理办理信贷业务")],
+        )
+        request = SearchRequest(
+            generation=6001,
+            query="信贷",
+            limit=100,
+            offset=0,
+            sort_mode=SORT_FILENAME,
+        )
+        worker = SearchWorker(self.store, request)
+        responses: list[SearchResponse] = []
+        errors: list[tuple[int, str]] = []
+        worker.signals.finished.connect(responses.append)
+        worker.signals.failed.connect(lambda generation, message: errors.append((generation, message)))
+
+        worker.run()
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(responses), 1)
+        self.assertEqual(responses[0].request.sort_mode, SORT_FILENAME)
+        self.assertEqual(
+            [item.filename for item in responses[0].page.items],
+            ["alpha.pdf", "manual.pdf"],
+        )
 
 
 if __name__ == "__main__":
