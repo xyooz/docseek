@@ -41,7 +41,13 @@ class SearchPage:
 
 
 class ChunkStore:
-    """Location-aware FTS index with one file split into multiple bounded chunks."""
+    """Location-aware FTS index with one file split into bounded chunks.
+
+    Raw chunk text is stored once in the ordinary ``chunks`` table. The FTS5
+    tables are contentless inverted indexes that share the same chunk rowid.
+    This avoids keeping a private copy of the full text in every tokenizer
+    index while preserving unicode, short-CJK and trigram retrieval paths.
+    """
 
     def __init__(self, db_path: Path) -> None:
         self.db_path = db_path
@@ -56,67 +62,113 @@ class ChunkStore:
         conn.execute("PRAGMA cache_size=-32768")
         return conn
 
+    @staticmethod
+    def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
+        row = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1",
+            (name,),
+        ).fetchone()
+        return row is not None
+
     def _init_schema(self) -> None:
         with self.connect() as conn:
             conn.execute("PRAGMA journal_mode=WAL")
             previous_version = ensure_schema_compatible(conn)
-            conn.executescript(
+            self._create_v3_schema(conn)
+            if previous_version < 3:
+                self._migrate_pre_v3_chunks(conn)
+            mark_schema_current(conn)
+
+    def _create_v3_schema(self, conn: sqlite3.Connection) -> None:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS chunks(
+                id INTEGER PRIMARY KEY,
+                path TEXT NOT NULL,
+                ordinal INTEGER NOT NULL,
+                location TEXT NOT NULL,
+                content TEXT NOT NULL,
+                UNIQUE(path, ordinal)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_chunks_path ON chunks(path);
+
+            CREATE VIRTUAL TABLE IF NOT EXISTS chunk_index USING fts5(
+                filename,
+                content,
+                content='',
+                tokenize='unicode61 remove_diacritics 2',
+                prefix='2 3 4'
+            );
+
+            CREATE VIRTUAL TABLE IF NOT EXISTS chunk_index_cjk2 USING fts5(
+                filename_tokens,
+                content_tokens,
+                content='',
+                tokenize='unicode61'
+            );
+            """
+        )
+        try:
+            conn.execute(
                 """
-                CREATE VIRTUAL TABLE IF NOT EXISTS chunk_fts USING fts5(
-                    path UNINDEXED,
-                    ordinal UNINDEXED,
-                    location UNINDEXED,
+                CREATE VIRTUAL TABLE IF NOT EXISTS chunk_index_tri USING fts5(
                     filename,
                     content,
-                    tokenize='unicode61 remove_diacritics 2',
-                    prefix='2 3 4'
-                );
-
-                CREATE VIRTUAL TABLE IF NOT EXISTS chunk_fts_cjk2 USING fts5(
-                    path UNINDEXED,
-                    ordinal UNINDEXED,
-                    location UNINDEXED,
-                    filename_tokens,
-                    content_tokens,
-                    tokenize='unicode61'
-                );
-
-                CREATE TABLE IF NOT EXISTS chunk_lookup(
-                    path TEXT NOT NULL,
-                    ordinal INTEGER NOT NULL,
-                    fts_rowid INTEGER NOT NULL,
-                    PRIMARY KEY(path, ordinal)
-                ) WITHOUT ROWID;
+                    content='',
+                    tokenize='trigram case_sensitive 0'
+                )
                 """
             )
-            try:
-                conn.execute(
-                    """
-                    CREATE VIRTUAL TABLE IF NOT EXISTS chunk_fts_tri USING fts5(
-                        path UNINDEXED,
-                        ordinal UNINDEXED,
-                        location UNINDEXED,
-                        filename,
-                        content,
-                        tokenize='trigram case_sensitive 0'
-                    )
-                    """
-                )
-                self._trigram_available = True
-            except sqlite3.OperationalError:
-                self._trigram_available = False
+            self._trigram_available = True
+        except sqlite3.OperationalError:
+            self._trigram_available = False
 
-            if previous_version < 2:
-                conn.execute("DELETE FROM chunk_lookup")
-                conn.execute(
-                    """
-                    INSERT OR REPLACE INTO chunk_lookup(path, ordinal, fts_rowid)
-                    SELECT path, CAST(ordinal AS INTEGER), rowid
-                    FROM chunk_fts
-                    """
-                )
+    def _migrate_pre_v3_chunks(self, conn: sqlite3.Connection) -> None:
+        """Move v1/v2 chunk data into the single-copy v3 layout.
 
-            mark_schema_current(conn)
+        The old base FTS table contains the original text, so migration can
+        rebuild the new inverted indexes without reopening or reparsing source
+        Office/PDF files.
+        """
+        if not self._table_exists(conn, "chunk_fts"):
+            return
+
+        # A schema migration is transactional. Clearing the new tables makes
+        # this deterministic if a development database contains an unfinished
+        # pre-v3 experiment.
+        conn.execute("DELETE FROM chunks")
+        conn.execute("INSERT INTO chunk_index(chunk_index) VALUES('delete-all')")
+        conn.execute("INSERT INTO chunk_index_cjk2(chunk_index_cjk2) VALUES('delete-all')")
+        if self._trigram_available:
+            conn.execute("INSERT INTO chunk_index_tri(chunk_index_tri) VALUES('delete-all')")
+
+        rows = conn.execute(
+            """
+            SELECT rowid, path, CAST(ordinal AS INTEGER) AS ordinal,
+                   location, filename, content
+            FROM chunk_fts
+            ORDER BY rowid
+            """
+        )
+        for row in rows:
+            chunk_id = int(row["rowid"])
+            path = str(row["path"])
+            ordinal = int(row["ordinal"])
+            location = str(row["location"] or "")
+            filename = str(row["filename"] or "")
+            content = str(row["content"] or "")
+            conn.execute(
+                "INSERT INTO chunks(id, path, ordinal, location, content) VALUES (?, ?, ?, ?, ?)",
+                (chunk_id, path, ordinal, location, content),
+            )
+            self._insert_fts_rows(conn, chunk_id, filename, content)
+
+        # Remove the old contentful copies only after the new layout is built.
+        conn.execute("DROP TABLE IF EXISTS chunk_lookup")
+        conn.execute("DROP TABLE IF EXISTS chunk_fts_tri")
+        conn.execute("DROP TABLE IF EXISTS chunk_fts_cjk2")
+        conn.execute("DROP TABLE IF EXISTS chunk_fts")
 
     @staticmethod
     def _cjk_bigrams(text: str) -> str:
@@ -129,6 +181,27 @@ class ChunkStore:
                 tokens.extend(run[i : i + 2] for i in range(len(run) - 1))
         return " ".join(tokens)
 
+    def _insert_fts_rows(
+        self,
+        conn: sqlite3.Connection,
+        chunk_id: int,
+        filename: str,
+        content: str,
+    ) -> None:
+        conn.execute(
+            "INSERT INTO chunk_index(rowid, filename, content) VALUES (?, ?, ?)",
+            (chunk_id, filename, content),
+        )
+        conn.execute(
+            "INSERT INTO chunk_index_cjk2(rowid, filename_tokens, content_tokens) VALUES (?, ?, ?)",
+            (chunk_id, self._cjk_bigrams(filename), self._cjk_bigrams(content)),
+        )
+        if self._trigram_available:
+            conn.execute(
+                "INSERT INTO chunk_index_tri(rowid, filename, content) VALUES (?, ?, ?)",
+                (chunk_id, filename, content),
+            )
+
     def replace_document(
         self,
         *,
@@ -140,7 +213,6 @@ class ChunkStore:
         chunks: Iterable[DocumentChunk],
     ) -> int:
         count = 0
-        filename_bigrams = self._cjk_bigrams(filename)
         with self.connect() as conn:
             conn.execute(
                 """
@@ -157,31 +229,12 @@ class ChunkStore:
             )
             self._delete_chunks(conn, path)
             for chunk in chunks:
-                values = (path, chunk.ordinal, chunk.location, filename, chunk.content)
                 cursor = conn.execute(
-                    "INSERT INTO chunk_fts(path, ordinal, location, filename, content) VALUES (?, ?, ?, ?, ?)",
-                    values,
+                    "INSERT INTO chunks(path, ordinal, location, content) VALUES (?, ?, ?, ?)",
+                    (path, chunk.ordinal, chunk.location, chunk.content),
                 )
-                conn.execute(
-                    "INSERT INTO chunk_lookup(path, ordinal, fts_rowid) VALUES (?, ?, ?)",
-                    (path, chunk.ordinal, int(cursor.lastrowid)),
-                )
-                conn.execute(
-                    "INSERT INTO chunk_fts_cjk2(path, ordinal, location, filename_tokens, content_tokens) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    (
-                        path,
-                        chunk.ordinal,
-                        chunk.location,
-                        filename_bigrams,
-                        self._cjk_bigrams(chunk.content),
-                    ),
-                )
-                if self._trigram_available:
-                    conn.execute(
-                        "INSERT INTO chunk_fts_tri(path, ordinal, location, filename, content) VALUES (?, ?, ?, ?, ?)",
-                        values,
-                    )
+                chunk_id = int(cursor.lastrowid)
+                self._insert_fts_rows(conn, chunk_id, filename, chunk.content)
                 count += 1
         return count
 
@@ -190,12 +243,49 @@ class ChunkStore:
             self._delete_chunks(conn, path)
             conn.execute("DELETE FROM files WHERE path = ?", (path,))
 
+    @staticmethod
+    def _contentless_delete(
+        conn: sqlite3.Connection,
+        table: str,
+        rowid: int,
+        first: str,
+        second: str,
+    ) -> None:
+        # Standard contentless FTS5 tables support deletion through the
+        # special 'delete' command. Supplying the original indexed values keeps
+        # this compatible with SQLite builds older than contentless-delete.
+        conn.execute(
+            f"INSERT INTO {table}({table}, rowid, {('filename_tokens' if table.endswith('_cjk2') else 'filename')}, {('content_tokens' if table.endswith('_cjk2') else 'content')}) "
+            "VALUES ('delete', ?, ?, ?)",
+            (rowid, first, second),
+        )
+
     def _delete_chunks(self, conn: sqlite3.Connection, path: str) -> None:
-        conn.execute("DELETE FROM chunk_lookup WHERE path = ?", (path,))
-        conn.execute("DELETE FROM chunk_fts WHERE path = ?", (path,))
-        conn.execute("DELETE FROM chunk_fts_cjk2 WHERE path = ?", (path,))
-        if self._trigram_available:
-            conn.execute("DELETE FROM chunk_fts_tri WHERE path = ?", (path,))
+        rows = conn.execute(
+            """
+            SELECT c.id, c.content, f.filename
+            FROM chunks c
+            JOIN files f ON f.path = c.path
+            WHERE c.path = ?
+            ORDER BY c.id
+            """,
+            (path,),
+        ).fetchall()
+        for row in rows:
+            chunk_id = int(row["id"])
+            content = str(row["content"] or "")
+            filename = str(row["filename"] or "")
+            self._contentless_delete(conn, "chunk_index", chunk_id, filename, content)
+            self._contentless_delete(
+                conn,
+                "chunk_index_cjk2",
+                chunk_id,
+                self._cjk_bigrams(filename),
+                self._cjk_bigrams(content),
+            )
+            if self._trigram_available:
+                self._contentless_delete(conn, "chunk_index_tri", chunk_id, filename, content)
+        conn.execute("DELETE FROM chunks WHERE path = ?", (path,))
 
     def remove_missing_under_root(self, root: str, existing_paths: set[str]) -> int:
         root_path = Path(root).resolve()
@@ -378,18 +468,8 @@ class ChunkStore:
         )
 
         if is_short_cjk:
-            table = "chunk_fts_cjk2"
+            table = "chunk_index_cjk2"
             fts_query = f'"{compact_cjk}"'
-            score_expr = "bm25(chunk_fts_cjk2, 0.0, 0.0, 0.0, 5.0, 1.0)"
-            snippet_expr = "''"
-            final_join = """
-                JOIN chunk_lookup lookup
-                  ON lookup.path = paged.path
-                 AND lookup.ordinal = paged.ordinal
-                JOIN chunk_fts base
-                  ON base.rowid = lookup.fts_rowid
-            """
-            final_content_expr = "base.content"
         else:
             compact = "".join(query.split())
             use_tri = (
@@ -397,13 +477,10 @@ class ChunkStore:
                 and bool(_CJK_RE.search(query))
                 and len(compact) >= 3
             )
-            table = "chunk_fts_tri" if use_tri else "chunk_fts"
+            table = "chunk_index_tri" if use_tri else "chunk_index"
             fts_query = self._build_fts_query(query)
-            score_expr = f"bm25({table}, 0.0, 0.0, 0.0, 5.0, 1.0)"
-            snippet_expr = f"snippet({table}, 4, '[[HIT]]', '[[/HIT]]', ' … ', 36)"
-            final_join = ""
-            final_content_expr = "NULL"
 
+        score_expr = f"bm25({table}, 5.0, 1.0)"
         clauses = [f"{table} MATCH :fts_query"]
         params: dict[str, object] = {
             "fts_query": fts_query,
@@ -437,18 +514,19 @@ class ChunkStore:
         sql = f"""
             WITH hits AS (
                 SELECT
+                    c.id AS chunk_id,
                     f.path,
                     f.filename,
                     f.extension,
                     f.modified_time,
                     f.size,
-                    CAST({table}.ordinal AS INTEGER) AS ordinal,
-                    {table}.location AS location,
-                    {snippet_expr} AS snippet,
+                    c.ordinal AS ordinal,
+                    c.location AS location,
                     {score_expr} AS bm25_score,
                     {filename_boost_expr} AS filename_boost
                 FROM {table}
-                JOIN files f ON f.path = {table}.path
+                JOIN chunks c ON c.id = {table}.rowid
+                JOIN files f ON f.path = c.path
                 WHERE {' AND '.join(clauses)}
             ),
             ranked AS (
@@ -463,15 +541,15 @@ class ChunkStore:
             ),
             file_hits AS (
                 SELECT
-                    path, filename, extension, modified_time, size,
-                    ordinal, location, snippet, relevance_score
+                    chunk_id, path, filename, extension, modified_time, size,
+                    ordinal, location, relevance_score
                 FROM ranked
                 WHERE file_rank = 1
             ),
             paged AS (
                 SELECT
-                    path, filename, extension, modified_time, size,
-                    ordinal, location, snippet, relevance_score,
+                    chunk_id, path, filename, extension, modified_time, size,
+                    ordinal, location, relevance_score,
                     COUNT(*) OVER() AS total_count
                 FROM file_hits
                 ORDER BY relevance_score ASC, modified_time DESC, path ASC
@@ -480,10 +558,10 @@ class ChunkStore:
             SELECT
                 paged.path, paged.filename, paged.extension,
                 paged.modified_time, paged.size, paged.location,
-                paged.snippet, {final_content_expr} AS raw_content,
+                chunks.content AS raw_content,
                 paged.relevance_score AS score, paged.total_count
             FROM paged
-            {final_join}
+            JOIN chunks ON chunks.id = paged.chunk_id
             ORDER BY paged.relevance_score ASC, paged.modified_time DESC, paged.path ASC
         """
         with self.connect() as conn:
@@ -494,11 +572,12 @@ class ChunkStore:
                     WITH hits AS (
                         SELECT
                             f.path,
-                            CAST({table}.ordinal AS INTEGER) AS ordinal,
+                            c.ordinal AS ordinal,
                             {score_expr} AS bm25_score,
                             {filename_boost_expr} AS filename_boost
                         FROM {table}
-                        JOIN files f ON f.path = {table}.path
+                        JOIN chunks c ON c.id = {table}.rowid
+                        JOIN files f ON f.path = c.path
                         WHERE {' AND '.join(clauses)}
                     ),
                     ranked AS (
@@ -519,27 +598,19 @@ class ChunkStore:
                 }
                 total_count = int(conn.execute(count_sql, count_params).fetchone()["n"])
 
-        items: list[ChunkSearchResult] = []
-        for row in rows:
-            if is_short_cjk:
-                snippet = self._snippet_from_content(
-                    str(row["raw_content"] or ""),
-                    query,
-                )
-            else:
-                snippet = str(row["snippet"] or "")
-            items.append(
-                ChunkSearchResult(
-                    path=str(row["path"]),
-                    filename=str(row["filename"]),
-                    extension=str(row["extension"]),
-                    modified_time=float(row["modified_time"]),
-                    size=int(row["size"]),
-                    location=str(row["location"] or ""),
-                    snippet=snippet,
-                    score=float(row["score"]),
-                )
+        items = [
+            ChunkSearchResult(
+                path=str(row["path"]),
+                filename=str(row["filename"]),
+                extension=str(row["extension"]),
+                modified_time=float(row["modified_time"]),
+                size=int(row["size"]),
+                location=str(row["location"] or ""),
+                snippet=self._snippet_from_content(str(row["raw_content"] or ""), query),
+                score=float(row["score"]),
             )
+            for row in rows
+        ]
         return SearchPage(items=items, total_count=total_count)
 
     def search(
@@ -569,22 +640,33 @@ class ChunkStore:
 
     @staticmethod
     def _snippet_from_content(content: str, query: str, radius: int = 52) -> str:
-        folded_query = query.casefold()
-        position = content.casefold().find(folded_query)
-        if position < 0:
+        cleaned_query = query.strip().strip('"')
+        terms = [term.strip('"') for term in query.split() if term.strip('"')]
+        candidates = [cleaned_query] + terms if cleaned_query else terms
+        folded = content.casefold()
+
+        positions = [
+            (folded.find(candidate.casefold()), candidate)
+            for candidate in candidates
+            if candidate
+        ]
+        positions = [(pos, term) for pos, term in positions if pos >= 0]
+        if not positions:
             return content[: radius * 2].replace("\n", " ")
+
+        position, anchor = min(positions, key=lambda item: item[0])
         start = max(0, position - radius)
-        end = min(len(content), position + len(query) + radius)
+        end = min(len(content), position + len(anchor) + radius)
         snippet = content[start:end].replace("\n", " ")
 
-        local_position = snippet.casefold().find(folded_query)
-        if local_position >= 0:
-            hit_end = local_position + len(query)
-            snippet = (
-                snippet[:local_position]
-                + "[[HIT]]"
-                + snippet[local_position:hit_end]
-                + "[[/HIT]]"
-                + snippet[hit_end:]
+        highlight_terms = sorted({term for term in terms if term}, key=len, reverse=True)
+        if cleaned_query and cleaned_query not in highlight_terms:
+            highlight_terms.insert(0, cleaned_query)
+        if highlight_terms:
+            pattern = re.compile(
+                "|".join(re.escape(term) for term in highlight_terms),
+                flags=re.IGNORECASE,
             )
+            snippet = pattern.sub(lambda match: f"[[HIT]]{match.group(0)}[[/HIT]]", snippet)
+
         return ("… " if start else "") + snippet + (" …" if end < len(content) else "")
