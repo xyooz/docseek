@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "docseek"
-version = "0.2.0"
+dynamic = ["version"]
 description = "Local full-text search for office documents"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -26,9 +26,15 @@ calamine = ["python-calamine>=0.8.2"]
 tika = ["iscc-tika>=0.6.0"]
 # Vendor fallback only; normal DocSeek startup never requires pywin32/WPS.
 wps = ["pywin32>=306; platform_system == 'Windows'"]
+# Keep the portable Windows build reproducible. This extra is never required by
+# normal DocSeek users or normal test/runtime installations.
+package = ["pyinstaller==6.22.2"]
 
 [project.scripts]
 docseek = "docseek.app:main"
+
+[tool.setuptools.dynamic]
+version = {attr = "docseek.__version__"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
