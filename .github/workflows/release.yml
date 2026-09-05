@@ -1,4 +1,5 @@
 name: release
+# Tag-triggered releases must point to a commit whose message does not contain a GitHub Actions skip token.
 
 on:
   workflow_dispatch:
