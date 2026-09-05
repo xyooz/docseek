@@ -6,6 +6,8 @@ import sqlite3
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+from .schema import ensure_schema_compatible
+
 
 _CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
 _CJK_RUN_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]+")
@@ -37,7 +39,18 @@ class SearchDatabase:
         self.db_path = db_path
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._trigram_available = False
+        self._preflight_schema_version()
         self._init_schema()
+
+    def _preflight_schema_version(self) -> None:
+        """Reject newer indexes before any compatibility table or WAL mutation."""
+        if not self.db_path.exists():
+            return
+        conn = sqlite3.connect(self.db_path, timeout=10)
+        try:
+            ensure_schema_compatible(conn)
+        finally:
+            conn.close()
 
     def connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(
