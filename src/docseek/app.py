@@ -3,9 +3,11 @@ from __future__ import annotations
 import sys
 
 from PySide6.QtCore import QTimer
+from PySide6.QtGui import QAction
 from PySide6.QtWidgets import QApplication, QMenu, QToolButton
 
 from . import app_base
+from .search_help import SearchHelpDialog
 from .search_presets import SearchState, SearchStateStore, search_state_label
 from .search_session import close_persistent_search_stores
 from .search_sort import SORT_RELEVANCE
@@ -27,12 +29,7 @@ empty_result_html = app_base.empty_result_html
 
 
 class MainWindow(app_base.MainWindow):
-    """Desktop window with persisted recent and saved searches.
-
-    The search/index/result-view core stays in ``app_base.MainWindow``. This
-    layer only owns product-level search-state history so the new persistence
-    behavior cannot accidentally change ranking, pagination or indexing.
-    """
+    """Desktop window with persisted recent and saved searches."""
 
     HISTORY_DELAY_MS = 1200
     SEARCH_SHUTDOWN_TIMEOUT_MS = 10_000
@@ -87,6 +84,13 @@ class MainWindow(app_base.MainWindow):
         self.favorite_button.setToolTip("收藏当前关键词、筛选和排序，方便以后直接恢复")
         self.favorite_button.clicked.connect(self._toggle_saved_search)
 
+        self.help_button = QToolButton()
+        self.help_button.setText("帮助")
+        self.help_button.setMinimumHeight(38)
+        self.help_button.setMinimumWidth(58)
+        self.help_button.setToolTip("查看搜索语法、结构定位和快捷键（F1）")
+        self.help_button.clicked.connect(self._show_search_help)
+
         root_layout = self.centralWidget().layout()
         top_bar = root_layout.itemAt(0).layout() if root_layout is not None else None
         if top_bar is None:
@@ -96,6 +100,16 @@ class MainWindow(app_base.MainWindow):
             insert_at = top_bar.count()
         top_bar.insertWidget(insert_at, self.history_button)
         top_bar.insertWidget(insert_at + 1, self.favorite_button)
+        top_bar.insertWidget(insert_at + 2, self.help_button)
+
+        help_action = QAction("搜索帮助", self)
+        help_action.setShortcut("F1")
+        help_action.triggered.connect(self._show_search_help)
+        self.addAction(help_action)
+        self.search_help_action = help_action
+
+    def _show_search_help(self, *_args) -> None:
+        SearchHelpDialog(self).exec()
 
     def _current_search_state(self) -> SearchState:
         return SearchState(
