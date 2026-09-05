@@ -28,6 +28,8 @@ jobs:
         run: python benchmarks/benchmark_search.py --files 1000 --chunks 3 --payload-kb 4 --batch-size 128 --iterations 3 --warmups 1 --limit 100
       - name: Benchmark persistent search session at 1k files
         run: python benchmarks/benchmark_search_session.py --files 1000 --chunks 3 --payload-kb 4 --batch-size 128 --iterations 3 --limit 100
+      - name: Retrieval quality baseline
+        run: python benchmarks/evaluate_retrieval.py --k 5 --assert-baseline
       - name: One-shot filename index split experiment
         if: contains(github.event.head_commit.message, '[filename-bench]')
         run: python benchmarks/benchmark_filename_split.py --files 5000 --chunks 12 --payload-kb 1 --iterations 5
