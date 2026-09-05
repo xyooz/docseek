@@ -7,11 +7,14 @@ from docx import Document
 from openpyxl import load_workbook
 from pptx import Presentation
 
+from .document_types import KNOWN_DOCUMENT_EXTENSIONS
 
-SUPPORTED_EXTENSIONS = {
-    ".txt", ".md", ".log", ".csv",
-    ".docx", ".xlsx", ".pptx", ".pdf",
-}
+
+# Compatibility export used by the watcher/indexer. This now means “known
+# document formats worth attempting locally”, not “every format has a built-in
+# Python parser”. Missing optional adapters are surfaced as persistent index
+# issues instead of being silently ignored.
+SUPPORTED_EXTENSIONS = set(KNOWN_DOCUMENT_EXTENSIONS)
 
 
 def extract_text(path: Path) -> str:
@@ -27,6 +30,14 @@ def extract_text(path: Path) -> str:
         return _extract_pptx(path)
     if suffix == ".pdf":
         return _extract_pdf(path)
+
+    # Legacy API compatibility for newly registered optional formats. Keep the
+    # same extraction broker as the chunk indexer instead of implementing a
+    # second set of format parsers here.
+    if suffix in SUPPORTED_EXTENSIONS:
+        from .chunks import iter_document_chunks
+
+        return "\n".join(chunk.content for chunk in iter_document_chunks(path))
 
     raise ValueError(f"Unsupported file type: {suffix}")
 
