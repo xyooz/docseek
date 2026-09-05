@@ -112,7 +112,7 @@ class ProgressiveSearchEngine:
                     rank AS bm25_score
                 FROM {table}
                 JOIN chunks c ON c.id = {table}.rowid
-                JOIN files f ON f.path = c.path
+                JOIN files f ON f.id = c.file_id
                 WHERE {' AND '.join(clauses)}
                 ORDER BY rank ASC
                 LIMIT :candidate_limit
@@ -221,10 +221,10 @@ class ProgressiveSearchEngine:
             max_size=max_size,
         )
         sql = f"""
-            SELECT COUNT(DISTINCT f.path) AS n
+            SELECT COUNT(DISTINCT f.id) AS n
             FROM {table}
             JOIN chunks c ON c.id = {table}.rowid
-            JOIN files f ON f.path = c.path
+            JOIN files f ON f.id = c.file_id
             WHERE {' AND '.join(clauses)}
         """
         with self.store.connect() as conn:
