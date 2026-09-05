@@ -32,37 +32,6 @@ class SearchWorkerTests(unittest.TestCase):
         close_thread_search_store()
         self.temp_dir.cleanup()
 
-    def test_worker_returns_exact_page_with_generation(self) -> None:
-        request = SearchRequest(
-            generation=1007,
-            query="信贷",
-            limit=100,
-            offset=0,
-            select_first=True,
-        )
-        worker = SearchWorker(self.store, request)
-        responses: list[SearchResponse] = []
-        errors: list[tuple[int, str]] = []
-        worker.signals.finished.connect(responses.append)
-        worker.signals.failed.connect(lambda generation, message: errors.append((generation, message)))
-
-        worker.run()
-
-        self.assertEqual(errors, [])
-        self.assertEqual(len(responses), 1)
-        response = responses[0]
-        self.assertEqual(response.request.generation, 1007)
-        self.assertTrue(response.request.select_first)
-        self.assertEqual(response.page.total_count, 1)
-        self.assertEqual(response.page.items[0].filename, "manual.pdf")
-        self.assertGreaterEqual(response.elapsed_ms, 0.0)
-
-    def test_search_session_is_reused_on_same_thread(self) -> None:
-        first = get_thread_search_store(self.db_path)
-        second = get_thread_search_store(self.db_path)
-        self.assertIs(first, second)
-        self.assertEqual(first.search("信贷")[0].filename, "manual.pdf")
-
     def test_older_queued_generation_becomes_noop(self) -> None:
         old = SearchWorker(
             self.store,
@@ -82,6 +51,12 @@ class SearchWorkerTests(unittest.TestCase):
         self.assertEqual(responses[0].page.items, [])
         self.assertEqual(responses[0].page.total_count, 0)
 
+    def test_search_session_is_reused_on_same_thread(self) -> None:
+        first = get_thread_search_store(self.db_path)
+        second = get_thread_search_store(self.db_path)
+        self.assertIs(first, second)
+        self.assertEqual(first.search("信贷")[0].filename, "manual.pdf")
+
     def test_worker_propagates_search_failure_with_generation(self) -> None:
         request = SearchRequest(generation=3011, query="信贷", limit=100, offset=0)
         worker = SearchWorker(self.store, request)
@@ -96,6 +71,31 @@ class SearchWorkerTests(unittest.TestCase):
             worker.run()
 
         self.assertEqual(errors, [(3011, "synthetic failure")])
+
+    def test_worker_returns_exact_page_with_generation(self) -> None:
+        request = SearchRequest(
+            generation=4007,
+            query="信贷",
+            limit=100,
+            offset=0,
+            select_first=True,
+        )
+        worker = SearchWorker(self.store, request)
+        responses: list[SearchResponse] = []
+        errors: list[tuple[int, str]] = []
+        worker.signals.finished.connect(responses.append)
+        worker.signals.failed.connect(lambda generation, message: errors.append((generation, message)))
+
+        worker.run()
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(responses), 1)
+        response = responses[0]
+        self.assertEqual(response.request.generation, 4007)
+        self.assertTrue(response.request.select_first)
+        self.assertEqual(response.page.total_count, 1)
+        self.assertEqual(response.page.items[0].filename, "manual.pdf")
+        self.assertGreaterEqual(response.elapsed_ms, 0.0)
 
 
 if __name__ == "__main__":
