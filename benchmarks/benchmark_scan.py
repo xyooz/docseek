@@ -46,9 +46,15 @@ def main() -> None:
 
         changed = root / "document_000000.txt"
         changed.write_text("客户经理 信贷 精准增量更新后的内容", encoding="utf-8")
-        started = time.perf_counter()
-        update_stats = DirectoryIndexer(db).update_paths([changed])
-        update_ms = (time.perf_counter() - started) * 1000
+
+        init_started = time.perf_counter()
+        incremental_indexer = DirectoryIndexer(db)
+        init_ms = (time.perf_counter() - init_started) * 1000
+
+        update_started = time.perf_counter()
+        update_stats = incremental_indexer.update_paths([changed])
+        update_only_ms = (time.perf_counter() - update_started) * 1000
+        total_update_ms = init_ms + update_only_ms
 
         print("DocSeek directory scan benchmark")
         print(f"files={args.files:,}")
@@ -63,7 +69,8 @@ def main() -> None:
             f"unchanged={second_stats.unchanged}"
         )
         print(
-            f"single_file_update={update_ms:.2f}ms "
+            f"single_file_total={total_update_ms:.2f}ms "
+            f"indexer_init={init_ms:.2f}ms update_only={update_only_ms:.2f}ms "
             f"indexed={update_stats.indexed} removed={update_stats.removed}"
         )
 
