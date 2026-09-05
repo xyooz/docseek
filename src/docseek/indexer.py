@@ -255,6 +255,13 @@ class DirectoryIndexer:
                 raise IndexCancelled()
             if on_detail:
                 on_detail(path, location, current)
+            elif on_progress:
+                # The current desktop worker already transports file progress
+                # as a Path plus counters. Preserve that compatibility while
+                # exposing useful row-level XLSX progress immediately; a future
+                # UI can opt into the structured on_detail callback directly.
+                display = Path(f"{path.name} · {location} · 已读取 {current:,} 行")
+                on_progress(display, stats)
 
         replace = writer.replace_document if writer is not None else self.chunk_store.replace_document
         chunk_count = replace(
@@ -265,7 +272,7 @@ class DirectoryIndexer:
             size=stat.st_size,
             chunks=iter_document_chunks(
                 path,
-                on_progress=report_detail if on_detail or path.suffix.lower() == ".xlsx" else None,
+                on_progress=report_detail if on_detail or on_progress or path.suffix.lower() == ".xlsx" else None,
             ),
         )
         if clear_issue:
