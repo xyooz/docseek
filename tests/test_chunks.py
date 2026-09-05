@@ -59,6 +59,34 @@ class DocumentChunkExtractionTests(unittest.TestCase):
             ],
         )
 
+    def test_xlsx_progress_is_throttled_and_reports_final_row(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "大表.xlsx"
+            workbook = Workbook(write_only=True)
+            worksheet = workbook.create_sheet("客户明细")
+            for row_no in range(1, 2_506):
+                worksheet.append([row_no, f"客户{row_no}"])
+            workbook.save(path)
+            workbook.close()
+
+            progress: list[tuple[str, int]] = []
+            list(
+                iter_document_chunks(
+                    path,
+                    xlsx_rows_per_chunk=200,
+                    on_progress=lambda location, current: progress.append((location, current)),
+                )
+            )
+
+        self.assertEqual(
+            progress,
+            [
+                ("工作表 客户明细", 1_000),
+                ("工作表 客户明细", 2_000),
+                ("工作表 客户明细", 2_505),
+            ],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
