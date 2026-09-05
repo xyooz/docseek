@@ -187,7 +187,9 @@ class ExactGroupedSearchEngine:
                 modified_time=float(row["modified_time"]),
                 size=int(row["size"]),
                 location=str(row["location"] or ""),
-                snippet=self.store._snippet_from_content(str(row["raw_content"] or ""), query),
+                snippet=self.store._snippet_from_content(
+                    self.store.decode_content(row["raw_content"]), query
+                ),
                 score=float(row["score"]),
             )
             for row in rows
