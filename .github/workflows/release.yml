@@ -1,0 +1,135 @@
+name: release
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/release.yml"
+      - "packaging/windows/**"
+      - "pyproject.toml"
+      - "src/docseek/__init__.py"
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build-release-candidate:
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install packaging dependencies
+        run: python -m pip install -e ".[calamine,tika,wps,package]"
+
+      - name: Validate release version
+        id: version
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = (python -c "import docseek; print(docseek.__version__)").Trim()
+          if (-not $version) { throw "Unable to resolve DocSeek version" }
+          "version=$version" >> $env:GITHUB_OUTPUT
+          Write-Host "DocSeek version: $version"
+
+          if ("${{ github.ref_type }}" -eq "tag") {
+            $expected = "v$version"
+            if ("${{ github.ref_name }}" -ne $expected) {
+              throw "Release tag/version mismatch: tag=${{ github.ref_name }}, expected=$expected"
+            }
+          }
+
+      - name: Build portable ZIP and Setup.exe
+        shell: pwsh
+        run: ./packaging/windows/build_installer.ps1
+
+      - name: Verify installer lifecycle
+        shell: pwsh
+        run: ./packaging/windows/verify_installer.ps1
+
+      - name: Verify portable ZIP after clean extraction
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $zip = Get-ChildItem dist\DocSeek-*-Windows-x64.zip | Select-Object -First 1
+          if (-not $zip) { throw "Portable ZIP was not found" }
+          $verifyRoot = Join-Path $env:RUNNER_TEMP "docseek-release-portable-verify"
+          if (Test-Path $verifyRoot) { Remove-Item -Recurse -Force $verifyRoot }
+          New-Item -ItemType Directory -Path $verifyRoot | Out-Null
+          Expand-Archive -Path $zip.FullName -DestinationPath $verifyRoot
+          $exe = Join-Path $verifyRoot "DocSeek.exe"
+          if (-not (Test-Path $exe)) { throw "Extracted DocSeek.exe was not found" }
+          $env:DOCSEEK_FROZEN_SMOKE = "1"
+          try {
+            $smoke = Start-Process -FilePath $exe -Wait -PassThru
+            if ($smoke.ExitCode -ne 0) {
+              throw "Extracted portable smoke failed with exit code $($smoke.ExitCode)"
+            }
+          }
+          finally {
+            Remove-Item Env:DOCSEEK_FROZEN_SMOKE -ErrorAction SilentlyContinue
+          }
+
+      - name: Generate SHA256SUMS
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $assets = @(
+            (Get-ChildItem dist\DocSeek-*-Windows-x64.zip | Select-Object -First 1),
+            (Get-ChildItem dist\DocSeek-*-Setup-x64.exe | Select-Object -First 1)
+          )
+          if ($assets -contains $null) { throw "Release assets are incomplete" }
+          $lines = foreach ($asset in $assets) {
+            $hash = (Get-FileHash $asset.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $($asset.Name)"
+          }
+          $checksumPath = Join-Path (Resolve-Path dist) "SHA256SUMS.txt"
+          Set-Content -Path $checksumPath -Value $lines -Encoding ascii
+          Get-Content $checksumPath
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: docseek-release-candidate
+          path: |
+            dist/DocSeek-*-Windows-x64.zip
+            dist/DocSeek-*-Setup-x64.exe
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 14
+
+  publish-release:
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: build-release-candidate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: docseek-release-candidate
+          path: release-assets
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.build-release-candidate.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" release-assets/* --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" release-assets/* \
+              --verify-tag \
+              --generate-notes \
+              --title "DocSeek $VERSION" \
+              --repo "$GITHUB_REPOSITORY"
+          fi
