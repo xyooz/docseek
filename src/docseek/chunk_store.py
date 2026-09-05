@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
+from .chunk_codec import decode_chunk_content, encode_chunk_content
 from .chunks import DocumentChunk
 from .schema import ensure_schema_compatible, mark_schema_current
 
@@ -53,11 +54,12 @@ class ChunkStore:
     Schema v4 removed the old trigram copy because a contiguous Chinese query
     of length >= 2 can be represented exactly as an overlapping-bigram phrase.
     Schema v5 introduced the integer ``files.id`` relationship. Schema v6
-    finishes that migration by removing the duplicate full path from every
-    chunk: paths live only in ``files`` and chunks reference them by ``file_id``.
-    Existing FTS rowids remain stable during migration, so source Office/PDF
-    files do not need to be reparsed and the inverted indexes do not need to be
-    rebuilt just to remove the duplicated path column.
+    removed the duplicate full path from every chunk. Schema v7 changes the
+    logical raw-content format: new/updated chunks store a versioned zlib BLOB,
+    while legacy TEXT rows remain readable. The FTS indexes still receive the
+    original Unicode text, so search semantics and FTS rowids do not change.
+    Existing v6 rows are intentionally not rewritten during startup; this avoids
+    a large upgrade WAL and lets changed documents migrate lazily.
     """
 
     def __init__(self, db_path: Path) -> None:
@@ -101,6 +103,9 @@ class ChunkStore:
             else:
                 self._create_v6_schema(conn)
 
+            # v7 is deliberately a logical codec migration. SQLite's dynamic
+            # typing lets the existing TEXT-affinity column hold compressed
+            # BLOBs, so opening a large v6 database does not rewrite every row.
             mark_schema_current(conn)
 
     @staticmethod
@@ -339,6 +344,10 @@ class ChunkStore:
         escaped = " ".join(token.replace('"', '""') for token in tokens)
         return f'"{escaped}"'
 
+    @staticmethod
+    def decode_content(value: object) -> str:
+        return decode_chunk_content(value)
+
     def _insert_fts_rows(
         self,
         conn: sqlite3.Connection,
@@ -396,7 +405,12 @@ class ChunkStore:
                     INSERT INTO chunks(file_id, ordinal, location, content)
                     VALUES (?, ?, ?, ?)
                     """,
-                    (file_id, chunk.ordinal, chunk.location, chunk.content),
+                    (
+                        file_id,
+                        chunk.ordinal,
+                        chunk.location,
+                        encode_chunk_content(chunk.content),
+                    ),
                 )
                 chunk_id = int(cursor.lastrowid)
                 self._insert_fts_rows(conn, chunk_id, filename, chunk.content)
@@ -448,7 +462,7 @@ class ChunkStore:
 
         for row in rows:
             chunk_id = int(row["id"])
-            content = str(row["content"] or "")
+            content = decode_chunk_content(row["content"])
             filename = str(row["filename"] or "")
             self._contentless_delete(conn, "chunk_index", chunk_id, filename, content)
             self._contentless_delete(
@@ -808,7 +822,7 @@ class ChunkStore:
                 modified_time=float(row["modified_time"]),
                 size=int(row["size"]),
                 location=str(row["location"] or ""),
-                snippet=self._snippet_from_content(str(row["raw_content"] or ""), query),
+                snippet=self._snippet_from_content(row["raw_content"], query),
                 score=float(row["score"]),
             )
             for row in rows
@@ -841,10 +855,11 @@ class ChunkStore:
         ).items
 
     @classmethod
-    def _snippet_from_content(cls, content: str, query: str, radius: int = 52) -> str:
+    def _snippet_from_content(cls, content: object, query: str, radius: int = 52) -> str:
+        decoded = decode_chunk_content(content)
         terms = [text for text, _quoted in cls._split_query_terms(query) if text]
         candidates = sorted(set(terms), key=len, reverse=True)
-        folded = content.casefold()
+        folded = decoded.casefold()
 
         positions = [
             (folded.find(candidate.casefold()), candidate)
@@ -852,12 +867,12 @@ class ChunkStore:
         ]
         positions = [(pos, term) for pos, term in positions if pos >= 0]
         if not positions:
-            return content[: radius * 2].replace("\n", " ")
+            return decoded[: radius * 2].replace("\n", " ")
 
         position, anchor = min(positions, key=lambda item: item[0])
         start = max(0, position - radius)
-        end = min(len(content), position + len(anchor) + radius)
-        snippet = content[start:end].replace("\n", " ")
+        end = min(len(decoded), position + len(anchor) + radius)
+        snippet = decoded[start:end].replace("\n", " ")
 
         if candidates:
             pattern = re.compile(
@@ -866,4 +881,4 @@ class ChunkStore:
             )
             snippet = pattern.sub(lambda match: f"[[HIT]]{match.group(0)}[[/HIT]]", snippet)
 
-        return ("… " if start else "") + snippet + (" …" if end < len(content) else "")
+        return ("… " if start else "") + snippet + (" …" if end < len(decoded) else "")
