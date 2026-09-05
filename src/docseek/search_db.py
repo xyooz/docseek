@@ -59,7 +59,12 @@ class SearchDatabase:
             factory=_ClosingConnection,
         )
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
+        # journal_mode is database-wide state and can require a schema-level
+        # lock even when the database is already in WAL mode. Reissuing it on
+        # every metadata/read connection created avoidable lock contention on
+        # real Windows desktops while the index writer held a transaction.
+        # Configure WAL once during schema initialization instead.
+        conn.execute("PRAGMA busy_timeout=10000")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA temp_store=MEMORY")
         conn.execute("PRAGMA cache_size=-32768")
@@ -67,6 +72,9 @@ class SearchDatabase:
 
     def _init_schema(self) -> None:
         with self.connect() as conn:
+            # Set WAL once per database initialization. Normal SearchDatabase
+            # connections deliberately do not mutate journal mode.
+            conn.execute("PRAGMA journal_mode=WAL")
             conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS files (
