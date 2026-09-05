@@ -26,7 +26,22 @@ class ParsedQuery:
 
     @property
     def text(self) -> str:
-        return " ".join(self.terms)
+        """Serialize parsed terms without losing quoted-phrase boundaries.
+
+        `_split_tokens()` intentionally removes user-facing quotes. A quoted
+        phrase is therefore represented as a single term containing spaces.
+        Re-quoting only those terms preserves the distinction between:
+
+        - `customer manager`   -> two terms joined with AND;
+        - `"customer manager"` -> one exact phrase.
+        """
+        rendered: list[str] = []
+        for term in self.terms:
+            if any(char.isspace() for char in term):
+                rendered.append(f'"{term.replace(chr(34), chr(34) * 2)}"')
+            else:
+                rendered.append(term)
+        return " ".join(rendered)
 
     @property
     def has_filters(self) -> bool:
