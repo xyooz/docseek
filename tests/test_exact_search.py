@@ -174,6 +174,35 @@ class ExactGroupedSearchTests(unittest.TestCase):
         page = self.grouped.search_page('客户经理 sheet:"客户 数据"')
         self.assertEqual(page.items[0].location, "工作表 客户 数据 · 行 1-20")
 
+    def test_filtered_structure_hint_keeps_deep_pagination_exact(self) -> None:
+        for index in range(12):
+            self._add(
+                index,
+                extension=".pdf" if index % 2 == 0 else ".docx",
+                folder="制度" if index % 4 in (0, 1) else "培训",
+                size=100 + index,
+                modified_time=float(index),
+                chunks=["信贷业务", "信贷业务"],
+                locations=["第 1 页", "第 2 页"],
+            )
+
+        kwargs = {
+            "extension": ".pdf",
+            "path_contains": "制度",
+            "min_size": 100,
+            "max_size": 200,
+        }
+        page = self.grouped.search_page(
+            "信贷业务 page:2",
+            limit=2,
+            offset=1,
+            **kwargs,
+        )
+        self.assertEqual(page.total_count, 3)
+        self.assertEqual([Path(row.path).stem for row in page.items], ["doc_004", "doc_000"])
+        self.assertTrue(all(row.location == "第 2 页" for row in page.items))
+        self.assertEqual(self.grouped.count_files("信贷业务 page:2", **kwargs), 3)
+
     def test_structure_hint_does_not_change_file_count(self) -> None:
         for index in range(4):
             self._add(
