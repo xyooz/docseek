@@ -5,6 +5,7 @@ from collections.abc import Iterable
 from types import TracebackType
 from typing import Self
 
+from .chunk_codec import encode_chunk_content
 from .chunk_store import ChunkStore
 from .chunks import DocumentChunk
 
@@ -110,7 +111,12 @@ class ChunkBatchWriter:
                     INSERT INTO chunks(file_id, ordinal, location, content)
                     VALUES (?, ?, ?, ?)
                     """,
-                    (file_id, chunk.ordinal, chunk.location, chunk.content),
+                    (
+                        file_id,
+                        chunk.ordinal,
+                        chunk.location,
+                        encode_chunk_content(chunk.content),
+                    ),
                 )
                 chunk_id = int(cursor.lastrowid)
                 self.store._insert_fts_rows(conn, chunk_id, filename, chunk.content)
