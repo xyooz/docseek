@@ -46,6 +46,9 @@ jobs:
       - name: One-shot first-index component profile
         if: contains(github.event.head_commit.message, '[index-profile]')
         run: python benchmarks/benchmark_index_profile.py --files 1000 --chunks 3 --payload-kb 4 --batch-size 32
+      - name: One-shot indexing batch-size sweep
+        if: contains(github.event.head_commit.message, '[batch-bench]')
+        run: python benchmarks/benchmark_batch_size.py --files 1000 --chunks 3 --payload-kb 4 --batch-sizes 16 32 64 128 256
       - name: Directory scan smoke
         run: python benchmarks/benchmark_scan.py --files 20
       - name: Test
