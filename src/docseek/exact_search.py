@@ -5,7 +5,7 @@ from .structure_ranking import parse_structure_query
 
 
 class ExactGroupedSearchEngine:
-    """Exact file-level search with late metadata and optional structure hints.
+    """Exact file-level search with late metadata and structure-aware ranking.
 
     FTS ranking is chunk-level, while filename boosts and supported metadata
     filters are file-level. Those file-level values are constant for every chunk
@@ -13,9 +13,13 @@ class ExactGroupedSearchEngine:
     repeats work.
 
     Explicit ``page:N``, ``slide:N`` and ``sheet:name`` hints are schema-free:
-    they are removed from the FTS text and add a small boost to matching
-    ``chunks.location`` values while the best chunk is selected. Queries without
-    structure hints preserve the existing exact BM25 + filename semantics.
+    they are removed from the FTS text and add a strong boost to matching
+    ``chunks.location`` values while the best chunk is selected.
+
+    Ordinary queries also get a smaller automatic boost when their compact text
+    appears in a semantic locator such as an Excel sheet name or an enriched
+    document/slide title. This keeps explicit hints optional and lets structure
+    improve ranking without changing the persisted database schema.
     """
 
     def __init__(self, store: ChunkStore) -> None:
@@ -41,6 +45,31 @@ class ExactGroupedSearchEngine:
                  AND LOWER(REPLACE(c.location, ' ', '')) LIKE
                      LOWER('工作表' || REPLACE(:sheet_hint, ' ', '') || '·行%')
                     THEN -2.5
+                ELSE 0.0
+            END
+        """
+
+    @staticmethod
+    def _automatic_structure_boost_expr() -> str:
+        """Small intent boost for semantic structure already stored in location.
+
+        The check is intentionally conservative: generic page/block coordinates
+        are ignored, while sheet names and explicit title-enriched locators can
+        participate. This avoids changing normal PDF/page ranking just because a
+        query happens to contain a number or generic location word.
+        """
+        return """
+            CASE
+                WHEN :location_query <> ''
+                 AND (
+                     LOWER(REPLACE(c.location, ' ', '')) LIKE '工作表%'
+                     OR INSTR(c.location, ' · 标题 ') > 0
+                 )
+                 AND INSTR(
+                     LOWER(REPLACE(c.location, ' ', '')),
+                     LOWER(:location_query)
+                 ) > 0
+                    THEN -1.25
                 ELSE 0.0
             END
         """
@@ -76,9 +105,12 @@ class ExactGroupedSearchEngine:
         table, fts_query = self.store._select_index(content_query)
         score_expr = f"bm25({table}, 5.0, 1.0)"
         structure_boost_expr = self._structure_boost_expr()
+        automatic_structure_boost_expr = self._automatic_structure_boost_expr()
+        plain_query = self.store._plain_query_text(content_query)
         params: dict[str, object] = {
             "fts_query": fts_query,
-            "raw_query": self.store._plain_query_text(content_query),
+            "raw_query": plain_query,
+            "location_query": "".join(plain_query.split()),
             "page_hint": structured.hints.page,
             "slide_hint": structured.hints.slide,
             "sheet_hint": structured.hints.sheet,
@@ -121,7 +153,9 @@ class ExactGroupedSearchEngine:
                     c.id AS chunk_id,
                     c.file_id AS file_id,
                     c.ordinal AS ordinal,
-                    {score_expr} + ({structure_boost_expr}) AS chunk_score
+                    {score_expr}
+                    + ({structure_boost_expr})
+                    + ({automatic_structure_boost_expr}) AS chunk_score
                 FROM {table}
                 JOIN chunks c ON c.id = {table}.rowid
                 WHERE {table} MATCH :fts_query

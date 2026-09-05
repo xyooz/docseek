@@ -103,6 +103,35 @@ class ExactGroupedSearchTests(unittest.TestCase):
         actual = self.grouped.search_page('"customer manager"')
         self.assertEqual(self._signature(actual), self._signature(expected))
 
+    def test_plain_query_prefers_matching_sheet_location(self) -> None:
+        self._add(
+            0,
+            extension=".xlsx",
+            chunks=["客户 数据", "客户 数据"],
+            locations=["工作表 汇总 · 行 1-20", "工作表 客户 数据 · 行 1-20"],
+        )
+        page = self.grouped.search_page("客户 数据")
+        self.assertEqual(page.items[0].location, "工作表 客户 数据 · 行 1-20")
+
+    def test_plain_query_prefers_enriched_title_location(self) -> None:
+        self._add(
+            0,
+            extension=".pptx",
+            chunks=["risk management", "risk management"],
+            locations=["幻灯片 1 · 标题 Overview", "幻灯片 2 · 标题 Risk Management"],
+        )
+        page = self.grouped.search_page("risk management")
+        self.assertEqual(page.items[0].location, "幻灯片 2 · 标题 Risk Management")
+
+    def test_generic_location_text_does_not_receive_automatic_boost(self) -> None:
+        self._add(
+            0,
+            chunks=["客户 数据", "客户 数据"],
+            locations=["位置 1", "位置 客户 数据"],
+        )
+        page = self.grouped.search_page("客户 数据")
+        self.assertEqual(page.items[0].location, "位置 1")
+
     def test_page_hint_prefers_matching_pdf_page(self) -> None:
         self._add(
             0,
