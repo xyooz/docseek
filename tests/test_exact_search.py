@@ -154,6 +154,16 @@ class ExactGroupedSearchTests(unittest.TestCase):
         page = self.grouped.search_page("风险管理 slide:4")
         self.assertEqual(page.items[0].location, "幻灯片 4 · 标题 风险管理")
 
+    def test_slide_hint_does_not_match_prefix_neighbor(self) -> None:
+        self._add(
+            0,
+            extension=".pptx",
+            chunks=["风险管理", "风险管理"],
+            locations=["幻灯片 40 · 标题 风险管理", "幻灯片 4 · 标题 风险管理"],
+        )
+        page = self.grouped.search_page("风险管理 slide:4")
+        self.assertEqual(page.items[0].location, "幻灯片 4 · 标题 风险管理")
+
     def test_sheet_hint_prefers_matching_sheet(self) -> None:
         self._add(
             0,
