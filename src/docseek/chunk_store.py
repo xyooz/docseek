@@ -41,17 +41,24 @@ class SearchPage:
 
 
 class ChunkStore:
-    """Location-aware FTS index with one file split into bounded chunks.
+    """Location-aware local FTS index.
 
-    Raw chunk text is stored once in the ordinary ``chunks`` table. The FTS5
-    tables are contentless inverted indexes that share the same chunk rowid.
-    This avoids keeping a private copy of the full text in every tokenizer
-    index while preserving unicode, short-CJK and trigram retrieval paths.
+    Raw chunk text is stored once in ``chunks``. Two contentless FTS5 indexes
+    provide complementary retrieval paths:
+
+    - ``chunk_index`` for normal unicode/Latin token search;
+    - ``chunk_index_cjk2`` for Chinese substring search using overlapping
+      bigrams and FTS phrase matching.
+
+    Earlier versions also maintained a full trigram copy. Schema v4 removes
+    that copy because a contiguous Chinese query of length >= 2 can be
+    represented exactly as an overlapping-bigram phrase (for example
+    ``客户经理`` -> ``客户 户经 经理``). This reduces write amplification and
+    database size without giving up contiguous Chinese substring matching.
     """
 
     def __init__(self, db_path: Path) -> None:
         self.db_path = db_path
-        self._trigram_available = False
         self._init_schema()
 
     def connect(self) -> sqlite3.Connection:
@@ -74,12 +81,19 @@ class ChunkStore:
         with self.connect() as conn:
             conn.execute("PRAGMA journal_mode=WAL")
             previous_version = ensure_schema_compatible(conn)
-            self._create_v3_schema(conn)
+
             if previous_version < 3:
+                self._create_v4_schema(conn)
                 self._migrate_pre_v3_chunks(conn)
+            elif previous_version < 4:
+                self._migrate_v3_to_v4(conn)
+            else:
+                self._create_v4_schema(conn)
+
             mark_schema_current(conn)
 
-    def _create_v3_schema(self, conn: sqlite3.Connection) -> None:
+    @staticmethod
+    def _create_v4_schema(conn: sqlite3.Connection) -> None:
         conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS chunks(
@@ -97,8 +111,7 @@ class ChunkStore:
                 filename,
                 content,
                 content='',
-                tokenize='unicode61 remove_diacritics 2',
-                prefix='2 3 4'
+                tokenize='unicode61 remove_diacritics 2'
             );
 
             CREATE VIRTUAL TABLE IF NOT EXISTS chunk_index_cjk2 USING fts5(
@@ -109,23 +122,35 @@ class ChunkStore:
             );
             """
         )
-        try:
+
+    def _migrate_v3_to_v4(self, conn: sqlite3.Connection) -> None:
+        """Rebuild only the compact inverted indexes; source files stay closed."""
+        # v3's unicode index carried unused prefix=2/3/4 helpers. Rebuild it
+        # from the single-copy chunks table so exact-token search keeps the
+        # same semantics without that extra posting data.
+        conn.execute("DROP TABLE IF EXISTS chunk_index")
+        conn.execute("DROP TABLE IF EXISTS chunk_index_tri")
+        self._create_v4_schema(conn)
+
+        rows = conn.execute(
+            """
+            SELECT c.id, c.content, f.filename
+            FROM chunks c
+            JOIN files f ON f.path = c.path
+            ORDER BY c.id
+            """
+        )
+        for row in rows:
+            chunk_id = int(row["id"])
+            filename = str(row["filename"] or "")
+            content = str(row["content"] or "")
             conn.execute(
-                """
-                CREATE VIRTUAL TABLE IF NOT EXISTS chunk_index_tri USING fts5(
-                    filename,
-                    content,
-                    content='',
-                    tokenize='trigram case_sensitive 0'
-                )
-                """
+                "INSERT INTO chunk_index(rowid, filename, content) VALUES (?, ?, ?)",
+                (chunk_id, filename, content),
             )
-            self._trigram_available = True
-        except sqlite3.OperationalError:
-            self._trigram_available = False
 
     def _migrate_pre_v3_chunks(self, conn: sqlite3.Connection) -> None:
-        """Move v1/v2 chunk data into the single-copy v3 layout.
+        """Move v1/v2 chunk data into the single-copy v4 layout.
 
         The old base FTS table contains the original text, so migration can
         rebuild the new inverted indexes without reopening or reparsing source
@@ -134,14 +159,9 @@ class ChunkStore:
         if not self._table_exists(conn, "chunk_fts"):
             return
 
-        # A schema migration is transactional. Clearing the new tables makes
-        # this deterministic if a development database contains an unfinished
-        # pre-v3 experiment.
         conn.execute("DELETE FROM chunks")
         conn.execute("INSERT INTO chunk_index(chunk_index) VALUES('delete-all')")
         conn.execute("INSERT INTO chunk_index_cjk2(chunk_index_cjk2) VALUES('delete-all')")
-        if self._trigram_available:
-            conn.execute("INSERT INTO chunk_index_tri(chunk_index_tri) VALUES('delete-all')")
 
         rows = conn.execute(
             """
@@ -164,11 +184,11 @@ class ChunkStore:
             )
             self._insert_fts_rows(conn, chunk_id, filename, content)
 
-        # Remove the old contentful copies only after the new layout is built.
         conn.execute("DROP TABLE IF EXISTS chunk_lookup")
         conn.execute("DROP TABLE IF EXISTS chunk_fts_tri")
         conn.execute("DROP TABLE IF EXISTS chunk_fts_cjk2")
         conn.execute("DROP TABLE IF EXISTS chunk_fts")
+        conn.execute("DROP TABLE IF EXISTS chunk_index_tri")
 
     @staticmethod
     def _cjk_bigrams(text: str) -> str:
@@ -180,6 +200,14 @@ class ChunkStore:
             else:
                 tokens.extend(run[i : i + 2] for i in range(len(run) - 1))
         return " ".join(tokens)
+
+    @classmethod
+    def _cjk_phrase(cls, text: str) -> str:
+        tokens = cls._cjk_bigrams(text).split()
+        if not tokens:
+            return '""'
+        escaped = " ".join(token.replace('"', '""') for token in tokens)
+        return f'"{escaped}"'
 
     def _insert_fts_rows(
         self,
@@ -196,11 +224,6 @@ class ChunkStore:
             "INSERT INTO chunk_index_cjk2(rowid, filename_tokens, content_tokens) VALUES (?, ?, ?)",
             (chunk_id, self._cjk_bigrams(filename), self._cjk_bigrams(content)),
         )
-        if self._trigram_available:
-            conn.execute(
-                "INSERT INTO chunk_index_tri(rowid, filename, content) VALUES (?, ?, ?)",
-                (chunk_id, filename, content),
-            )
 
     def replace_document(
         self,
@@ -251,9 +274,6 @@ class ChunkStore:
         first: str,
         second: str,
     ) -> None:
-        # Standard contentless FTS5 tables support deletion through the
-        # special 'delete' command. Supplying the original indexed values keeps
-        # this compatible with SQLite builds older than contentless-delete.
         conn.execute(
             f"INSERT INTO {table}({table}, rowid, {('filename_tokens' if table.endswith('_cjk2') else 'filename')}, {('content_tokens' if table.endswith('_cjk2') else 'content')}) "
             "VALUES ('delete', ?, ?, ?)",
@@ -283,8 +303,6 @@ class ChunkStore:
                 self._cjk_bigrams(filename),
                 self._cjk_bigrams(content),
             )
-            if self._trigram_available:
-                self._contentless_delete(conn, "chunk_index_tri", chunk_id, filename, content)
         conn.execute("DELETE FROM chunks WHERE path = ?", (path,))
 
     def remove_missing_under_root(self, root: str, existing_paths: set[str]) -> int:
@@ -314,6 +332,14 @@ class ChunkStore:
     @staticmethod
     def _cjk_only(query: str) -> str:
         return "".join(ch for ch in query if _CJK_RE.match(ch))
+
+    def _select_index(self, query: str) -> tuple[str, str]:
+        compact = "".join(query.split())
+        compact_cjk = self._cjk_only(query)
+        pure_cjk = bool(compact_cjk and compact_cjk == compact)
+        if pure_cjk:
+            return "chunk_index_cjk2", self._cjk_phrase(compact_cjk)
+        return "chunk_index", self._build_fts_query(query)
 
     @staticmethod
     def _append_metadata_filters(
@@ -460,26 +486,7 @@ class ChunkStore:
                 max_size=max_size,
             )
 
-        compact_cjk = self._cjk_only(query)
-        is_short_cjk = bool(
-            compact_cjk
-            and len(compact_cjk) <= 2
-            and compact_cjk == "".join(query.split())
-        )
-
-        if is_short_cjk:
-            table = "chunk_index_cjk2"
-            fts_query = f'"{compact_cjk}"'
-        else:
-            compact = "".join(query.split())
-            use_tri = (
-                self._trigram_available
-                and bool(_CJK_RE.search(query))
-                and len(compact) >= 3
-            )
-            table = "chunk_index_tri" if use_tri else "chunk_index"
-            fts_query = self._build_fts_query(query)
-
+        table, fts_query = self._select_index(query)
         score_expr = f"bm25({table}, 5.0, 1.0)"
         clauses = [f"{table} MATCH :fts_query"]
         params: dict[str, object] = {
