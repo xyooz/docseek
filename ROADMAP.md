@@ -25,7 +25,10 @@ DocSeek 的目标是做成一个适合 Windows 办公环境长期常驻使用的
 - Extractor Revision 渐进式重建；
 - 可重复性能基准与 10k / 50k 规模档；
 - Recall@K / MRR / nDCG 检索质量回归门槛；
-- 搜索总命中文件数与搜索耗时显示。
+- 搜索总命中文件数与搜索耗时显示；
+- 相关性 / 最近修改 / 文件名排序；
+- 可点击筛选 Chips、键盘导航与可操作空状态；
+- `QTableView + QAbstractTableModel` 增量结果列表。
 
 这一阶段的目标不是“功能最多”，而是验证：**普通办公人员是否真的能比 Everything 的文件名搜索更快找到记得内容、不记得标题的文档。**
 
@@ -121,26 +124,33 @@ DocSeek 的目标是做成一个适合 Windows 办公环境长期常驻使用的
 - 显示总命中文件数；
 - 显示搜索耗时；
 - 滚动增量加载；
-- 类型筛选与高级语法。
+- 类型筛选与高级语法；
+- 更明确的空状态与首次使用引导；
+- 可点击筛选 Chips，降低记忆 `ext:` / `path:` 等语法成本；
+- 排序切换：相关性 / 最近修改 / 文件名；
+- 快捷键上下选择、Enter 打开、Esc 清空。
 
 下一步：
 
-- 更明确的空状态与首次使用引导；
 - 搜索历史；
 - 常用筛选保存；
-- 可点击筛选 Chips，降低记忆 `ext:` / `path:` 等语法成本；
-- 排序切换：相关性 / 最近修改 / 文件名；
-- 快捷键上下选择、Enter 打开、Esc 清空；
 - 搜索帮助弹层，而不是要求用户阅读 README。
 
 ### 结果列表
 
-从 `QTableWidget` 迁移到 `QTableView + QAbstractTableModel`：
+已完成：
 
-- 大结果集更低 UI 开销；
-- 更自然的增量加载；
-- 列宽、列显示状态可保存；
-- 更方便加入图标、排序和状态标记。
+- 从 `QTableWidget` 迁移到 `QTableView + QAbstractTableModel`；
+- 每行直接持有一个 `ChunkSearchResult`，避免为每列创建独立 Item；
+- 分页结果通过 `beginInsertRows / endInsertRows` 增量追加；
+- 选中、预览、打开、定位、复制路径统一从 Model 读取；
+- 使用 offscreen `MainWindow` smoke test 覆盖真实 View / Model 接线。
+
+下一步：
+
+- 保存列宽与列显示状态；
+- 评估文件类型图标和轻量状态标记；
+- 优化大量结果持续追加时的 UI 内存和绘制基线。
 
 ### 索引管理
 
