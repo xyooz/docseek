@@ -18,9 +18,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Rust-backed spreadsheet parser. Kept optional until real-world XLS/XLSB/ODS
-# compatibility and memory profiles are validated on target office machines.
+# Rust-backed spreadsheet parser for XLS/XLSB/ODS with row/sheet fidelity.
 calamine = ["python-calamine>=0.8.2"]
+# Rust-native Apache Tika compatibility backend. No Java service is required;
+# kept optional because its wheel is ~40 MiB and flat-text extraction is not
+# always as structure-rich as DocSeek's specialized direct adapters.
+tika = ["iscc-tika>=0.6.0"]
 # Vendor fallback only; normal DocSeek startup never requires pywin32/WPS.
 wps = ["pywin32>=306; platform_system == 'Windows'"]
 
