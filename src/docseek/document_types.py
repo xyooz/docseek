@@ -37,11 +37,6 @@ _FORMATS = (
     FormatCapability(".md", DocumentFamily.TEXT, (SupportMode.DIRECT,), "Markdown"),
     FormatCapability(".log", DocumentFamily.TEXT, (SupportMode.DIRECT,), "Log"),
     FormatCapability(".csv", DocumentFamily.TEXT, (SupportMode.DIRECT,), "CSV"),
-    FormatCapability(".tsv", DocumentFamily.TEXT, (SupportMode.DIRECT,), "TSV"),
-    FormatCapability(".json", DocumentFamily.TEXT, (SupportMode.DIRECT,), "JSON"),
-    FormatCapability(".jsonl", DocumentFamily.TEXT, (SupportMode.DIRECT,), "JSON Lines"),
-    FormatCapability(".yaml", DocumentFamily.TEXT, (SupportMode.DIRECT,), "YAML"),
-    FormatCapability(".yml", DocumentFamily.TEXT, (SupportMode.DIRECT,), "YAML"),
 
     # Mature structure-preserving parsers for the most common office formats.
     FormatCapability(
@@ -117,23 +112,20 @@ _FORMATS = (
         ".odp", DocumentFamily.PRESENTATION, (SupportMode.TIKA_NATIVE,), "OpenDocument Presentation"
     ),
 
-    # Web / structured-text documents. Tika removes markup and indexes the
-    # readable text rather than filling search results with HTML/XML tags.
+    # Additional formats explicitly covered by the bundled native Tika layer.
+    FormatCapability(".tsv", DocumentFamily.TEXT, (SupportMode.TIKA_NATIVE,), "TSV"),
     FormatCapability(".html", DocumentFamily.TEXT, (SupportMode.TIKA_NATIVE,), "HTML"),
     FormatCapability(".htm", DocumentFamily.TEXT, (SupportMode.TIKA_NATIVE,), "HTML"),
     FormatCapability(".xhtml", DocumentFamily.TEXT, (SupportMode.TIKA_NATIVE,), "XHTML"),
     FormatCapability(".xml", DocumentFamily.TEXT, (SupportMode.TIKA_NATIVE,), "XML"),
-
-    # E-books and local mail stores are common sources of long-lived reference
-    # material. Tika can expose their text and embedded/attachment content.
     FormatCapability(".epub", DocumentFamily.WRITER, (SupportMode.TIKA_NATIVE,), "EPUB"),
     FormatCapability(".eml", DocumentFamily.WRITER, (SupportMode.TIKA_NATIVE,), "E-mail Message"),
     FormatCapability(".msg", DocumentFamily.WRITER, (SupportMode.TIKA_NATIVE,), "Outlook Message"),
     FormatCapability(".mbox", DocumentFamily.WRITER, (SupportMode.TIKA_NATIVE,), "Mailbox"),
     FormatCapability(".pst", DocumentFamily.WRITER, (SupportMode.TIKA_NATIVE,), "Outlook Data File"),
 
-    # Apache Tika also exposes parsers for Apple iWork packages. These remain in
-    # the isolated compatibility lane because package variants differ widely.
+    # Apache Tika exposes iWork package parsers. Keep these in the isolated
+    # compatibility lane because package versions differ widely in practice.
     FormatCapability(".pages", DocumentFamily.WRITER, (SupportMode.TIKA_NATIVE,), "Apple Pages"),
     FormatCapability(".numbers", DocumentFamily.SPREADSHEET, (SupportMode.TIKA_NATIVE,), "Apple Numbers"),
     FormatCapability(".key", DocumentFamily.PRESENTATION, (SupportMode.TIKA_NATIVE,), "Apple Keynote"),
