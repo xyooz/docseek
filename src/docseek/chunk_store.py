@@ -52,11 +52,12 @@ class ChunkStore:
 
     Schema v4 removed the old trigram copy because a contiguous Chinese query
     of length >= 2 can be represented exactly as an overlapping-bigram phrase.
-    Schema v5 keeps the source ``path`` column temporarily for safe rollback,
-    but also assigns every chunk the integer ``files.id``. Production search
-    now joins and partitions by that compact integer key instead of repeatedly
-    comparing long Windows path strings. A later schema may drop the duplicate
-    chunk path after 10k/50k migration benchmarks confirm the layout.
+    Schema v5 introduced the integer ``files.id`` relationship. Schema v6
+    finishes that migration by removing the duplicate full path from every
+    chunk: paths live only in ``files`` and chunks reference them by ``file_id``.
+    Existing FTS rowids remain stable during migration, so source Office/PDF
+    files do not need to be reparsed and the inverted indexes do not need to be
+    rebuilt just to remove the duplicated path column.
     """
 
     def __init__(self, db_path: Path) -> None:
@@ -89,14 +90,22 @@ class ChunkStore:
                 self._migrate_pre_v3_chunks(conn)
             elif previous_version < 4:
                 self._migrate_v3_to_v4(conn)
-            else:
+            elif previous_version < 6:
                 self._create_v4_schema(conn)
+            else:
+                self._create_v6_schema(conn)
 
-            self._ensure_v5_file_ids(conn)
+            if previous_version < 6:
+                self._ensure_v5_file_ids(conn)
+                self._migrate_v5_to_v6(conn)
+            else:
+                self._create_v6_schema(conn)
+
             mark_schema_current(conn)
 
     @staticmethod
     def _create_v4_schema(conn: sqlite3.Connection) -> None:
+        """Create the legacy path-bearing layout needed by pre-v6 migrations."""
         conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS chunks(
@@ -127,29 +136,62 @@ class ChunkStore:
         )
 
     @staticmethod
-    def _ensure_v5_file_ids(conn: sqlite3.Connection) -> None:
-        """Backfill a compact integer relationship without rebuilding FTS.
+    def _create_v6_schema(conn: sqlite3.Connection) -> None:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS chunks(
+                id INTEGER PRIMARY KEY,
+                file_id INTEGER NOT NULL,
+                ordinal INTEGER NOT NULL,
+                location TEXT NOT NULL,
+                content TEXT NOT NULL,
+                UNIQUE(file_id, ordinal)
+            );
 
-        ``path`` intentionally remains in ``chunks`` for schema v5. This makes
-        the migration reversible and lets an older v4-shaped index be repaired
-        from its own metadata. Search/write hot paths already use ``file_id``.
-        """
+            CREATE INDEX IF NOT EXISTS idx_chunks_file_id ON chunks(file_id);
+
+            CREATE VIRTUAL TABLE IF NOT EXISTS chunk_index USING fts5(
+                filename,
+                content,
+                content='',
+                tokenize='unicode61 remove_diacritics 2'
+            );
+
+            CREATE VIRTUAL TABLE IF NOT EXISTS chunk_index_cjk2 USING fts5(
+                filename_tokens,
+                content_tokens,
+                content='',
+                tokenize='unicode61'
+            );
+            """
+        )
+
+    @staticmethod
+    def _ensure_v5_file_ids(conn: sqlite3.Connection) -> None:
+        """Backfill the integer relationship before the v6 table compaction."""
         columns = {
             str(row[1])
             for row in conn.execute("PRAGMA table_info(chunks)").fetchall()
         }
         if "file_id" not in columns:
+            if "path" not in columns:
+                raise RuntimeError(
+                    "索引缺少 file_id 与 path，无法安全升级到 v6。"
+                )
             conn.execute("ALTER TABLE chunks ADD COLUMN file_id INTEGER")
+            columns.add("file_id")
 
-        conn.execute(
-            """
-            UPDATE chunks
-            SET file_id = (
-                SELECT f.id FROM files f WHERE f.path = chunks.path
+        if "path" in columns:
+            conn.execute(
+                """
+                UPDATE chunks
+                SET file_id = (
+                    SELECT f.id FROM files f WHERE f.path = chunks.path
+                )
+                WHERE file_id IS NULL
+                """
             )
-            WHERE file_id IS NULL
-            """
-        )
+
         orphan_count = int(
             conn.execute(
                 "SELECT COUNT(*) FROM chunks WHERE file_id IS NULL"
@@ -157,13 +199,67 @@ class ChunkStore:
         )
         if orphan_count:
             raise RuntimeError(
-                "索引升级到 v5 时发现无法映射到文件元数据的内容块："
+                "索引升级到 v6 时发现无法映射到文件元数据的内容块："
                 f"{orphan_count} 个。为避免静默丢失搜索结果，升级已中止。"
             )
 
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_chunks_file_id ON chunks(file_id)"
         )
+
+    def _migrate_v5_to_v6(self, conn: sqlite3.Connection) -> None:
+        """Remove duplicated chunk paths while preserving chunk/FTS rowids."""
+        columns = {
+            str(row[1])
+            for row in conn.execute("PRAGMA table_info(chunks)").fetchall()
+        }
+        if "path" not in columns:
+            self._create_v6_schema(conn)
+            return
+
+        orphan_count = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM chunks WHERE file_id IS NULL"
+            ).fetchone()[0]
+        )
+        if orphan_count:
+            raise RuntimeError(
+                "索引升级到 v6 前仍存在未映射内容块："
+                f"{orphan_count} 个。升级已中止。"
+            )
+
+        old_count = int(conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0])
+        conn.execute("DROP TABLE IF EXISTS chunks_v6")
+        conn.execute(
+            """
+            CREATE TABLE chunks_v6(
+                id INTEGER PRIMARY KEY,
+                file_id INTEGER NOT NULL,
+                ordinal INTEGER NOT NULL,
+                location TEXT NOT NULL,
+                content TEXT NOT NULL,
+                UNIQUE(file_id, ordinal)
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO chunks_v6(id, file_id, ordinal, location, content)
+            SELECT id, file_id, ordinal, location, content
+            FROM chunks
+            ORDER BY id
+            """
+        )
+        new_count = int(conn.execute("SELECT COUNT(*) FROM chunks_v6").fetchone()[0])
+        if new_count != old_count:
+            raise RuntimeError(
+                "索引升级到 v6 时内容块数量不一致："
+                f"迁移前 {old_count}，迁移后 {new_count}。升级已中止。"
+            )
+
+        conn.execute("DROP TABLE chunks")
+        conn.execute("ALTER TABLE chunks_v6 RENAME TO chunks")
+        conn.execute("CREATE INDEX idx_chunks_file_id ON chunks(file_id)")
 
     def _migrate_v3_to_v4(self, conn: sqlite3.Connection) -> None:
         """Rebuild only the compact inverted indexes; source files stay closed."""
@@ -189,7 +285,7 @@ class ChunkStore:
             )
 
     def _migrate_pre_v3_chunks(self, conn: sqlite3.Connection) -> None:
-        """Move v1/v2 chunk data into the single-copy v4/v5 layout."""
+        """Move v1/v2 chunk data into the single-copy legacy layout."""
         if not self._table_exists(conn, "chunk_fts"):
             return
 
@@ -297,10 +393,10 @@ class ChunkStore:
             for chunk in chunks:
                 cursor = conn.execute(
                     """
-                    INSERT INTO chunks(path, file_id, ordinal, location, content)
-                    VALUES (?, ?, ?, ?, ?)
+                    INSERT INTO chunks(file_id, ordinal, location, content)
+                    VALUES (?, ?, ?, ?)
                     """,
-                    (path, file_id, chunk.ordinal, chunk.location, chunk.content),
+                    (file_id, chunk.ordinal, chunk.location, chunk.content),
                 )
                 chunk_id = int(cursor.lastrowid)
                 self._insert_fts_rows(conn, chunk_id, filename, chunk.content)
@@ -336,30 +432,19 @@ class ChunkStore:
     ) -> None:
         if file_id is None:
             file_id = self._file_id_for_path(conn, path)
+        if file_id is None:
+            return
 
-        if file_id is not None:
-            rows = conn.execute(
-                """
-                SELECT c.id, c.content, f.filename
-                FROM chunks c
-                JOIN files f ON f.id = c.file_id
-                WHERE c.file_id = ?
-                ORDER BY c.id
-                """,
-                (file_id,),
-            ).fetchall()
-        else:
-            # Compatibility fallback for an interrupted pre-v5 migration.
-            rows = conn.execute(
-                """
-                SELECT c.id, c.content, f.filename
-                FROM chunks c
-                JOIN files f ON f.path = c.path
-                WHERE c.path = ?
-                ORDER BY c.id
-                """,
-                (path,),
-            ).fetchall()
+        rows = conn.execute(
+            """
+            SELECT c.id, c.content, f.filename
+            FROM chunks c
+            JOIN files f ON f.id = c.file_id
+            WHERE c.file_id = ?
+            ORDER BY c.id
+            """,
+            (file_id,),
+        ).fetchall()
 
         for row in rows:
             chunk_id = int(row["id"])
@@ -374,10 +459,7 @@ class ChunkStore:
                 self._cjk_bigrams(content),
             )
 
-        if file_id is not None:
-            conn.execute("DELETE FROM chunks WHERE file_id = ?", (file_id,))
-        else:
-            conn.execute("DELETE FROM chunks WHERE path = ?", (path,))
+        conn.execute("DELETE FROM chunks WHERE file_id = ?", (file_id,))
 
     def remove_missing_under_root(self, root: str, existing_paths: set[str]) -> int:
         root_path = Path(root).resolve()
