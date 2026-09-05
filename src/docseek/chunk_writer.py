@@ -107,10 +107,10 @@ class ChunkBatchWriter:
             for chunk in chunks:
                 cursor = conn.execute(
                     """
-                    INSERT INTO chunks(path, file_id, ordinal, location, content)
-                    VALUES (?, ?, ?, ?, ?)
+                    INSERT INTO chunks(file_id, ordinal, location, content)
+                    VALUES (?, ?, ?, ?)
                     """,
-                    (path, file_id, chunk.ordinal, chunk.location, chunk.content),
+                    (file_id, chunk.ordinal, chunk.location, chunk.content),
                 )
                 chunk_id = int(cursor.lastrowid)
                 self.store._insert_fts_rows(conn, chunk_id, filename, chunk.content)
