@@ -8,10 +8,11 @@ class ExactGroupedSearchEngine:
     """Exact file-level search with structure-aware ranking.
 
     FTS ranking is chunk-level while filename boosts are file-level. Metadata
-    filters also apply to whole files. For broad single-term queries DocSeek
-    materializes eligible file ids before scoring chunks; for multi-term AND
-    queries, FTS is already selective enough that late metadata filtering avoids
-    paying the materialization overhead. Both paths preserve exact semantics.
+    filters also apply to whole files. Based on the scale workload, DocSeek only
+    prefilters broad single-term searches by extension/path, where the benefit is
+    repeatable. Multi-term queries and date/size-only filters keep late filtering
+    to avoid paying an eligible-set materialization cost when FTS is already
+    selective. Both paths preserve exact semantics.
 
     Explicit ``page:N``, ``slide:N`` and ``sheet:name`` hints are schema-free:
     they are removed from the FTS text and add a strong boost to matching
@@ -130,7 +131,12 @@ class ExactGroupedSearchEngine:
             max_size=max_size,
         )
         query_terms = self.store._split_query_terms(content_query)
-        use_metadata_prefilter = bool(metadata_clauses) and len(query_terms) <= 1
+        stable_scope_filter = extension is not None or path_contains is not None
+        use_metadata_prefilter = (
+            bool(metadata_clauses)
+            and len(query_terms) <= 1
+            and stable_scope_filter
+        )
         if use_metadata_prefilter:
             eligible_cte = f"""
             eligible_files AS MATERIALIZED (
