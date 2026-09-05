@@ -45,12 +45,19 @@ def iter_chunk_file(path: Path):
 def extract_to_file(source: Path, output: Path) -> int:
     # The extraction broker uses this marker to execute compatibility adapters
     # directly inside this killable child instead of recursively spawning more
-    # workers.
+    # workers. Keep it scoped so direct unit calls cannot leak worker state.
+    previous = os.environ.get("DOCSEEK_LEGACY_WORKER")
     os.environ["DOCSEEK_LEGACY_WORKER"] = "1"
-    return write_chunk_file(
-        output,
-        DEFAULT_EXTRACTION_BROKER.iter_chunks(Path(source)),
-    )
+    try:
+        return write_chunk_file(
+            output,
+            DEFAULT_EXTRACTION_BROKER.iter_chunks(Path(source)),
+        )
+    finally:
+        if previous is None:
+            os.environ.pop("DOCSEEK_LEGACY_WORKER", None)
+        else:
+            os.environ["DOCSEEK_LEGACY_WORKER"] = previous
 
 
 def main(argv: list[str] | None = None) -> int:
