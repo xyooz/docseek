@@ -26,13 +26,14 @@ from PySide6.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QTextBrowser,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
 from .chunk_store import ChunkSearchResult, ChunkStore
 from .indexer import DirectoryIndexer, IndexCancelled, IndexStats
-from .query_parser import parse_query
+from .query_parser import parse_query, query_filter_chips, remove_query_filter
 from .search_db import SearchDatabase
 from .search_worker import SearchRequest, SearchResponse, SearchWorker
 from .settings_dialog import IndexSettingsDialog
@@ -176,6 +177,18 @@ class MainWindow(QMainWindow):
         self.type_filter.setMinimumHeight(38)
         self.type_filter.setMinimumWidth(105)
 
+        self.filter_chip_panel = QWidget()
+        self.filter_chip_panel.setVisible(False)
+        self.filter_chip_panel.setObjectName("filterChipPanel")
+        self.filter_chip_layout = QHBoxLayout(self.filter_chip_panel)
+        self.filter_chip_layout.setContentsMargins(0, 0, 0, 0)
+        self.filter_chip_layout.setSpacing(6)
+        self.filter_chip_label = QLabel("当前筛选：")
+        self.filter_chip_label.setStyleSheet("color: palette(mid);")
+        self.filter_chip_layout.addWidget(self.filter_chip_label)
+        self.filter_chip_layout.addStretch(1)
+        self.filter_chip_buttons: list[QToolButton] = []
+
         self.choose_button = QPushButton("添加目录")
         self.refresh_button = QPushButton("刷新索引")
         self.settings_button = QPushButton("索引设置")
@@ -266,6 +279,7 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(14, 14, 14, 10)
         layout.setSpacing(10)
         layout.addLayout(top_bar)
+        layout.addWidget(self.filter_chip_panel)
         layout.addWidget(self.scope_label)
         layout.addWidget(self.index_progress_panel)
         layout.addWidget(splitter, 1)
@@ -281,6 +295,7 @@ class MainWindow(QMainWindow):
         self.search_timer.timeout.connect(self._perform_search)
 
         self.search_input.textChanged.connect(self.search_timer.start)
+        self.search_input.textChanged.connect(self._refresh_filter_chips)
         self.search_input.returnPressed.connect(self._perform_search)
         self.type_filter.currentIndexChanged.connect(self._perform_search)
         self.choose_button.clicked.connect(self._choose_directory)
@@ -307,6 +322,7 @@ class MainWindow(QMainWindow):
         focus_action.triggered.connect(self.search_input.setFocus)
         self.addAction(focus_action)
 
+        self._refresh_filter_chips()
         self._refresh_scope()
         self._refresh_status()
         self._restart_watcher()
@@ -468,6 +484,40 @@ class MainWindow(QMainWindow):
             self.database.get_index_roots(),
             self.database.get_excluded_paths(),
         )
+
+    def _refresh_filter_chips(self, *_args) -> None:
+        for button in self.filter_chip_buttons:
+            self.filter_chip_layout.removeWidget(button)
+            button.deleteLater()
+        self.filter_chip_buttons.clear()
+
+        chips = query_filter_chips(self.search_input.text())
+        for chip in chips:
+            button = QToolButton(self.filter_chip_panel)
+            label = chip.label if len(chip.label) <= 42 else chip.label[:39] + "…"
+            button.setText(f"{label}  ×")
+            button.setToolTip(f"{chip.label}\n点击移除此筛选")
+            button.setCursor(Qt.PointingHandCursor)
+            button.setStyleSheet(
+                "QToolButton { border: 1px solid palette(mid); border-radius: 10px; "
+                "padding: 3px 8px; background: palette(base); } "
+                "QToolButton:hover { background: palette(alternate-base); }"
+            )
+            button.clicked.connect(
+                lambda _checked=False, key=chip.key: self._remove_filter_chip(key)
+            )
+            self.filter_chip_layout.insertWidget(
+                self.filter_chip_layout.count() - 1, button
+            )
+            self.filter_chip_buttons.append(button)
+
+        self.filter_chip_panel.setVisible(bool(chips))
+
+    def _remove_filter_chip(self, key: str) -> None:
+        updated = remove_query_filter(self.search_input.text(), key)
+        self.search_input.setText(updated)
+        self.search_input.setCursorPosition(len(updated))
+        self.search_input.setFocus()
 
     def _perform_search(self) -> None:
         # Incrementing the generation invalidates every in-flight response from
