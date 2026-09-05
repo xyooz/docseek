@@ -35,10 +35,10 @@ jobs:
         run: python benchmarks/benchmark_filename_split.py --files 5000 --chunks 12 --payload-kb 1 --iterations 5
       - name: Scale baseline at 10k files
         if: contains(github.event.head_commit.message, '[scale-10k]') || contains(github.event.head_commit.message, '[grouped-bench]')
-        run: python benchmarks/benchmark_grouped_office.py --files 10000 --chunks 3 --payload-kb 4 --batch-size 128 --iterations 3 --warmups 1 --limit 100 --json-out scale-10k.json
+        run: python benchmarks/benchmark_grouped_office.py --files 10000 --chunks 3 --payload-kb 4 --batch-size 128 --iterations 3 --warmups 1 --limit 100 --max-grouped-p95-ms 200 --json-out scale-10k.json
       - name: Scale pressure test at 50k files
         if: contains(github.event.head_commit.message, '[scale-50k]')
-        run: python benchmarks/benchmark_grouped_office.py --files 50000 --chunks 3 --payload-kb 4 --batch-size 128 --iterations 3 --warmups 1 --limit 100 --json-out scale-50k.json
+        run: python benchmarks/benchmark_grouped_office.py --files 50000 --chunks 3 --payload-kb 4 --batch-size 128 --iterations 3 --warmups 1 --limit 100 --max-grouped-p95-ms 500 --json-out scale-50k.json
       - name: One-shot first-paint deferred-count experiment
         if: contains(github.event.head_commit.message, '[first-paint-bench]')
         run: python benchmarks/benchmark_first_paint.py --files 10000 --chunks 3 --payload-kb 4 --iterations 3 --warmups 1 --limit 100
