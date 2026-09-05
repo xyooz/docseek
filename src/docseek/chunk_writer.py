@@ -99,11 +99,18 @@ class ChunkBatchWriter:
                 """,
                 (path, filename, extension, modified_time, size),
             )
-            self.store._delete_chunks(conn, path)
+            file_id = self.store._file_id_for_path(conn, path)
+            if file_id is None:
+                raise RuntimeError(f"无法为索引文件分配 file_id：{path}")
+
+            self.store._delete_chunks(conn, path, file_id=file_id)
             for chunk in chunks:
                 cursor = conn.execute(
-                    "INSERT INTO chunks(path, ordinal, location, content) VALUES (?, ?, ?, ?)",
-                    (path, chunk.ordinal, chunk.location, chunk.content),
+                    """
+                    INSERT INTO chunks(path, file_id, ordinal, location, content)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (path, file_id, chunk.ordinal, chunk.location, chunk.content),
                 )
                 chunk_id = int(cursor.lastrowid)
                 self.store._insert_fts_rows(conn, chunk_id, filename, chunk.content)
