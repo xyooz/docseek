@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtWidgets import QLabel
+from PySide6.QtWidgets import QGroupBox, QLabel, QVBoxLayout
 
+from .index_health import capture_index_health, format_index_health
 from .index_issues_dialog import IndexIssuesDialog
 from .index_retry import build_index_retry_plan, dispatch_index_retry
 from .index_root_state import IndexRootStateStore
@@ -11,7 +12,7 @@ from .settings_dialog import IndexSettingsDialog
 
 
 class PausableIndexSettingsDialog(IndexSettingsDialog):
-    """Index settings with per-root pause/resume controls and safe retry."""
+    """Index settings with per-root pause/resume, health and safe retry."""
 
     def __init__(self, database, parent=None) -> None:
         super().__init__(database, parent)
@@ -33,6 +34,27 @@ class PausableIndexSettingsDialog(IndexSettingsDialog):
         self.root_list.setToolTip(
             "取消勾选目录可暂停 watcher 和手动刷新；重新勾选并保存后会自动进行增量校准。"
         )
+
+        self.health_summary_label = QLabel()
+        self.health_summary_label.setWordWrap(True)
+        self.health_summary_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.health_hint_label = QLabel(
+            "占用包含 SQLite 主库及当前 WAL/SHM 文件；暂停目录的现有索引仍计入文件数和空间占用。"
+        )
+        self.health_hint_label.setWordWrap(True)
+        self.health_hint_label.setStyleSheet("color: palette(mid); font-size: 11px;")
+
+        health_group = QGroupBox("索引概况")
+        health_layout = QVBoxLayout()
+        health_layout.addWidget(self.health_summary_label)
+        health_layout.addWidget(self.health_hint_label)
+        health_group.setLayout(health_layout)
+
+        # Base layout is: note, roots, excludes, performance, issues, buttons.
+        # Put health immediately before issue recovery so status and remediation
+        # read as one coherent section.
+        self.layout().insertWidget(4, health_group)
+        self._refresh_health_summary()
 
     @staticmethod
     def _make_checkable(item, *, checked: bool) -> None:
@@ -61,6 +83,18 @@ class PausableIndexSettingsDialog(IndexSettingsDialog):
             or set(self._paused_roots_from_ui()) != self._original_paused
             or self.max_size.value() != self.database.get_max_file_size_mb()
         )
+
+    def _refresh_health_summary(self) -> None:
+        if not hasattr(self, "health_summary_label"):
+            return
+        snapshot = capture_index_health(self.database)
+        self.health_summary_label.setText(format_index_health(snapshot))
+
+    def _refresh_issue_summary(self) -> None:
+        # Base __init__ calls this virtual method before the health widget exists,
+        # so the health refresh is deliberately guarded above.
+        super()._refresh_issue_summary()
+        self._refresh_health_summary()
 
     def _show_index_issues(self) -> None:
         # Retry must use the settings the indexer will actually read. If this
