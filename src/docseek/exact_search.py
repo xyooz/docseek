@@ -4,19 +4,19 @@ from .chunk_store import ChunkSearchResult, ChunkStore, SearchPage
 
 
 class ExactGroupedSearchEngine:
-    """Exact file-level search without a per-hit ROW_NUMBER window sort.
+    """Exact file-level search using compact grouped minima.
 
-    ``ChunkStore.search_page`` currently uses ``ROW_NUMBER() OVER
-    (PARTITION BY path ORDER BY score, ordinal)`` to select the best chunk for
-    every file. This experimental engine preserves the exact same rule using
-    two grouped minima:
+    ``ChunkStore.search_page`` uses ``ROW_NUMBER() OVER`` across every matching
+    chunk. This engine preserves the same exact ordering rule with two grouped
+    minima while keeping the materialized hit set intentionally narrow:
 
-    1. minimum relevance score per file;
+    1. minimum relevance score per integer ``file_id``;
     2. minimum chunk ordinal among chunks tied at that score.
 
-    It remains exact and supports deep pagination. The separate engine makes it
-    possible to benchmark and verify equivalence before changing production
-    search SQL.
+    File metadata and raw chunk text are joined only after the hit stream has
+    collapsed to one winning chunk per file. This avoids copying long paths,
+    filenames and other metadata into every matching chunk row, which matters
+    for broad queries over large office-document indexes.
     """
 
     def __init__(self, store: ChunkStore) -> None:
@@ -84,59 +84,52 @@ class ExactGroupedSearchEngine:
             WITH hits AS MATERIALIZED (
                 SELECT
                     c.id AS chunk_id,
-                    f.path,
-                    f.filename,
-                    f.extension,
-                    f.modified_time,
-                    f.size,
+                    c.file_id AS file_id,
                     c.ordinal AS ordinal,
-                    c.location AS location,
                     ({score_expr}) + ({filename_boost_expr}) AS relevance_score
                 FROM {table}
                 JOIN chunks c ON c.id = {table}.rowid
-                JOIN files f ON f.path = c.path
+                JOIN files f ON f.id = c.file_id
                 WHERE {' AND '.join(clauses)}
             ),
             best_scores AS (
-                SELECT path, MIN(relevance_score) AS relevance_score
+                SELECT file_id, MIN(relevance_score) AS relevance_score
                 FROM hits
-                GROUP BY path
+                GROUP BY file_id
             ),
             best_ordinals AS (
                 SELECT
-                    h.path,
+                    h.file_id,
                     b.relevance_score,
                     MIN(h.ordinal) AS ordinal
                 FROM hits h
                 JOIN best_scores b
-                  ON b.path = h.path
+                  ON b.file_id = h.file_id
                  AND b.relevance_score = h.relevance_score
-                GROUP BY h.path, b.relevance_score
+                GROUP BY h.file_id, b.relevance_score
             ),
             file_hits AS (
-                SELECT
-                    h.chunk_id,
-                    h.path,
-                    h.filename,
-                    h.extension,
-                    h.modified_time,
-                    h.size,
-                    h.ordinal,
-                    h.location,
-                    h.relevance_score
+                SELECT h.chunk_id, h.file_id, h.relevance_score
                 FROM hits h
                 JOIN best_ordinals b
-                  ON b.path = h.path
+                  ON b.file_id = h.file_id
                  AND b.relevance_score = h.relevance_score
                  AND b.ordinal = h.ordinal
             ),
             paged AS (
                 SELECT
-                    chunk_id, path, filename, extension, modified_time, size,
-                    ordinal, location, relevance_score,
+                    h.chunk_id,
+                    h.file_id,
+                    h.relevance_score,
+                    f.path,
+                    f.filename,
+                    f.extension,
+                    f.modified_time,
+                    f.size,
                     COUNT(*) OVER() AS total_count
-                FROM file_hits
-                ORDER BY relevance_score ASC, modified_time DESC, path ASC
+                FROM file_hits h
+                JOIN files f ON f.id = h.file_id
+                ORDER BY h.relevance_score ASC, f.modified_time DESC, f.path ASC
                 LIMIT :limit OFFSET :offset
             )
             SELECT
@@ -145,7 +138,7 @@ class ExactGroupedSearchEngine:
                 paged.extension,
                 paged.modified_time,
                 paged.size,
-                paged.location,
+                chunks.location AS location,
                 chunks.content AS raw_content,
                 paged.relevance_score AS score,
                 paged.total_count
@@ -220,10 +213,10 @@ class ExactGroupedSearchEngine:
             max_size=max_size,
         )
         sql = f"""
-            SELECT COUNT(DISTINCT f.path) AS n
+            SELECT COUNT(DISTINCT c.file_id) AS n
             FROM {table}
             JOIN chunks c ON c.id = {table}.rowid
-            JOIN files f ON f.path = c.path
+            JOIN files f ON f.id = c.file_id
             WHERE {' AND '.join(clauses)}
         """
         with self.store.connect() as conn:
