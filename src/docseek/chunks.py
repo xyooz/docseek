@@ -31,10 +31,9 @@ def iter_document_chunks(
 ) -> Iterator[DocumentChunk]:
     """Yield bounded, location-aware chunks without building one giant body string.
 
-    XLSX callers may provide ``on_progress`` to receive lightweight streaming
-    row progress. The callback is invoked at a bounded cadence while the same
-    read-only worksheet iterator is already being consumed, so progress
-    reporting does not require a second workbook pass or retain worksheet rows.
+    Direct OOXML/PDF/text formats stay on the established parsers. Other known
+    formats are delegated lazily to the adapter registry so the production
+    indexer can gain mature optional backends without a flag-day rewrite.
     """
     suffix = path.suffix.lower()
     if suffix in TEXT_EXTENSIONS:
@@ -52,7 +51,15 @@ def iter_document_chunks(
     elif suffix == ".pdf":
         yield from _iter_pdf_chunks(path)
     else:
-        raise ValueError(f"Unsupported file type: {suffix}")
+        # Local import avoids a module cycle: document_adapters itself reuses
+        # the direct helpers in this module for OOXML produced by compatible
+        # parsers/vendor fallbacks.
+        from .document_adapters import DEFAULT_ADAPTER_REGISTRY
+
+        adapter = DEFAULT_ADAPTER_REGISTRY.adapter_for(path)
+        if adapter.name == "direct":  # defensive; direct cases are handled above.
+            raise ValueError(f"Unsupported direct file type: {suffix}")
+        yield from adapter.iter_chunks(path, on_progress=on_progress)
 
 
 def _iter_text_chunks(path: Path, *, target_chars: int) -> Iterator[DocumentChunk]:
@@ -146,12 +153,7 @@ def _iter_docx_chunks(path: Path, *, target_chars: int) -> Iterator[DocumentChun
 
 
 def _xlsx_row_text(row: tuple[object, ...]) -> str:
-    """Render one Excel row without shifting later columns to the left.
-
-    Empty cells between populated cells are represented by empty tab fields.
-    Trailing empty cells are removed so a wide formatted worksheet does not
-    generate enormous runs of meaningless separators.
-    """
+    """Render one spreadsheet row without shifting later columns to the left."""
     cells = ["" if value is None else str(value) for value in row]
     while cells and not cells[-1]:
         cells.pop()
@@ -161,8 +163,6 @@ def _xlsx_row_text(row: tuple[object, ...]) -> str:
 
 
 def _xlsx_chunk_content(sheet_title: str, rows: list[str]) -> str:
-    # Sheet names are useful business context (e.g. “客户明细”/“逾期清单”) and
-    # should be searchable even when they do not appear inside worksheet cells.
     return f"工作表: {sheet_title}\n" + "\n".join(rows)
 
 
