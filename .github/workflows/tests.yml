@@ -28,6 +28,9 @@ jobs:
         run: python benchmarks/benchmark_search.py --files 1000 --chunks 3 --payload-kb 4 --iterations 3 --warmups 1 --limit 100
       - name: Benchmark persistent search session at 1k files
         run: python benchmarks/benchmark_search_session.py --files 1000 --chunks 3 --payload-kb 4 --iterations 3 --limit 100
+      - name: One-shot mixed office workload at 10k files
+        if: contains(github.event.head_commit.message, '[office-bench]')
+        run: python benchmarks/benchmark_office_workload.py --files 10000 --chunks 3 --payload-kb 4 --iterations 5 --warmups 1 --limit 100
       - name: Directory scan smoke
         run: python benchmarks/benchmark_scan.py --files 20
       - name: Test
