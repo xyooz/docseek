@@ -14,9 +14,9 @@ class ChunkBatchWriter:
 
     FTS5 creates index segments at transaction boundaries. During a full scan,
     committing every file causes many small segments and many fsyncs. This
-    writer keeps a connection/transaction open across a bounded number of
-    documents, but wraps each document in a SAVEPOINT so a broken parser/file
-    cannot corrupt or roll back the rest of the batch.
+    writer keeps one explicit write transaction open across a bounded number
+    of documents, but wraps each document in a SAVEPOINT so a broken parser or
+    file cannot corrupt or roll back the rest of the batch.
 
     Watcher-driven single-file updates intentionally keep using
     ``ChunkStore.replace_document`` for simple per-file atomicity.
@@ -33,6 +33,7 @@ class ChunkBatchWriter:
         if self.conn is not None:
             raise RuntimeError("ChunkBatchWriter is already open")
         self.conn = self.store.connect()
+        self.conn.execute("BEGIN IMMEDIATE")
         return self
 
     def __exit__(
@@ -56,9 +57,11 @@ class ChunkBatchWriter:
 
     def flush(self) -> None:
         conn = self._require_connection()
-        if self.pending_documents:
-            conn.commit()
-            self.pending_documents = 0
+        if not self.pending_documents:
+            return
+        conn.commit()
+        self.pending_documents = 0
+        conn.execute("BEGIN IMMEDIATE")
 
     def replace_document(
         self,
