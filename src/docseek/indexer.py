@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 from .chunk_store import ChunkStore
+from .chunk_writer import ChunkBatchWriter
 from .chunks import iter_document_chunks
 from .extractors import SUPPORTED_EXTENSIONS
 from .index_issues import IndexIssueStore
@@ -95,12 +96,7 @@ class DirectoryIndexer:
         return row is not None
 
     def _load_index_state(self) -> dict[str, tuple[float, int, bool]]:
-        """Load metadata/chunk presence once for a full reconciliation scan.
-
-        Full scans are dominated by unchanged files. Querying SQLite twice per
-        unchanged path becomes expensive at tens of thousands of files, so the
-        scan keeps a compact in-memory snapshot instead.
-        """
+        """Load metadata/chunk presence once for a full reconciliation scan."""
         with self.chunk_store.connect() as conn:
             file_rows = conn.execute(
                 "SELECT path, modified_time, size FROM files"
@@ -152,9 +148,13 @@ class DirectoryIndexer:
         on_progress: Callable[[Path, IndexStats], None] | None = None,
         prefetched_state: tuple[float, int, bool] | None = None,
         state_prefetched: bool = False,
-    ) -> None:
+        writer: ChunkBatchWriter | None = None,
+        clear_issue: bool = True,
+    ) -> bool:
         stat = path.stat()
         if stat.st_size > self.max_file_size:
+            if writer is not None:
+                writer.flush()
             self._remove_indexed_path(normalized, stats)
             stats.skipped += 1
             actual_mb = stat.st_size / (1024 * 1024)
@@ -164,7 +164,7 @@ class DirectoryIndexer:
                 "file_too_large",
                 f"文件大小 {actual_mb:.1f} MB，当前索引上限 {limit_mb:.0f} MB",
             )
-            return
+            return False
 
         if state_prefetched:
             unchanged = (
@@ -182,14 +182,16 @@ class DirectoryIndexer:
             has_chunk = self._has_chunk_index(normalized) if unchanged else False
 
         if unchanged and has_chunk:
-            self.issues.clear(normalized)
+            if clear_issue:
+                self.issues.clear(normalized)
             stats.unchanged += 1
-            return
+            return True
 
         if on_progress:
             on_progress(path, stats)
 
-        chunk_count = self.chunk_store.replace_document(
+        replace = writer.replace_document if writer is not None else self.chunk_store.replace_document
+        chunk_count = replace(
             path=normalized,
             filename=path.name,
             extension=path.suffix.lower(),
@@ -197,9 +199,11 @@ class DirectoryIndexer:
             size=stat.st_size,
             chunks=iter_document_chunks(path),
         )
-        self.issues.clear(normalized)
+        if clear_issue:
+            self.issues.clear(normalized)
         stats.indexed += 1
         stats.chunks += chunk_count
+        return True
 
     def update_paths(
         self,
@@ -266,33 +270,47 @@ class DirectoryIndexer:
         root = root.resolve()
         stats = IndexStats()
         seen_paths: set[str] = set()
+        successful_paths: set[str] = set()
         index_state = self._load_index_state()
 
-        for path in self._iter_supported_files(root, stats):
-            if self._cancel.is_set():
-                raise IndexCancelled()
+        with ChunkBatchWriter(self.chunk_store, batch_size=32) as writer:
+            for path in self._iter_supported_files(root, stats):
+                if self._cancel.is_set():
+                    writer.flush()
+                    raise IndexCancelled()
 
-            stats.scanned += 1
-            normalized = self._normalize(path)
-            seen_paths.add(normalized)
+                stats.scanned += 1
+                normalized = self._normalize(path)
+                seen_paths.add(normalized)
 
-            try:
-                self._index_existing_file(
-                    path,
-                    normalized,
-                    stats,
-                    on_progress=on_progress,
-                    prefetched_state=index_state.get(normalized),
-                    state_prefetched=True,
-                )
-                if on_progress and stats.scanned % 250 == 0:
-                    on_progress(path, stats)
-            except IndexCancelled:
-                raise
-            except Exception as exc:
-                stats.skipped += 1
-                self.issues.record(normalized, self._error_code(exc), str(exc))
+                try:
+                    success = self._index_existing_file(
+                        path,
+                        normalized,
+                        stats,
+                        on_progress=on_progress,
+                        prefetched_state=index_state.get(normalized),
+                        state_prefetched=True,
+                        writer=writer,
+                        clear_issue=False,
+                    )
+                    if success:
+                        successful_paths.add(normalized)
+                    if on_progress and stats.scanned % 250 == 0:
+                        on_progress(path, stats)
+                except IndexCancelled:
+                    writer.flush()
+                    raise
+                except Exception as exc:
+                    # Release any batched writer lock before persisting the
+                    # problem through IndexIssueStore's separate connection.
+                    writer.flush()
+                    stats.skipped += 1
+                    self.issues.record(normalized, self._error_code(exc), str(exc))
 
+        # Clearing successful-file issues in one transaction removes another
+        # per-file SQLite commit from large reconciliation scans.
+        self.issues.clear_many(successful_paths)
         stats.removed += self.chunk_store.remove_missing_under_root(str(root), seen_paths)
         self.issues.clear_under_root_if_missing(str(root), seen_paths)
         self.database.add_index_root(str(root))
