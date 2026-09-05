@@ -1,6 +1,12 @@
 from __future__ import annotations
 
 from .chunk_store import ChunkSearchResult, ChunkStore, SearchPage
+from .search_sort import (
+    SORT_RELEVANCE,
+    browse_order_clause,
+    search_order_clause,
+    validate_sort_mode,
+)
 from .structure_ranking import parse_structure_query
 
 
@@ -21,6 +27,10 @@ class ExactGroupedSearchEngine:
     appears in a semantic locator such as an Excel sheet name or an enriched
     document/slide title. This keeps explicit hints optional and lets structure
     improve ranking without changing the persisted database schema.
+
+    File ordering is selected from a closed allow-list. Relevance remains the
+    default; modified-time and filename modes only change file order, while the
+    best matching chunk/snippet inside each file is still chosen by relevance.
     """
 
     def __init__(self, store: ChunkStore) -> None:
@@ -80,6 +90,74 @@ class ExactGroupedSearchEngine:
             END
         """
 
+    def _browse_page(
+        self,
+        *,
+        sort_mode: str,
+        limit: int,
+        offset: int,
+        extension: str | None,
+        path_contains: str | None,
+        modified_after: float | None,
+        modified_before: float | None,
+        min_size: int | None,
+        max_size: int | None,
+    ) -> SearchPage:
+        order_clause = browse_order_clause(sort_mode)
+        clauses: list[str] = []
+        params: dict[str, object] = {
+            "limit": max(1, int(limit)),
+            "offset": max(0, int(offset)),
+        }
+        self.store._append_metadata_filters(
+            clauses,
+            params,
+            extension=extension,
+            path_contains=path_contains,
+            modified_after=modified_after,
+            modified_before=modified_before,
+            min_size=min_size,
+            max_size=max_size,
+        )
+        where = "WHERE " + " AND ".join(clauses) if clauses else ""
+        sql = f"""
+            SELECT
+                f.path, f.filename, f.extension, f.modified_time, f.size,
+                COUNT(*) OVER() AS total_count
+            FROM files f
+            {where}
+            ORDER BY {order_clause}
+            LIMIT :limit OFFSET :offset
+        """
+        with self.store.connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+            total_count = int(rows[0]["total_count"]) if rows else 0
+            if not rows and int(params["offset"]) > 0:
+                count_sql = f"SELECT COUNT(*) AS n FROM files f {where}"
+                count_params = {
+                    key: value
+                    for key, value in params.items()
+                    if key not in {"limit", "offset"}
+                }
+                total_count = int(conn.execute(count_sql, count_params).fetchone()["n"])
+
+        return SearchPage(
+            items=[
+                ChunkSearchResult(
+                    path=str(row["path"]),
+                    filename=str(row["filename"]),
+                    extension=str(row["extension"]),
+                    modified_time=float(row["modified_time"]),
+                    size=int(row["size"]),
+                    location="",
+                    snippet="",
+                    score=0.0,
+                )
+                for row in rows
+            ],
+            total_count=total_count,
+        )
+
     def search_page(
         self,
         query: str,
@@ -92,10 +170,13 @@ class ExactGroupedSearchEngine:
         modified_before: float | None = None,
         min_size: int | None = None,
         max_size: int | None = None,
+        sort_mode: str = SORT_RELEVANCE,
     ) -> SearchPage:
+        sort_mode = validate_sort_mode(sort_mode)
         query = query.strip()
         if not query:
-            return self.store.browse_page(
+            return self._browse_page(
+                sort_mode=sort_mode,
                 limit=limit,
                 offset=offset,
                 extension=extension,
@@ -113,6 +194,7 @@ class ExactGroupedSearchEngine:
         structure_boost_expr = self._structure_boost_expr()
         automatic_structure_boost_expr = self._automatic_structure_boost_expr()
         plain_query = self.store._plain_query_text(content_query)
+        order_clause = search_order_clause(sort_mode)
         params: dict[str, object] = {
             "fts_query": fts_query,
             "raw_query": plain_query,
@@ -210,7 +292,7 @@ class ExactGroupedSearchEngine:
                     modified_time, size, relevance_score,
                     COUNT(*) OVER() AS total_count
                 FROM file_hits
-                ORDER BY relevance_score ASC, modified_time DESC, path ASC
+                ORDER BY {order_clause}
                 LIMIT :limit OFFSET :offset
             )
             SELECT
@@ -225,7 +307,7 @@ class ExactGroupedSearchEngine:
                 paged.total_count
             FROM paged
             JOIN chunks ON chunks.id = paged.chunk_id
-            ORDER BY paged.relevance_score ASC, paged.modified_time DESC, paged.path ASC
+            ORDER BY {order_clause}
         """
 
         with self.store.connect() as conn:
@@ -272,8 +354,10 @@ class ExactGroupedSearchEngine:
     ) -> int:
         query = query.strip()
         if not query:
-            return self.store.browse_page(
+            return self._browse_page(
+                sort_mode=SORT_RELEVANCE,
                 limit=1,
+                offset=0,
                 extension=extension,
                 path_contains=path_contains,
                 modified_after=modified_after,

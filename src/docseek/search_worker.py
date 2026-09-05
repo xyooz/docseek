@@ -10,6 +10,7 @@ from PySide6.QtCore import QObject, QRunnable, Signal
 from .chunk_store import ChunkStore, SearchPage
 from .exact_search import ExactGroupedSearchEngine
 from .search_session import get_thread_search_store
+from .search_sort import SORT_RELEVANCE
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,6 +25,7 @@ class SearchRequest:
     modified_before: float | None = None
     min_size: int | None = None
     max_size: int | None = None
+    sort_mode: str = SORT_RELEVANCE
     select_first: bool = False
     is_filter_only: bool = False
 
@@ -116,6 +118,7 @@ class SearchWorker(QRunnable):
                     modified_before=self.request.modified_before,
                     min_size=self.request.min_size,
                     max_size=self.request.max_size,
+                    sort_mode=self.request.sort_mode,
                 )
             except Exception as exc:
                 self.signals.failed.emit(self.request.generation, str(exc))
