@@ -125,9 +125,6 @@ class ChunkStore:
 
     def _migrate_v3_to_v4(self, conn: sqlite3.Connection) -> None:
         """Rebuild only the compact inverted indexes; source files stay closed."""
-        # v3's unicode index carried unused prefix=2/3/4 helpers. Rebuild it
-        # from the single-copy chunks table so exact-token search keeps the
-        # same semantics without that extra posting data.
         conn.execute("DROP TABLE IF EXISTS chunk_index")
         conn.execute("DROP TABLE IF EXISTS chunk_index_tri")
         self._create_v4_schema(conn)
@@ -150,12 +147,7 @@ class ChunkStore:
             )
 
     def _migrate_pre_v3_chunks(self, conn: sqlite3.Connection) -> None:
-        """Move v1/v2 chunk data into the single-copy v4 layout.
-
-        The old base FTS table contains the original text, so migration can
-        rebuild the new inverted indexes without reopening or reparsing source
-        Office/PDF files.
-        """
+        """Move v1/v2 chunk data into the single-copy v4 layout."""
         if not self._table_exists(conn, "chunk_fts"):
             return
 
@@ -324,21 +316,61 @@ class ChunkStore:
         return len(missing)
 
     @staticmethod
-    def _build_fts_query(query: str) -> str:
-        terms = [term.strip() for term in query.split() if term.strip()]
-        escaped = [term.replace('"', '""') for term in terms]
-        return " AND ".join(f'"{term}"' for term in escaped)
+    def _split_query_terms(query: str) -> list[tuple[str, bool]]:
+        """Return (text, quoted) terms while tolerating unmatched quotes."""
+        terms: list[tuple[str, bool]] = []
+        current: list[str] = []
+        in_quotes = False
+        token_quoted = False
+
+        def flush() -> None:
+            nonlocal current, token_quoted
+            if current:
+                terms.append(("".join(current), token_quoted))
+                current = []
+                token_quoted = False
+
+        for char in query.strip():
+            if char == '"':
+                if not current:
+                    token_quoted = True
+                in_quotes = not in_quotes
+                continue
+            if char.isspace() and not in_quotes:
+                flush()
+                continue
+            current.append(char)
+        flush()
+        return terms
+
+    @classmethod
+    def _build_fts_query(cls, query: str) -> str:
+        rendered: list[str] = []
+        for text, _quoted in cls._split_query_terms(query):
+            escaped = text.replace('"', '""')
+            rendered.append(f'"{escaped}"')
+        return " AND ".join(rendered)
 
     @staticmethod
     def _cjk_only(query: str) -> str:
         return "".join(ch for ch in query if _CJK_RE.match(ch))
 
+    @classmethod
+    def _plain_query_text(cls, query: str) -> str:
+        return " ".join(text for text, _quoted in cls._split_query_terms(query))
+
     def _select_index(self, query: str) -> tuple[str, str]:
-        compact = "".join(query.split())
-        compact_cjk = self._cjk_only(query)
-        pure_cjk = bool(compact_cjk and compact_cjk == compact)
-        if pure_cjk:
-            return "chunk_index_cjk2", self._cjk_phrase(compact_cjk)
+        terms = self._split_query_terms(query)
+        if terms and all(
+            text and self._cjk_only(text) == "".join(text.split())
+            for text, _quoted in terms
+        ):
+            # Preserve AND semantics between user terms while each individual
+            # CJK term is matched as an exact contiguous substring.
+            return (
+                "chunk_index_cjk2",
+                " AND ".join(self._cjk_phrase("".join(text.split())) for text, _quoted in terms),
+            )
         return "chunk_index", self._build_fts_query(query)
 
     @staticmethod
@@ -491,7 +523,7 @@ class ChunkStore:
         clauses = [f"{table} MATCH :fts_query"]
         params: dict[str, object] = {
             "fts_query": fts_query,
-            "raw_query": query,
+            "raw_query": self._plain_query_text(query),
             "limit": max(1, int(limit)),
             "offset": max(0, int(offset)),
         }
@@ -645,17 +677,15 @@ class ChunkStore:
             max_size=max_size,
         ).items
 
-    @staticmethod
-    def _snippet_from_content(content: str, query: str, radius: int = 52) -> str:
-        cleaned_query = query.strip().strip('"')
-        terms = [term.strip('"') for term in query.split() if term.strip('"')]
-        candidates = [cleaned_query] + terms if cleaned_query else terms
+    @classmethod
+    def _snippet_from_content(cls, content: str, query: str, radius: int = 52) -> str:
+        terms = [text for text, _quoted in cls._split_query_terms(query) if text]
+        candidates = sorted(set(terms), key=len, reverse=True)
         folded = content.casefold()
 
         positions = [
             (folded.find(candidate.casefold()), candidate)
             for candidate in candidates
-            if candidate
         ]
         positions = [(pos, term) for pos, term in positions if pos >= 0]
         if not positions:
@@ -666,12 +696,9 @@ class ChunkStore:
         end = min(len(content), position + len(anchor) + radius)
         snippet = content[start:end].replace("\n", " ")
 
-        highlight_terms = sorted({term for term in terms if term}, key=len, reverse=True)
-        if cleaned_query and cleaned_query not in highlight_terms:
-            highlight_terms.insert(0, cleaned_query)
-        if highlight_terms:
+        if candidates:
             pattern = re.compile(
-                "|".join(re.escape(term) for term in highlight_terms),
+                "|".join(re.escape(term) for term in candidates),
                 flags=re.IGNORECASE,
             )
             snippet = pattern.sub(lambda match: f"[[HIT]]{match.group(0)}[[/HIT]]", snippet)
