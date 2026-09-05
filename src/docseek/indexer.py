@@ -84,7 +84,7 @@ class DirectoryIndexer:
     def _has_chunk_index(self, path: str) -> bool:
         with self.chunk_store.connect() as conn:
             row = conn.execute(
-                "SELECT 1 FROM chunk_fts WHERE path = ? LIMIT 1",
+                "SELECT 1 FROM chunks WHERE path = ? LIMIT 1",
                 (path,),
             ).fetchone()
         return row is not None
@@ -106,7 +106,7 @@ class DirectoryIndexer:
                 "SELECT path, modified_time, size FROM files"
             ).fetchall()
             chunk_rows = conn.execute(
-                "SELECT DISTINCT path FROM chunk_fts"
+                "SELECT DISTINCT path FROM chunks"
             ).fetchall()
 
         chunk_paths = {str(row["path"]) for row in chunk_rows}
