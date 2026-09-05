@@ -58,11 +58,8 @@ class ChunkStore:
 
     def _init_schema(self) -> None:
         with self.connect() as conn:
-            # Switching journal mode is comparatively expensive on Windows.
-            # Do it once when the store is initialized, not on every per-file
-            # connection used during indexing or searching.
             conn.execute("PRAGMA journal_mode=WAL")
-            ensure_schema_compatible(conn)
+            previous_version = ensure_schema_compatible(conn)
             conn.executescript(
                 """
                 CREATE VIRTUAL TABLE IF NOT EXISTS chunk_fts USING fts5(
@@ -83,6 +80,13 @@ class ChunkStore:
                     content_tokens,
                     tokenize='unicode61'
                 );
+
+                CREATE TABLE IF NOT EXISTS chunk_lookup(
+                    path TEXT NOT NULL,
+                    ordinal INTEGER NOT NULL,
+                    fts_rowid INTEGER NOT NULL,
+                    PRIMARY KEY(path, ordinal)
+                ) WITHOUT ROWID;
                 """
             )
             try:
@@ -101,6 +105,19 @@ class ChunkStore:
                 self._trigram_available = True
             except sqlite3.OperationalError:
                 self._trigram_available = False
+
+            # Schema v2 adds a compact path/ordinal -> chunk_fts rowid map.
+            # Existing indexes can be upgraded without reparsing source files.
+            if previous_version < 2:
+                conn.execute("DELETE FROM chunk_lookup")
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO chunk_lookup(path, ordinal, fts_rowid)
+                    SELECT path, CAST(ordinal AS INTEGER), rowid
+                    FROM chunk_fts
+                    """
+                )
+
             mark_schema_current(conn)
 
     @staticmethod
@@ -143,12 +160,17 @@ class ChunkStore:
             self._delete_chunks(conn, path)
             for chunk in chunks:
                 values = (path, chunk.ordinal, chunk.location, filename, chunk.content)
-                conn.execute(
+                cursor = conn.execute(
                     "INSERT INTO chunk_fts(path, ordinal, location, filename, content) VALUES (?, ?, ?, ?, ?)",
                     values,
                 )
                 conn.execute(
-                    "INSERT INTO chunk_fts_cjk2(path, ordinal, location, filename_tokens, content_tokens) VALUES (?, ?, ?, ?, ?)",
+                    "INSERT INTO chunk_lookup(path, ordinal, fts_rowid) VALUES (?, ?, ?)",
+                    (path, chunk.ordinal, int(cursor.lastrowid)),
+                )
+                conn.execute(
+                    "INSERT INTO chunk_fts_cjk2(path, ordinal, location, filename_tokens, content_tokens) "
+                    "VALUES (?, ?, ?, ?, ?)",
                     (
                         path,
                         chunk.ordinal,
@@ -171,6 +193,7 @@ class ChunkStore:
             conn.execute("DELETE FROM files WHERE path = ?", (path,))
 
     def _delete_chunks(self, conn: sqlite3.Connection, path: str) -> None:
+        conn.execute("DELETE FROM chunk_lookup WHERE path = ?", (path,))
         conn.execute("DELETE FROM chunk_fts WHERE path = ?", (path,))
         conn.execute("DELETE FROM chunk_fts_cjk2 WHERE path = ?", (path,))
         if self._trigram_available:
@@ -278,7 +301,11 @@ class ChunkStore:
             total_count = int(rows[0]["total_count"]) if rows else 0
             if not rows and int(params["offset"]) > 0:
                 count_sql = f"SELECT COUNT(*) AS n FROM files f {where}"
-                count_params = {key: value for key, value in params.items() if key not in {"limit", "offset"}}
+                count_params = {
+                    key: value
+                    for key, value in params.items()
+                    if key not in {"limit", "offset"}
+                }
                 total_count = int(conn.execute(count_sql, count_params).fetchone()["n"])
 
         items = [
@@ -346,26 +373,45 @@ class ChunkStore:
             )
 
         compact_cjk = self._cjk_only(query)
-        is_short_cjk = compact_cjk and len(compact_cjk) <= 2 and compact_cjk == "".join(query.split())
+        is_short_cjk = bool(
+            compact_cjk
+            and len(compact_cjk) <= 2
+            and compact_cjk == "".join(query.split())
+        )
+
         if is_short_cjk:
             table = "chunk_fts_cjk2"
             fts_query = f'"{compact_cjk}"'
-            snippet_expr = "''"
             score_expr = "bm25(chunk_fts_cjk2, 0.0, 0.0, 0.0, 5.0, 1.0)"
+            extra_joins = """
+                JOIN chunk_lookup lookup
+                  ON lookup.path = chunk_fts_cjk2.path
+                 AND lookup.ordinal = CAST(chunk_fts_cjk2.ordinal AS INTEGER)
+                JOIN chunk_fts base
+                  ON base.rowid = lookup.fts_rowid
+            """
+            snippet_expr = "''"
+            raw_content_expr = "base.content"
         else:
             compact = "".join(query.split())
-            use_tri = self._trigram_available and bool(_CJK_RE.search(query)) and len(compact) >= 3
+            use_tri = (
+                self._trigram_available
+                and bool(_CJK_RE.search(query))
+                and len(compact) >= 3
+            )
             table = "chunk_fts_tri" if use_tri else "chunk_fts"
             fts_query = self._build_fts_query(query)
-            snippet_expr = f"snippet({table}, 4, '[[HIT]]', '[[/HIT]]', ' … ', 36)"
             score_expr = f"bm25({table}, 0.0, 0.0, 0.0, 5.0, 1.0)"
+            extra_joins = ""
+            snippet_expr = f"snippet({table}, 4, '[[HIT]]', '[[/HIT]]', ' … ', 36)"
+            raw_content_expr = "NULL"
 
         clauses = [f"{table} MATCH :fts_query"]
         params: dict[str, object] = {
             "fts_query": fts_query,
             "raw_query": query,
-            "limit": max(1, limit),
-            "offset": max(0, offset),
+            "limit": max(1, int(limit)),
+            "offset": max(0, int(offset)),
         }
         self._append_metadata_filters(
             clauses,
@@ -401,10 +447,12 @@ class ChunkStore:
                     CAST({table}.ordinal AS INTEGER) AS ordinal,
                     {table}.location AS location,
                     {snippet_expr} AS snippet,
+                    {raw_content_expr} AS raw_content,
                     {score_expr} AS bm25_score,
                     {filename_boost_expr} AS filename_boost
                 FROM {table}
                 JOIN files f ON f.path = {table}.path
+                {extra_joins}
                 WHERE {' AND '.join(clauses)}
             ),
             ranked AS (
@@ -420,13 +468,13 @@ class ChunkStore:
             file_hits AS (
                 SELECT
                     path, filename, extension, modified_time, size,
-                    location, snippet, relevance_score
+                    location, snippet, raw_content, relevance_score
                 FROM ranked
                 WHERE file_rank = 1
             )
             SELECT
                 path, filename, extension, modified_time, size,
-                location, snippet, relevance_score AS score,
+                location, snippet, raw_content, relevance_score AS score,
                 COUNT(*) OVER() AS total_count
             FROM file_hits
             ORDER BY relevance_score ASC, modified_time DESC, path ASC
@@ -445,6 +493,7 @@ class ChunkStore:
                             {filename_boost_expr} AS filename_boost
                         FROM {table}
                         JOIN files f ON f.path = {table}.path
+                        {extra_joins}
                         WHERE {' AND '.join(clauses)}
                     ),
                     ranked AS (
@@ -458,18 +507,22 @@ class ChunkStore:
                     )
                     SELECT COUNT(*) AS n FROM ranked WHERE file_rank = 1
                 """
-                count_params = {key: value for key, value in params.items() if key not in {"limit", "offset"}}
+                count_params = {
+                    key: value
+                    for key, value in params.items()
+                    if key not in {"limit", "offset"}
+                }
                 total_count = int(conn.execute(count_sql, count_params).fetchone()["n"])
 
         items: list[ChunkSearchResult] = []
         for row in rows:
-            snippet = str(row["snippet"] or "")
             if is_short_cjk:
-                snippet = self._plain_chunk_snippet(
-                    str(row["path"]),
-                    str(row["location"]),
+                snippet = self._snippet_from_content(
+                    str(row["raw_content"] or ""),
                     query,
                 )
+            else:
+                snippet = str(row["snippet"] or "")
             items.append(
                 ChunkSearchResult(
                     path=str(row["path"]),
@@ -509,20 +562,24 @@ class ChunkStore:
             max_size=max_size,
         ).items
 
-    def _plain_chunk_snippet(self, path: str, location: str, query: str, radius: int = 52) -> str:
-        with self.connect() as conn:
-            row = conn.execute(
-                "SELECT content FROM chunk_fts WHERE path = ? AND location = ? LIMIT 1",
-                (path, location),
-            ).fetchone()
-        if not row:
-            return ""
-        content = str(row["content"] or "")
-        position = content.casefold().find(query.casefold())
+    @staticmethod
+    def _snippet_from_content(content: str, query: str, radius: int = 52) -> str:
+        folded_query = query.casefold()
+        position = content.casefold().find(folded_query)
         if position < 0:
             return content[: radius * 2].replace("\n", " ")
         start = max(0, position - radius)
         end = min(len(content), position + len(query) + radius)
         snippet = content[start:end].replace("\n", " ")
-        highlighted = snippet.replace(query, f"[[HIT]]{query}[[/HIT]]")
-        return ("… " if start else "") + highlighted + (" …" if end < len(content) else "")
+
+        local_position = snippet.casefold().find(folded_query)
+        if local_position >= 0:
+            hit_end = local_position + len(query)
+            snippet = (
+                snippet[:local_position]
+                + "[[HIT]]"
+                + snippet[local_position:hit_end]
+                + "[[/HIT]]"
+                + snippet[hit_end:]
+            )
+        return ("… " if start else "") + snippet + (" …" if end < len(content) else "")
