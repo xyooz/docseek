@@ -4,12 +4,12 @@ import html
 import os
 import subprocess
 import sys
-from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, QObject, QRunnable, Qt, QThreadPool, QTimer, Signal
 from PySide6.QtGui import QAction, QGuiApplication
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QComboBox,
     QFileDialog,
@@ -23,17 +23,17 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSplitter,
     QStatusBar,
-    QTableWidget,
-    QTableWidgetItem,
+    QTableView,
     QTextBrowser,
     QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
-from .chunk_store import ChunkSearchResult, ChunkStore
+from .chunk_store import ChunkStore
 from .indexer import DirectoryIndexer, IndexCancelled, IndexStats
 from .query_parser import parse_query, query_filter_chips, remove_query_filter
+from .results_model import SearchResultsModel
 from .search_db import SearchDatabase
 from .search_sort import SORT_FILENAME, SORT_MODIFIED, SORT_RELEVANCE
 from .search_worker import SearchRequest, SearchResponse, SearchWorker
@@ -175,7 +175,6 @@ class MainWindow(QMainWindow):
         self.loading_generation: int | None = None
 
         self.current_worker: IndexWorker | None = None
-        self.current_results: list[ChunkSearchResult] = []
         self.search_offset = 0
         self.has_more_results = False
         self.loading_more = False
@@ -275,14 +274,14 @@ class MainWindow(QMainWindow):
         progress_layout.addLayout(progress_text, 1)
         progress_layout.addWidget(self.index_counts_label)
 
-        self.results = QTableWidget(0, 6)
-        self.results.setHorizontalHeaderLabels(
-            ["文件名", "命中位置", "类型", "大小", "修改时间", "路径"]
-        )
-        self.results.setSelectionBehavior(QTableWidget.SelectRows)
-        self.results.setSelectionMode(QTableWidget.SingleSelection)
-        self.results.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.results = QTableView()
+        self.results_model = SearchResultsModel(self.results)
+        self.results.setModel(self.results_model)
+        self.results.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.results.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.results.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.results.setSortingEnabled(False)
+        self.results.setWordWrap(False)
         self.results.verticalHeader().setVisible(False)
         self.results.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         self.results.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
@@ -343,8 +342,10 @@ class MainWindow(QMainWindow):
         self.refresh_button.clicked.connect(self._refresh_all_roots)
         self.settings_button.clicked.connect(self._open_index_settings)
         self.cancel_button.clicked.connect(self._cancel_index)
-        self.results.cellDoubleClicked.connect(lambda _row, _column: self._open_selected())
-        self.results.itemSelectionChanged.connect(self._show_preview)
+        self.results.doubleClicked.connect(lambda _index: self._open_selected())
+        self.results.selectionModel().selectionChanged.connect(
+            lambda _selected, _deselected: self._show_preview()
+        )
         self.results.customContextMenuRequested.connect(self._show_context_menu)
         self.results.verticalScrollBar().valueChanged.connect(self._on_results_scroll)
         self.search_input.installEventFilter(self)
@@ -377,14 +378,13 @@ class MainWindow(QMainWindow):
 
             if watched is self.search_input and key in (Qt.Key_Down, Qt.Key_Up):
                 row = result_entry_row(
-                    self.results.rowCount(), move_down=key == Qt.Key_Down
+                    self.results_model.rowCount(), move_down=key == Qt.Key_Down
                 )
                 if row is not None:
-                    self.results.setCurrentCell(row, 0)
+                    index = self.results_model.index(row, 0)
+                    self.results.setCurrentIndex(index)
                     self.results.selectRow(row)
-                    item = self.results.item(row, 0)
-                    if item is not None:
-                        self.results.scrollToItem(item)
+                    self.results.scrollTo(index)
                     self.results.setFocus()
                     return True
 
@@ -392,7 +392,11 @@ class MainWindow(QMainWindow):
                 self._open_selected()
                 return True
 
-            if watched is self.results and key == Qt.Key_Up and self.results.currentRow() <= 0:
+            if (
+                watched is self.results
+                and key == Qt.Key_Up
+                and self.results.currentIndex().row() <= 0
+            ):
                 self.search_input.setFocus()
                 self.search_input.setCursorPosition(len(self.search_input.text()))
                 return True
@@ -428,7 +432,7 @@ class MainWindow(QMainWindow):
             if roots:
                 self._start_index(roots, automatic=True)
             else:
-                self.results.setRowCount(0)
+                self.results_model.clear()
 
     def _refresh_all_roots(self) -> None:
         roots = [Path(root) for root in self.database.get_index_roots()]
@@ -618,9 +622,8 @@ class MainWindow(QMainWindow):
         self.has_more_results = False
         self.loading_more = False
         self.loading_generation = None
-        self.current_results = []
         self.seen_result_paths.clear()
-        self.results.setRowCount(0)
+        self.results_model.clear()
         self.preview.clear()
         self._load_next_page(select_first=True)
 
@@ -687,12 +690,7 @@ class MainWindow(QMainWindow):
         unique_rows = [row for row in rows if row.path not in self.seen_result_paths]
         for row in unique_rows:
             self.seen_result_paths.add(row.path)
-
-        start_row = len(self.current_results)
-        self.current_results.extend(unique_rows)
-        self.results.setRowCount(len(self.current_results))
-        for offset, row in enumerate(unique_rows):
-            self._populate_result_row(start_row + offset, row)
+        self.results_model.append_items(unique_rows)
 
         self.search_offset += len(rows)
         self.has_more_results = self.search_offset < page.total_count
@@ -703,13 +701,16 @@ class MainWindow(QMainWindow):
             if response.elapsed_ms < 10
             else f"{response.elapsed_ms:.0f} ms"
         )
+        displayed = self.results_model.rowCount()
         self.statusBar().showMessage(
-            f"{mode}：已显示 {len(self.current_results):,} / 共 {page.total_count:,} 个文件"
+            f"{mode}：已显示 {displayed:,} / 共 {page.total_count:,} 个文件"
             f" · {latency}{suffix}"
         )
         if page.total_count == 0:
             self.preview.setHtml(empty_result_html(filter_only=request.is_filter_only))
-        elif request.select_first and self.current_results:
+        elif request.select_first and displayed:
+            index = self.results_model.index(0, 0)
+            self.results.setCurrentIndex(index)
             self.results.selectRow(0)
 
     def _search_failed(self, worker: SearchWorker, generation: int, message: str) -> None:
@@ -721,36 +722,19 @@ class MainWindow(QMainWindow):
             self.loading_generation = None
         self.statusBar().showMessage(f"搜索失败：{message}", 8000)
 
-    def _populate_result_row(self, row_index: int, row: ChunkSearchResult) -> None:
-        name_item = QTableWidgetItem(row.filename)
-        name_item.setData(Qt.UserRole, row.path)
-        location_item = QTableWidgetItem(row.location or "—")
-        ext_item = QTableWidgetItem(row.extension.lstrip(".").upper())
-        size_item = QTableWidgetItem(self._human_size(row.size))
-        time_item = QTableWidgetItem(
-            datetime.fromtimestamp(row.modified_time).strftime("%Y-%m-%d %H:%M")
-        )
-        path_item = QTableWidgetItem(row.path)
-
-        self.results.setItem(row_index, 0, name_item)
-        self.results.setItem(row_index, 1, location_item)
-        self.results.setItem(row_index, 2, ext_item)
-        self.results.setItem(row_index, 3, size_item)
-        self.results.setItem(row_index, 4, time_item)
-        self.results.setItem(row_index, 5, path_item)
-
     def _on_results_scroll(self, value: int) -> None:
         scrollbar = self.results.verticalScrollBar()
         if self.has_more_results and value >= scrollbar.maximum() - 2:
             self._load_next_page()
 
     def _show_preview(self) -> None:
-        row_index = self.results.currentRow()
-        if row_index < 0 or row_index >= len(self.current_results):
-            self.preview.clear()
+        row_index = self.results.currentIndex().row()
+        row = self.results_model.result_at(row_index)
+        if row is None:
+            if self.database.get_index_roots():
+                self.preview.clear()
             return
 
-        row = self.current_results[row_index]
         safe_filename = html.escape(row.filename)
         safe_path = html.escape(row.path)
         metadata = (
@@ -776,11 +760,8 @@ class MainWindow(QMainWindow):
         )
 
     def _selected_path(self) -> str | None:
-        row = self.results.currentRow()
-        if row < 0:
-            return None
-        item = self.results.item(row, 0)
-        return str(item.data(Qt.UserRole)) if item else None
+        row = self.results_model.result_at(self.results.currentIndex().row())
+        return row.path if row is not None else None
 
     def _open_selected(self) -> None:
         path = self._selected_path()
@@ -807,7 +788,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("已复制文件路径", 3000)
 
     def _show_context_menu(self, point) -> None:
-        if self.results.currentRow() < 0:
+        if not self.results.currentIndex().isValid():
             return
         menu = QMenu(self)
         menu.addAction("打开", self._open_selected)
