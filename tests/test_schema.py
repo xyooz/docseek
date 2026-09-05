@@ -95,6 +95,87 @@ class SchemaVersionTests(unittest.TestCase):
         self.assertEqual([row.filename for row in rows], ["credit.pdf"])
         self.assertIn("[[HIT]]信贷[[/HIT]]", rows[0].snippet)
 
+    def test_v3_index_drops_trigram_and_unused_prefix_copy(self) -> None:
+        SearchDatabase(self.db_path)
+        path = r"C:\docs\manual.pdf"
+        content = "农业银行客户经理办理信贷业务"
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            conn.executescript(
+                """
+                CREATE TABLE chunks(
+                    id INTEGER PRIMARY KEY,
+                    path TEXT NOT NULL,
+                    ordinal INTEGER NOT NULL,
+                    location TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    UNIQUE(path, ordinal)
+                );
+                CREATE INDEX idx_chunks_path ON chunks(path);
+                CREATE VIRTUAL TABLE chunk_index USING fts5(
+                    filename,
+                    content,
+                    content='',
+                    tokenize='unicode61 remove_diacritics 2',
+                    prefix='2 3 4'
+                );
+                CREATE VIRTUAL TABLE chunk_index_cjk2 USING fts5(
+                    filename_tokens,
+                    content_tokens,
+                    content='',
+                    tokenize='unicode61'
+                );
+                CREATE VIRTUAL TABLE chunk_index_tri USING fts5(
+                    filename,
+                    content,
+                    content='',
+                    tokenize='trigram case_sensitive 0'
+                );
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO files(path, filename, extension, modified_time, size, last_error)
+                VALUES (?, 'manual.pdf', '.pdf', 1.0, 123, NULL)
+                """,
+                (path,),
+            )
+            cursor = conn.execute(
+                "INSERT INTO chunks(path, ordinal, location, content) VALUES (?, 0, '第 1 页', ?)",
+                (path, content),
+            )
+            rowid = int(cursor.lastrowid)
+            bigrams = "农业 业银 银行 行客 客户 户经 经理 理办 办理 理信 信贷 贷业 业务"
+            conn.execute(
+                "INSERT INTO chunk_index(rowid, filename, content) VALUES (?, 'manual.pdf', ?)",
+                (rowid, content),
+            )
+            conn.execute(
+                "INSERT INTO chunk_index_cjk2(rowid, filename_tokens, content_tokens) VALUES (?, '', ?)",
+                (rowid, bigrams),
+            )
+            conn.execute(
+                "INSERT INTO chunk_index_tri(rowid, filename, content) VALUES (?, 'manual.pdf', ?)",
+                (rowid, content),
+            )
+            conn.execute("PRAGMA user_version = 3")
+            conn.commit()
+
+        migrated = ChunkStore(self.db_path)
+        with migrated.connect() as conn:
+            tri = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='chunk_index_tri'"
+            ).fetchone()
+            base_sql = str(
+                conn.execute(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name='chunk_index'"
+                ).fetchone()[0]
+            )
+
+        self.assertIsNone(tri)
+        self.assertNotIn("prefix=", base_sql)
+        rows = migrated.search("客户经理")
+        self.assertEqual([row.filename for row in rows], ["manual.pdf"])
+
     def test_newer_database_is_rejected(self) -> None:
         SearchDatabase(self.db_path)
         with closing(sqlite3.connect(self.db_path)) as conn:
