@@ -1,14 +1,20 @@
 from __future__ import annotations
 
+from datetime import datetime
+from pathlib import Path
+
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
+    QFileDialog,
     QGroupBox,
     QLabel,
     QMessageBox,
     QPlainTextEdit,
+    QPushButton,
     QVBoxLayout,
 )
 
+from .diagnostics import write_diagnostic_report
 from .file_exclusions import (
     FileExclusionStore,
     InvalidFileExclusionPattern,
@@ -86,12 +92,24 @@ class PausableIndexSettingsDialog(IndexSettingsDialog):
         )
         self.health_hint_label.setWordWrap(True)
         self.health_hint_label.setStyleSheet("color: palette(mid); font-size: 11px;")
+        self.diagnostic_button = QPushButton("导出脱敏诊断…")
+        self.diagnostic_button.setToolTip(
+            "导出版本、运行环境和索引健康统计；不包含目录路径、文件名、正文、问题详情或搜索记录。"
+        )
+        self.diagnostic_button.clicked.connect(self._export_diagnostics)
+        self.diagnostic_hint_label = QLabel(
+            "诊断文件只包含聚合状态，不包含索引目录路径、问题文件路径、文件名、正文或搜索记录。"
+        )
+        self.diagnostic_hint_label.setWordWrap(True)
+        self.diagnostic_hint_label.setStyleSheet("color: palette(mid); font-size: 11px;")
 
         health_group = QGroupBox("索引概况")
         health_layout = QVBoxLayout()
         health_layout.addWidget(self.health_summary_label)
         health_layout.addWidget(self.reconcile_time_label)
         health_layout.addWidget(self.health_hint_label)
+        health_layout.addWidget(self.diagnostic_button)
+        health_layout.addWidget(self.diagnostic_hint_label)
         health_group.setLayout(health_layout)
 
         # Base layout is: note, roots, excludes, performance, issues, buttons.
@@ -146,6 +164,33 @@ class PausableIndexSettingsDialog(IndexSettingsDialog):
                 "最近完整校准："
                 + format_reconcile_time(snapshot.last_successful_reconcile_at)
             )
+
+    def _export_diagnostics(self) -> None:
+        default_name = (
+            "docseek-diagnostics-" + datetime.now().strftime("%Y%m%d-%H%M%S") + ".json"
+        )
+        filename, _selected_filter = QFileDialog.getSaveFileName(
+            self,
+            "导出脱敏诊断",
+            str(Path.home() / default_name),
+            "JSON 文件 (*.json)",
+        )
+        if not filename:
+            return
+        if not filename.lower().endswith(".json"):
+            filename += ".json"
+        try:
+            destination = write_diagnostic_report(self.database, filename)
+        except Exception as exc:  # UI boundary: report failure instead of closing settings.
+            QMessageBox.warning(self, "导出诊断失败", str(exc))
+            return
+        QMessageBox.information(
+            self,
+            "诊断已导出",
+            "已保存脱敏诊断：\n"
+            f"{destination}\n\n"
+            "文件不包含目录路径、文件名、正文、问题详情或搜索记录。",
+        )
 
     def _refresh_issue_summary(self) -> None:
         # Base __init__ calls this virtual method before the health widget exists,
