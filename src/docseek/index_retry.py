@@ -101,3 +101,39 @@ def build_index_retry_plan(
         rescan_roots=tuple(rescan_roots),
         skipped_paths=tuple(skipped),
     )
+
+
+def dispatch_index_retry(window, plan: IndexRetryPlan) -> None:
+    """Route a retry plan through the desktop's established index workers.
+
+    The helper intentionally uses the same full-scan and precise-update entry
+    points as normal watcher/refresh work. When both are needed, precise file
+    retries are placed on the existing pending-path queue and drain after the
+    root reconciliation finishes, so two SQLite writers are never launched in
+    parallel by one retry action.
+    """
+
+    skipped = len(plan.skipped_paths)
+    if plan.empty:
+        if skipped:
+            window.statusBar().showMessage(
+                f"有 {skipped} 项位于已暂停或已移除的索引目录，未执行重试",
+                7000,
+            )
+        else:
+            window.statusBar().showMessage("当前没有可重试的索引问题", 5000)
+        return
+
+    if plan.rescan_roots:
+        window.pending_watch_paths.update(str(path) for path in plan.file_paths)
+        window._start_index(list(plan.rescan_roots))
+        message = f"正在重试索引问题：校准 {len(plan.rescan_roots)} 个目录"
+        if plan.file_paths:
+            message += f"，随后重试 {len(plan.file_paths)} 个文件"
+    else:
+        window._start_path_update(list(plan.file_paths))
+        message = f"正在重试 {len(plan.file_paths)} 个问题文件"
+
+    if skipped:
+        message += f"；另有 {skipped} 项因目录暂停或已移除而跳过"
+    window.statusBar().showMessage(message, 7000)
