@@ -34,8 +34,8 @@ def iter_document_chunks(
     Every supported format now passes through the capability-aware broker and
     streaming DocIR layer before being converted back to the existing v7
     ``DocumentChunk`` contract. The compatibility conversion is lossless, so
-    this architectural upgrade does not change FTS text, locations or require a
-    schema migration.
+    this architectural upgrade does not change FTS text or require a schema
+    migration. Structural labels may become richer as extractors learn titles.
     """
     from .extraction_broker import DEFAULT_EXTRACTION_BROKER
 
@@ -117,6 +117,24 @@ def _detect_text_encoding(path: Path) -> str:
     return "utf-8"
 
 
+def _clean_location_title(text: str, *, max_chars: int = 80) -> str:
+    """Normalize a human-readable structural title for compact result labels."""
+    normalized = " ".join(text.split()).strip()
+    if len(normalized) <= max_chars:
+        return normalized
+    return normalized[: max_chars - 3].rstrip() + "..."
+
+
+def _is_docx_heading_style(style_name: str) -> bool:
+    style = style_name.strip()
+    folded = style.casefold()
+    return (
+        folded.startswith("heading")
+        or folded == "title"
+        or style.startswith("标题")
+    )
+
+
 def _iter_docx_chunks(path: Path, *, target_chars: int) -> Iterator[DocumentChunk]:
     document = Document(path)
     ordinal = 0
@@ -124,20 +142,27 @@ def _iter_docx_chunks(path: Path, *, target_chars: int) -> Iterator[DocumentChun
     char_count = 0
     section_start = 1
     block_no = 0
+    current_heading = ""
+    buffer_heading = ""
 
     def maybe_emit(force: bool = False) -> DocumentChunk | None:
-        nonlocal ordinal, buffer, char_count, section_start
+        nonlocal ordinal, buffer, char_count, section_start, buffer_heading
         if not buffer or (not force and char_count < target_chars):
             return None
         content = "\n".join(buffer).strip()
         if not content:
             buffer = []
             char_count = 0
+            buffer_heading = ""
             return None
-        chunk = DocumentChunk(ordinal, f"文档块 {section_start}-{block_no}", content)
+        location = f"文档块 {section_start}-{block_no}"
+        if buffer_heading:
+            location += f" · 标题 {buffer_heading}"
+        chunk = DocumentChunk(ordinal, location, content)
         ordinal += 1
         buffer = []
         char_count = 0
+        buffer_heading = ""
         section_start = block_no + 1
         return chunk
 
@@ -146,6 +171,11 @@ def _iter_docx_chunks(path: Path, *, target_chars: int) -> Iterator[DocumentChun
         if not text:
             continue
         block_no += 1
+        style_name = str(getattr(getattr(paragraph, "style", None), "name", "") or "")
+        if _is_docx_heading_style(style_name):
+            current_heading = _clean_location_title(text)
+        if not buffer:
+            buffer_heading = current_heading
         buffer.append(text)
         char_count += len(text)
         chunk = maybe_emit()
@@ -158,6 +188,8 @@ def _iter_docx_chunks(path: Path, *, target_chars: int) -> Iterator[DocumentChun
             if not text:
                 continue
             block_no += 1
+            if not buffer:
+                buffer_heading = current_heading
             buffer.append(text)
             char_count += len(text)
             chunk = maybe_emit()
@@ -238,6 +270,8 @@ def _iter_pptx_chunks(path: Path) -> Iterator[DocumentChunk]:
     ordinal = 0
     for slide_no, slide in enumerate(presentation.slides, start=1):
         content: list[str] = []
+        title_shape = getattr(slide.shapes, "title", None)
+        title_text = _clean_location_title(str(getattr(title_shape, "text", "") or ""))
         for shape in slide.shapes:
             text = getattr(shape, "text", "")
             if text:
@@ -247,7 +281,10 @@ def _iter_pptx_chunks(path: Path) -> Iterator[DocumentChunk]:
                     content.append("\t".join(cell.text for cell in row.cells))
         text = "\n".join(content).strip()
         if text:
-            yield DocumentChunk(ordinal, f"幻灯片 {slide_no}", text)
+            location = f"幻灯片 {slide_no}"
+            if title_text:
+                location += f" · 标题 {title_text}"
+            yield DocumentChunk(ordinal, location, text)
             ordinal += 1
 
 

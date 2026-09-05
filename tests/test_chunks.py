@@ -4,12 +4,43 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from docx import Document
 from openpyxl import Workbook
+from pptx import Presentation
 
 from docseek.chunks import iter_document_chunks
 
 
 class DocumentChunkExtractionTests(unittest.TestCase):
+    def test_docx_heading_is_preserved_in_chunk_location(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "制度.docx"
+            document = Document()
+            document.add_heading("客户经理考核办法", level=1)
+            document.add_paragraph("本章节介绍客户经理考核与管理要求。")
+            document.save(path)
+
+            chunks = list(iter_document_chunks(path))
+
+        self.assertEqual(len(chunks), 1)
+        self.assertIn("· 标题 客户经理考核办法", chunks[0].location)
+        self.assertIn("本章节介绍客户经理考核与管理要求", chunks[0].content)
+
+    def test_pptx_title_is_preserved_in_slide_location(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "培训.pptx"
+            presentation = Presentation()
+            slide = presentation.slides.add_slide(presentation.slide_layouts[1])
+            slide.shapes.title.text = "风险管理"
+            slide.placeholders[1].text = "客户经理风险管理培训内容"
+            presentation.save(path)
+
+            chunks = list(iter_document_chunks(path))
+
+        self.assertEqual(len(chunks), 1)
+        self.assertEqual(chunks[0].location, "幻灯片 1 · 标题 风险管理")
+        self.assertIn("风险管理", chunks[0].content)
+
     def test_xlsx_preserves_interior_empty_cells_and_sheet_name(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "客户清单.xlsx"

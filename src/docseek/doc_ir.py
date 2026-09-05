@@ -60,10 +60,10 @@ class DocumentBlock:
 
 
 _PDF_LOCATION = re.compile(r"^第\s*(\d+)\s*页$")
-_SLIDE_LOCATION = re.compile(r"^幻灯片\s*(\d+)$")
+_SLIDE_LOCATION = re.compile(r"^幻灯片\s*(\d+)(?:\s*·\s*标题\s+(.+))?$")
 _SHEET_LOCATION = re.compile(r"^工作表\s+(.+?)\s*·\s*行\s+(\d+)-(\d+)$")
 _LINE_LOCATION = re.compile(r"^行\s+(\d+)-(\d+)$")
-_WRITER_LOCATION = re.compile(r"^文档块\s+(\d+)-(\d+)$")
+_WRITER_LOCATION = re.compile(r"^文档块\s+(\d+)-(\d+)(?:\s*·\s*标题\s+(.+))?$")
 
 
 def _generic_block(
@@ -104,12 +104,14 @@ def block_from_chunk(
         match = _SLIDE_LOCATION.match(location)
         if not match:
             return _generic_block(family, chunk)
+        slide_no, title = match.groups()
         return DocumentBlock(
             chunk.ordinal,
             BlockKind.SLIDE,
             chunk.content,
-            BlockLocator(location, slide=int(match.group(1))),
+            BlockLocator(location, slide=int(slide_no)),
             family,
+            title=title,
         )
 
     if family == DocumentFamily.SPREADSHEET:
@@ -151,16 +153,18 @@ def block_from_chunk(
         match = _WRITER_LOCATION.match(location)
         if not match:
             return _generic_block(family, chunk)
+        start, end, title = match.groups()
         return DocumentBlock(
             chunk.ordinal,
             BlockKind.WRITER_BLOCK,
             chunk.content,
             BlockLocator(
                 location,
-                block_start=int(match.group(1)),
-                block_end=int(match.group(2)),
+                block_start=int(start),
+                block_end=int(end),
             ),
             family,
+            title=title,
         )
 
     return _generic_block(family, chunk)

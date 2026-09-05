@@ -34,13 +34,14 @@ class DocumentIRTests(unittest.TestCase):
         slide = block_from_chunk(
             Path("培训.pptx"),
             DocumentFamily.PRESENTATION,
-            DocumentChunk(16, "幻灯片 17", "风险管理"),
+            DocumentChunk(16, "幻灯片 17 · 标题 风险管理", "风险管理"),
         )
 
         self.assertEqual(pdf.kind, BlockKind.PAGE)
         self.assertEqual(pdf.locator.page, 28)
         self.assertEqual(slide.kind, BlockKind.SLIDE)
         self.assertEqual(slide.locator.slide, 17)
+        self.assertEqual(slide.title, "风险管理")
 
     def test_text_and_writer_ranges_are_kept(self) -> None:
         text = block_from_chunk(
@@ -51,11 +52,12 @@ class DocumentIRTests(unittest.TestCase):
         writer = block_from_chunk(
             Path("制度.docx"),
             DocumentFamily.WRITER,
-            DocumentChunk(2, "文档块 8-15", "正文"),
+            DocumentChunk(2, "文档块 8-15 · 标题 客户经理管理", "正文"),
         )
 
         self.assertEqual((text.locator.line_start, text.locator.line_end), (101, 180))
         self.assertEqual((writer.locator.block_start, writer.locator.block_end), (8, 15))
+        self.assertEqual(writer.title, "客户经理管理")
 
 
 if __name__ == "__main__":

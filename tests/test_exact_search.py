@@ -149,10 +149,10 @@ class ExactGroupedSearchTests(unittest.TestCase):
             0,
             extension=".pptx",
             chunks=["风险管理", "风险管理"],
-            locations=["幻灯片 1", "幻灯片 4"],
+            locations=["幻灯片 1 · 标题 概览", "幻灯片 4 · 标题 风险管理"],
         )
         page = self.grouped.search_page("风险管理 slide:4")
-        self.assertEqual(page.items[0].location, "幻灯片 4")
+        self.assertEqual(page.items[0].location, "幻灯片 4 · 标题 风险管理")
 
     def test_sheet_hint_prefers_matching_sheet(self) -> None:
         self._add(

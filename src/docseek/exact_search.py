@@ -36,7 +36,8 @@ class ExactGroupedSearchEngine:
             END
             + CASE
                 WHEN :slide_hint IS NOT NULL
-                 AND REPLACE(c.location, ' ', '') = '幻灯片' || CAST(:slide_hint AS TEXT)
+                 AND REPLACE(c.location, ' ', '') LIKE
+                     '幻灯片' || CAST(:slide_hint AS TEXT) || '%'
                     THEN -3.0
                 ELSE 0.0
             END
