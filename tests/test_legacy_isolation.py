@@ -40,6 +40,74 @@ class LegacyIsolationTests(unittest.TestCase):
             self.assertTrue(chunks)
             self.assertIn("信贷客户经理", "\n".join(chunk.content for chunk in chunks))
 
+    def test_failed_backend_falls_back_to_next_real_worker(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "sample.txt"
+            source.write_text("回退链成功 信贷资料", encoding="utf-8")
+            original_command = legacy_worker_command
+
+            def command(source_path, output_path, *, adapter_name=None):
+                if adapter_name == "broken":
+                    return [sys.executable, "-c", "import sys; sys.exit(7)"]
+                return original_command(
+                    source_path,
+                    output_path,
+                    adapter_name=adapter_name,
+                )
+
+            with mock.patch(
+                "docseek.legacy_isolation.available_legacy_adapter_names",
+                return_value=("broken", "direct"),
+            ), mock.patch(
+                "docseek.legacy_isolation.legacy_worker_command",
+                side_effect=command,
+            ):
+                chunks = list(
+                    iter_legacy_chunks_isolated(
+                        source,
+                        timeout_seconds=10,
+                        adapter_timeout_seconds=3,
+                    )
+                )
+
+            self.assertIn("回退链成功", "\n".join(chunk.content for chunk in chunks))
+
+    def test_timed_out_backend_is_killed_then_falls_back(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "sample.txt"
+            source.write_text("超时回退成功 客户经理", encoding="utf-8")
+            original_command = legacy_worker_command
+
+            def command(source_path, output_path, *, adapter_name=None):
+                if adapter_name == "hanging":
+                    return [
+                        sys.executable,
+                        "-c",
+                        "import time; time.sleep(10)",
+                    ]
+                return original_command(
+                    source_path,
+                    output_path,
+                    adapter_name=adapter_name,
+                )
+
+            with mock.patch(
+                "docseek.legacy_isolation.available_legacy_adapter_names",
+                return_value=("hanging", "direct"),
+            ), mock.patch(
+                "docseek.legacy_isolation.legacy_worker_command",
+                side_effect=command,
+            ):
+                chunks = list(
+                    iter_legacy_chunks_isolated(
+                        source,
+                        timeout_seconds=8,
+                        adapter_timeout_seconds=2,
+                    )
+                )
+
+            self.assertIn("超时回退成功", "\n".join(chunk.content for chunk in chunks))
+
     def test_timeout_terminates_hanging_worker(self) -> None:
         process = subprocess.Popen(
             [sys.executable, "-c", "import time; time.sleep(10)"],
@@ -67,13 +135,15 @@ class LegacyIsolationTests(unittest.TestCase):
     def test_source_and_frozen_worker_commands_are_explicit(self) -> None:
         source = Path("legacy.xls")
         output = Path("chunks.bin")
-        command = legacy_worker_command(source, output)
+        command = legacy_worker_command(source, output, adapter_name="calamine")
         self.assertEqual(command[:3], [sys.executable, "-m", "docseek.legacy_worker"])
+        self.assertEqual(command[3:5], ["--adapter", "calamine"])
 
         with mock.patch.object(sys, "frozen", True, create=True):
-            frozen = legacy_worker_command(source, output)
+            frozen = legacy_worker_command(source, output, adapter_name="tika-native")
         self.assertEqual(frozen[0], sys.executable)
         self.assertEqual(frozen[1], "--docseek-extract-worker")
+        self.assertEqual(frozen[2:4], ["--adapter", "tika-native"])
 
     def test_broker_routes_legacy_format_to_isolated_lane(self) -> None:
         expected = [DocumentChunk(0, "内容块 1", "legacy body")]
