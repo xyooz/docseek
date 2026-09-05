@@ -300,7 +300,8 @@ def reset_index_scope(db_path: str | Path) -> int:
 
     db = Path(db_path).expanduser().resolve()
     cleared = _clear_all_index_rows(db)
-    with sqlite3.connect(db, timeout=10) as conn:
+    conn = sqlite3.connect(db, timeout=10)
+    try:
         conn.execute("PRAGMA secure_delete=ON")
         conn.executemany(
             "DELETE FROM settings WHERE key = ?",
@@ -313,6 +314,12 @@ def reset_index_scope(db_path: str | Path) -> int:
                 (LAST_SUCCESSFUL_RECONCILE_AT_KEY,),
             ],
         )
+        conn.commit()
+    finally:
+        # sqlite3.Connection's context manager only commits/rolls back; it does
+        # not close the native handle. Explicit close is required on Windows so
+        # reset does not leave docseek.db locked until garbage collection.
+        conn.close()
     return cleared
 
 
