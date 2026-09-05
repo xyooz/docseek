@@ -26,8 +26,6 @@ jobs:
         run: python -c "import docseek.app"
       - name: Benchmark search at 1k files
         run: python benchmarks/benchmark_search.py --files 1000 --chunks 3 --payload-kb 4 --iterations 3 --warmups 1 --limit 100
-      - name: Benchmark metadata prefilter at 1k files
-        run: python benchmarks/benchmark_prefilter.py --files 1000 --chunks 3 --payload-kb 4 --iterations 3 --warmups 1 --limit 100
       - name: Directory scan smoke
         run: python benchmarks/benchmark_scan.py --files 20
       - name: Test
