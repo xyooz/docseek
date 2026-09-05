@@ -12,6 +12,7 @@ from .chunks import iter_document_chunks
 from .extraction_revision import current_extraction_revision
 from .extractors import SUPPORTED_EXTENSIONS
 from .index_cleanup import remove_missing_under_root
+from .index_health import record_successful_reconcile
 from .index_issues import IndexIssueStore
 from .search_db import SearchDatabase
 
@@ -441,6 +442,7 @@ class DirectoryIndexer:
         stats.removed += remove_missing_under_root(self.chunk_store, str(root), seen_paths)
         self.issues.clear_under_root_if_missing(str(root), seen_paths)
         self.database.add_index_root(str(root))
+        record_successful_reconcile(self.database)
         return stats
 
     def _is_excluded(self, path: Path) -> bool:
