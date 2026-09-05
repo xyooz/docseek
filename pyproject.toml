@@ -17,6 +17,13 @@ dependencies = [
   "watchdog>=6.0",
 ]
 
+[project.optional-dependencies]
+# Rust-backed spreadsheet parser. Kept optional until real-world XLS/XLSB/ODS
+# compatibility and memory profiles are validated on target office machines.
+calamine = ["python-calamine>=0.8.2"]
+# Vendor fallback only; normal DocSeek startup never requires pywin32/WPS.
+wps = ["pywin32>=306; platform_system == 'Windows'"]
+
 [project.scripts]
 docseek = "docseek.app:main"
 
