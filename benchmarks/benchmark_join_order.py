@@ -20,33 +20,35 @@ def _stats(samples: list[float]) -> tuple[float, float]:
 def _sql(strategy: str) -> str:
     if strategy == "path_join":
         from_sql = """
-            FROM chunk_index_cjk2 idx
-            JOIN chunks c ON c.id = idx.rowid
+            FROM chunk_index_cjk2
+            JOIN chunks c ON c.id = chunk_index_cjk2.rowid
             JOIN files f ON f.path = c.path
         """
         file_key = "f.path"
+        extra_where = ""
     elif strategy == "id_join":
         from_sql = """
-            FROM chunk_index_cjk2 idx
-            JOIN chunks c ON c.id = idx.rowid
+            FROM chunk_index_cjk2
+            JOIN chunks c ON c.id = chunk_index_cjk2.rowid
             JOIN files f ON f.id = c.file_id
         """
         file_key = "f.id"
+        extra_where = ""
     elif strategy == "id_cross":
         # SQLite documents CROSS JOIN as a way to prevent table reordering.
         # Keep FTS MATCH as the outer loop, then rowid -> chunk -> integer file.
         from_sql = """
-            FROM chunk_index_cjk2 idx
+            FROM chunk_index_cjk2
             CROSS JOIN chunks c
             CROSS JOIN files f
         """
         file_key = "f.id"
+        extra_where = (
+            "AND c.id = chunk_index_cjk2.rowid "
+            "AND f.id = c.file_id"
+        )
     else:
         raise ValueError(strategy)
-
-    extra_where = ""
-    if strategy == "id_cross":
-        extra_where = "AND c.id = idx.rowid AND f.id = c.file_id"
 
     return f"""
         WITH hits AS (
@@ -69,7 +71,7 @@ def _sql(strategy: str) -> str:
                     ELSE 0.0
                 END AS filename_boost
             {from_sql}
-            WHERE idx MATCH :fts_query {extra_where}
+            WHERE chunk_index_cjk2 MATCH :fts_query {extra_where}
         ),
         ranked AS (
             SELECT
@@ -100,7 +102,13 @@ def _sql(strategy: str) -> str:
     """
 
 
-def _run(store: ChunkStore, strategy: str, *, iterations: int, limit: int) -> tuple[float, float, list[str], list[str]]:
+def _run(
+    store: ChunkStore,
+    strategy: str,
+    *,
+    iterations: int,
+    limit: int,
+) -> tuple[float, float, list[str], list[str]]:
     sql = _sql(strategy)
     params = {
         "fts_query": store._cjk_phrase("客户经理"),
