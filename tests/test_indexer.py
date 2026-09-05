@@ -159,14 +159,17 @@ class DirectoryIndexerTests(unittest.TestCase):
         self.assertEqual(self.issues.count(), 0)
         self.assertEqual([row.filename for row in self.chunks.search("信贷")], ["retry.txt"])
 
-    def test_xlsx_detail_progress_is_propagated_during_scan(self) -> None:
-        target = self.root / "客户清单.xlsx"
+    def _write_progress_workbook(self, target: Path) -> None:
         workbook = Workbook(write_only=True)
         worksheet = workbook.create_sheet("客户明细")
         for row_no in range(1, 1_506):
             worksheet.append([row_no, f"客户{row_no}"])
         workbook.save(target)
         workbook.close()
+
+    def test_xlsx_detail_progress_is_propagated_during_scan(self) -> None:
+        target = self.root / "客户清单.xlsx"
+        self._write_progress_workbook(target)
 
         progress: list[tuple[str, str, int]] = []
         stats = DirectoryIndexer(self.db).scan(
@@ -183,6 +186,26 @@ class DirectoryIndexerTests(unittest.TestCase):
                 ("客户清单.xlsx", "工作表 客户明细", 1_000),
                 ("客户清单.xlsx", "工作表 客户明细", 1_505),
             ],
+        )
+
+    def test_xlsx_row_progress_reaches_existing_file_progress_channel(self) -> None:
+        target = self.root / "客户清单.xlsx"
+        self._write_progress_workbook(target)
+
+        displayed_paths: list[str] = []
+        stats = DirectoryIndexer(self.db).scan(
+            self.root,
+            on_progress=lambda path, _stats: displayed_paths.append(path.name),
+        )
+
+        self.assertEqual(stats.indexed, 1)
+        self.assertIn(
+            "客户清单.xlsx · 工作表 客户明细 · 已读取 1,000 行",
+            displayed_paths,
+        )
+        self.assertIn(
+            "客户清单.xlsx · 工作表 客户明细 · 已读取 1,505 行",
+            displayed_paths,
         )
 
 
