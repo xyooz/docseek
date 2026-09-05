@@ -70,6 +70,19 @@ def result_entry_row(row_count: int, *, move_down: bool) -> int | None:
     return 0 if move_down else row_count - 1
 
 
+def empty_result_html(*, filter_only: bool) -> str:
+    """Return actionable empty-result guidance for the preview pane."""
+    if filter_only:
+        return (
+            "<h3>当前筛选没有匹配文件</h3>"
+            "<p>可以移除上方筛选条件，或调整文件类型、日期、路径和大小范围后再试。</p>"
+        )
+    return (
+        "<h3>没有找到匹配文档</h3>"
+        "<p>可以减少关键词、取消过严的引号短语，或移除部分筛选条件后再试。</p>"
+    )
+
+
 class IndexSignals(QObject):
     progress = Signal(str, int, int)
     finished = Signal(object)
@@ -266,7 +279,9 @@ class MainWindow(QMainWindow):
 
         self.preview = QTextBrowser()
         self.preview.setOpenExternalLinks(False)
-        self.preview.setPlaceholderText("选择一条结果，这里会显示命中的正文上下文和具体位置。")
+        self.preview.setPlaceholderText(
+            "输入记得的正文关键词开始搜索；选中结果后，这里会显示命中上下文和具体位置。"
+        )
 
         splitter = QSplitter(Qt.Horizontal)
         splitter.addWidget(self.results)
@@ -674,7 +689,9 @@ class MainWindow(QMainWindow):
             f"{mode}：已显示 {len(self.current_results):,} / 共 {page.total_count:,} 个文件"
             f" · {latency}{suffix}"
         )
-        if request.select_first and self.current_results:
+        if page.total_count == 0:
+            self.preview.setHtml(empty_result_html(filter_only=request.is_filter_only))
+        elif request.select_first and self.current_results:
             self.results.selectRow(0)
 
     def _search_failed(self, worker: SearchWorker, generation: int, message: str) -> None:
@@ -787,6 +804,11 @@ class MainWindow(QMainWindow):
         if not roots:
             self.scope_label.setText("尚未建立索引，请先添加一个工作目录")
             self.scope_label.setToolTip("")
+            self.preview.setHtml(
+                "<h3>开始使用 DocSeek</h3>"
+                "<p>点击上方“添加目录”，选择需要检索的工作资料目录。建立索引后，"
+                "直接输入记得的正文内容即可查找文档，不需要记住文件名。</p>"
+            )
             return
 
         suffix = f" · 排除 {len(excluded)} 个目录" if excluded else ""
