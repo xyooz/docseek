@@ -98,11 +98,15 @@ class LegacyIsolationTests(unittest.TestCase):
                 "docseek.legacy_isolation.legacy_worker_command",
                 side_effect=command,
             ):
+                # A real Windows Python worker needs measurable startup time.
+                # Two seconds still proves the first worker is killed well before
+                # its 10-second sleep while giving the fallback worker time to
+                # import DocSeek and produce a real chunk file.
                 chunks = list(
                     iter_legacy_chunks_isolated(
                         source,
-                        timeout_seconds=5,
-                        adapter_timeout_seconds=0.10,
+                        timeout_seconds=8,
+                        adapter_timeout_seconds=2,
                     )
                 )
 
