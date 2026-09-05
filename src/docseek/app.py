@@ -7,6 +7,7 @@ from PySide6.QtWidgets import QApplication, QMenu, QToolButton
 
 from . import app_base
 from .search_presets import SearchState, SearchStateStore, search_state_label
+from .search_session import close_persistent_search_stores
 from .search_sort import SORT_RELEVANCE
 
 # Keep the established public helpers available from docseek.app. Existing
@@ -34,6 +35,7 @@ class MainWindow(app_base.MainWindow):
     """
 
     HISTORY_DELAY_MS = 1200
+    SEARCH_SHUTDOWN_TIMEOUT_MS = 10_000
 
     def __init__(self) -> None:
         self._history_ui_ready = False
@@ -58,6 +60,18 @@ class MainWindow(app_base.MainWindow):
 
         self._history_ui_ready = True
         self._refresh_saved_button()
+
+    def closeEvent(self, event) -> None:  # noqa: N802
+        """Finish in-flight searches and release persistent SQLite handles."""
+        if hasattr(self, "history_record_timer"):
+            self.history_record_timer.stop()
+        self.search_timer.stop()
+        self.search_generation += 1
+        self.search_thread_pool.clear()
+        finished = self.search_thread_pool.waitForDone(self.SEARCH_SHUTDOWN_TIMEOUT_MS)
+        if finished:
+            close_persistent_search_stores(self.chunk_store.db_path)
+        super().closeEvent(event)
 
     def _install_search_state_controls(self) -> None:
         self.history_button = QToolButton()
