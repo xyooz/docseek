@@ -10,6 +10,7 @@ from pathlib import Path
 from docseek.chunk_store import ChunkStore
 from docseek.chunk_writer import ChunkBatchWriter
 from docseek.chunks import DocumentChunk
+from docseek.progressive_search import ProgressiveSearchEngine
 from docseek.search_db import SearchDatabase
 
 
@@ -17,7 +18,7 @@ DEFAULT_QUERIES = [
     "信贷",              # broad 2-char CJK
     "客户经理",          # broad 4-char CJK
     "身份证有效期",      # broad longer CJK
-    "customer manager", # broad Latin phrase
+    "customer manager", # broad Latin multi-term
     "专项稀有词",        # selective query
 ]
 
@@ -94,6 +95,12 @@ def build_synthetic_index(
     return elapsed, _database_bytes(db_path), logical_source_bytes
 
 
+def _latency_stats(samples_ms: list[float]) -> tuple[float, float]:
+    ordered = sorted(samples_ms)
+    p95_index = min(len(ordered) - 1, max(0, int(len(ordered) * 0.95) - 1))
+    return statistics.median(samples_ms), ordered[p95_index]
+
+
 def benchmark_queries(
     db_path: Path,
     *,
@@ -103,33 +110,53 @@ def benchmark_queries(
     limit: int,
 ) -> dict[str, dict[str, float]]:
     store = ChunkStore(db_path)
+    progressive = ProgressiveSearchEngine(store)
     results: dict[str, dict[str, float]] = {}
 
     for query in queries:
-        cold_started = time.perf_counter()
-        cold_page = store.search_page(query, limit=limit)
-        cold_ms = (time.perf_counter() - cold_started) * 1000
+        exact_cold_started = time.perf_counter()
+        exact_page = store.search_page(query, limit=limit)
+        exact_cold_ms = (time.perf_counter() - exact_cold_started) * 1000
+
+        progressive_cold_started = time.perf_counter()
+        quick_page = progressive.search_topk(query, limit=limit)
+        progressive_cold_ms = (time.perf_counter() - progressive_cold_started) * 1000
 
         for _ in range(warmups):
             store.search_page(query, limit=limit)
+            progressive.search_topk(query, limit=limit)
 
-        samples_ms: list[float] = []
-        page = cold_page
+        exact_samples: list[float] = []
+        quick_samples: list[float] = []
+        count_samples: list[float] = []
         for _ in range(iterations):
             started = time.perf_counter()
-            page = store.search_page(query, limit=limit)
-            samples_ms.append((time.perf_counter() - started) * 1000)
+            exact_page = store.search_page(query, limit=limit)
+            exact_samples.append((time.perf_counter() - started) * 1000)
 
-        ordered = sorted(samples_ms)
-        p95_index = min(len(ordered) - 1, max(0, int(len(ordered) * 0.95) - 1))
+            started = time.perf_counter()
+            quick_page = progressive.search_topk(query, limit=limit)
+            quick_samples.append((time.perf_counter() - started) * 1000)
+
+            started = time.perf_counter()
+            exact_count = progressive.count_files(query)
+            count_samples.append((time.perf_counter() - started) * 1000)
+
+        exact_p50, exact_p95 = _latency_stats(exact_samples)
+        quick_p50, quick_p95 = _latency_stats(quick_samples)
+        count_p50, count_p95 = _latency_stats(count_samples)
         results[query] = {
-            "cold_ms": cold_ms,
-            "p50_ms": statistics.median(samples_ms),
-            "p95_ms": ordered[p95_index],
-            "min_ms": min(samples_ms),
-            "max_ms": max(samples_ms),
-            "returned": float(len(page.items)),
-            "total_count": float(page.total_count),
+            "exact_cold_ms": exact_cold_ms,
+            "exact_p50_ms": exact_p50,
+            "exact_p95_ms": exact_p95,
+            "quick_cold_ms": progressive_cold_ms,
+            "quick_p50_ms": quick_p50,
+            "quick_p95_ms": quick_p95,
+            "count_p50_ms": count_p50,
+            "count_p95_ms": count_p95,
+            "returned": float(len(quick_page.items)),
+            "total_count": float(exact_count),
+            "candidates": float(quick_page.candidates_scanned),
         }
     return results
 
@@ -208,13 +235,14 @@ def main() -> None:
         f"index_amplification={amplification:.2f}x"
     )
     print()
-    print("query latency (cold + warmed steady-state)")
+    print("query latency: exact page vs progressive top-k vs exact count")
     for query, stats in query_stats.items():
         print(
-            f"- {query!r}: cold={stats['cold_ms']:.2f} ms "
-            f"p50={stats['p50_ms']:.2f} ms p95={stats['p95_ms']:.2f} ms "
-            f"min={stats['min_ms']:.2f} ms max={stats['max_ms']:.2f} ms "
-            f"returned={int(stats['returned'])}/{int(stats['total_count'])}"
+            f"- {query!r}: "
+            f"exact(cold={stats['exact_cold_ms']:.2f}, p50={stats['exact_p50_ms']:.2f}, p95={stats['exact_p95_ms']:.2f}) ms; "
+            f"topk(cold={stats['quick_cold_ms']:.2f}, p50={stats['quick_p50_ms']:.2f}, p95={stats['quick_p95_ms']:.2f}) ms; "
+            f"count(p50={stats['count_p50_ms']:.2f}, p95={stats['count_p95_ms']:.2f}) ms; "
+            f"returned={int(stats['returned'])}/{int(stats['total_count'])} candidates={int(stats['candidates'])}"
         )
 
     if temp_dir is not None:
