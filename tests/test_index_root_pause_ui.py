@@ -57,6 +57,11 @@ class IndexRootPauseUiTests(unittest.TestCase):
             root_b.mkdir()
             active_file = root_a / "active.docx"
             paused_file = root_b / "paused.docx"
+            # Create real files so the assertion can compare filesystem identity
+            # instead of path spelling. Windows runners may represent the same
+            # temp path using either an 8.3 alias (RUNNER~1) or the long form.
+            active_file.touch()
+            paused_file.touch()
 
             with patch.object(app_module, "DB_PATH", db_path):
                 window = app_module.MainWindow()
@@ -85,7 +90,9 @@ class IndexRootPauseUiTests(unittest.TestCase):
                         window._drain_watch_queue()
                         update_paths.assert_called_once()
                         paths = update_paths.call_args.args[0]
-                        self.assertEqual(paths, [active_file.resolve()])
+                        self.assertEqual(len(paths), 1)
+                        self.assertTrue(os.path.samefile(paths[0], active_file))
+                        self.assertFalse(os.path.samefile(paths[0], paused_file))
                 finally:
                     window.close()
                     QApplication.processEvents()
