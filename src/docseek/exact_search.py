@@ -5,14 +5,13 @@ from .structure_ranking import parse_structure_query
 
 
 class ExactGroupedSearchEngine:
-    """Exact file-level search with structure-aware ranking.
+    """Exact file-level search with late metadata and structure-aware ranking.
 
-    FTS ranking is chunk-level while filename boosts are file-level. Metadata
-    filters also apply to whole files. Based on the scale workload, DocSeek only
-    prefilters broad single-term searches by extension/path, where the benefit is
-    repeatable. Multi-term queries and date/size-only filters keep late filtering
-    to avoid paying an eligible-set materialization cost when FTS is already
-    selective. Both paths preserve exact semantics.
+    FTS ranking is chunk-level, while filename boosts and supported metadata
+    filters are file-level. Keeping metadata filtering after exact chunk scoring
+    has proven the most stable behavior across Windows CI runners; experimental
+    prefilter variants remain useful for benchmarking but are not part of the
+    production path.
 
     Explicit ``page:N``, ``slide:N`` and ``sheet:name`` hints are schema-free:
     they are removed from the FTS text and add a strong boost to matching
@@ -58,7 +57,13 @@ class ExactGroupedSearchEngine:
 
     @staticmethod
     def _automatic_structure_boost_expr() -> str:
-        """Small intent boost for semantic structure already stored in location."""
+        """Small intent boost for semantic structure already stored in location.
+
+        The check is intentionally conservative: generic page/block coordinates
+        are ignored, while sheet names and explicit title-enriched locators can
+        participate. This avoids changing normal PDF/page ranking just because a
+        query happens to contain a number or generic location word.
+        """
         return """
             CASE
                 WHEN :location_query <> ''
@@ -130,31 +135,11 @@ class ExactGroupedSearchEngine:
             min_size=min_size,
             max_size=max_size,
         )
-        query_terms = self.store._split_query_terms(content_query)
-        stable_scope_filter = extension is not None or path_contains is not None
-        use_metadata_prefilter = (
-            bool(metadata_clauses)
-            and len(query_terms) <= 1
-            and stable_scope_filter
+        metadata_where = (
+            "WHERE " + " AND ".join(metadata_clauses)
+            if metadata_clauses
+            else ""
         )
-        if use_metadata_prefilter:
-            eligible_cte = f"""
-            eligible_files AS MATERIALIZED (
-                SELECT f.id
-                FROM files f
-                WHERE {' AND '.join(metadata_clauses)}
-            ),
-            """
-            eligible_join = "JOIN eligible_files ef ON ef.id = c.file_id"
-            metadata_where = ""
-        else:
-            eligible_cte = ""
-            eligible_join = ""
-            metadata_where = (
-                "WHERE " + " AND ".join(metadata_clauses)
-                if metadata_clauses
-                else ""
-            )
 
         filename_boost_expr = """
             CASE
@@ -169,7 +154,7 @@ class ExactGroupedSearchEngine:
         """
 
         sql = f"""
-            WITH {eligible_cte}hits AS MATERIALIZED (
+            WITH hits AS MATERIALIZED (
                 SELECT
                     c.id AS chunk_id,
                     c.file_id AS file_id,
@@ -179,7 +164,6 @@ class ExactGroupedSearchEngine:
                     + ({automatic_structure_boost_expr}) AS chunk_score
                 FROM {table}
                 JOIN chunks c ON c.id = {table}.rowid
-                {eligible_join}
                 WHERE {table} MATCH :fts_query
             ),
             best_scores AS (
@@ -312,33 +296,23 @@ class ExactGroupedSearchEngine:
             min_size=min_size,
             max_size=max_size,
         )
-
-        if metadata_clauses:
-            sql = f"""
-                WITH eligible_files AS MATERIALIZED (
-                    SELECT f.id
-                    FROM files f
-                    WHERE {' AND '.join(metadata_clauses)}
-                ),
-                matched_files AS (
-                    SELECT DISTINCT c.file_id
-                    FROM {table}
-                    JOIN chunks c ON c.id = {table}.rowid
-                    JOIN eligible_files ef ON ef.id = c.file_id
-                    WHERE {table} MATCH :fts_query
-                )
-                SELECT COUNT(*) AS n FROM matched_files
-            """
-        else:
-            sql = f"""
-                WITH matched_files AS (
-                    SELECT DISTINCT c.file_id
-                    FROM {table}
-                    JOIN chunks c ON c.id = {table}.rowid
-                    WHERE {table} MATCH :fts_query
-                )
-                SELECT COUNT(*) AS n FROM matched_files
-            """
+        metadata_where = (
+            "WHERE " + " AND ".join(metadata_clauses)
+            if metadata_clauses
+            else ""
+        )
+        sql = f"""
+            WITH matched_files AS (
+                SELECT DISTINCT c.file_id
+                FROM {table}
+                JOIN chunks c ON c.id = {table}.rowid
+                WHERE {table} MATCH :fts_query
+            )
+            SELECT COUNT(*) AS n
+            FROM matched_files m
+            JOIN files f ON f.id = m.file_id
+            {metadata_where}
+        """
         with self.store.connect() as conn:
             row = conn.execute(sql, params).fetchone()
         return int(row["n"] if row else 0)
