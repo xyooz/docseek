@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 
 from benchmark_search import build_synthetic_index
-from docseek.chunk_store import ChunkStore
+from docseek.chunk_store import ChunkSearchResult, ChunkStore
 
 
 def _stats(samples: list[float]) -> tuple[float, float]:
@@ -35,8 +35,6 @@ def _sql(strategy: str) -> str:
         file_key = "f.id"
         extra_where = ""
     elif strategy == "id_cross":
-        # SQLite documents CROSS JOIN as a way to prevent table reordering.
-        # Keep FTS MATCH as the outer loop, then rowid -> chunk -> integer file.
         from_sql = """
             FROM chunk_index_cjk2
             CROSS JOIN chunks c
@@ -59,7 +57,9 @@ def _sql(strategy: str) -> str:
                 f.filename,
                 f.extension,
                 f.modified_time,
+                f.size,
                 c.ordinal,
+                c.location,
                 bm25(chunk_index_cjk2, 5.0, 1.0) AS bm25_score,
                 CASE
                     WHEN LOWER(SUBSTR(f.filename, 1, LENGTH(f.filename) - LENGTH(f.extension))) = LOWER(:raw_query)
@@ -84,22 +84,47 @@ def _sql(strategy: str) -> str:
             FROM hits
         ),
         file_hits AS (
-            SELECT chunk_id, path, modified_time, relevance_score
+            SELECT
+                chunk_id, path, filename, extension, modified_time, size,
+                ordinal, location, relevance_score
             FROM ranked
             WHERE file_rank = 1
         ),
         paged AS (
             SELECT
-                chunk_id, path, modified_time, relevance_score,
+                chunk_id, path, filename, extension, modified_time, size,
+                ordinal, location, relevance_score,
                 COUNT(*) OVER() AS total_count
             FROM file_hits
             ORDER BY relevance_score ASC, modified_time DESC, path ASC
             LIMIT :limit
         )
-        SELECT path, relevance_score, total_count
+        SELECT
+            paged.path, paged.filename, paged.extension,
+            paged.modified_time, paged.size, paged.location,
+            chunks.content AS raw_content,
+            paged.relevance_score AS score,
+            paged.total_count
         FROM paged
-        ORDER BY relevance_score ASC, modified_time DESC, path ASC
+        JOIN chunks ON chunks.id = paged.chunk_id
+        ORDER BY paged.relevance_score ASC, paged.modified_time DESC, paged.path ASC
     """
+
+
+def _materialize_results(store: ChunkStore, rows, query: str) -> list[ChunkSearchResult]:
+    return [
+        ChunkSearchResult(
+            path=str(row["path"]),
+            filename=str(row["filename"]),
+            extension=str(row["extension"]),
+            modified_time=float(row["modified_time"]),
+            size=int(row["size"]),
+            location=str(row["location"] or ""),
+            snippet=store._snippet_from_content(str(row["raw_content"] or ""), query),
+            score=float(row["score"]),
+        )
+        for row in rows
+    ]
 
 
 def _run(
@@ -109,31 +134,34 @@ def _run(
     iterations: int,
     limit: int,
 ) -> tuple[float, float, list[str], list[str]]:
+    query = "客户经理"
     sql = _sql(strategy)
     params = {
-        "fts_query": store._cjk_phrase("客户经理"),
-        "raw_query": "客户经理",
+        "fts_query": store._cjk_phrase(query),
+        "raw_query": query,
         "limit": limit,
     }
     with store.connect() as conn:
         plan_rows = conn.execute("EXPLAIN QUERY PLAN " + sql, params).fetchall()
         plan = [" | ".join(str(value) for value in row) for row in plan_rows]
-        conn.execute(sql, params).fetchall()
+        rows = conn.execute(sql, params).fetchall()
+        _materialize_results(store, rows, query)
         samples: list[float] = []
-        rows = []
+        items: list[ChunkSearchResult] = []
         for _ in range(iterations):
             started = time.perf_counter()
             rows = conn.execute(sql, params).fetchall()
+            items = _materialize_results(store, rows, query)
             samples.append((time.perf_counter() - started) * 1000.0)
     p50, p95 = _stats(samples)
-    return p50, p95, [str(row["path"]) for row in rows], plan
+    return p50, p95, [item.path for item in items], plan
 
 
 def main() -> None:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-    parser = argparse.ArgumentParser(description="Compare SQLite FTS join-order strategies")
+    parser = argparse.ArgumentParser(description="Compare SQLite FTS exact join strategies")
     parser.add_argument("--files", type=int, default=1000)
     parser.add_argument("--chunks", type=int, default=3)
     parser.add_argument("--payload-kb", type=int, default=4)
@@ -152,7 +180,7 @@ def main() -> None:
         )
         store = ChunkStore(db_path)
         results: dict[str, list[str]] = {}
-        print("DocSeek FTS join-order benchmark")
+        print("DocSeek full exact join benchmark")
         for strategy in ("path_join", "id_join", "id_cross"):
             p50, p95, paths, plan = _run(
                 store, strategy, iterations=args.iterations, limit=args.limit
