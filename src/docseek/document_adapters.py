@@ -124,6 +124,12 @@ class CalamineSpreadsheetAdapter:
 
         from python_calamine import CalamineWorkbook
 
+        # Calamine loads legacy BIFF .xls workbooks eagerly before sheet rows
+        # become iterable. Surface that otherwise silent phase so a large or
+        # unusual workbook does not look like a frozen desktop application.
+        if on_progress and path.suffix.lower() == ".xls":
+            on_progress("正在打开旧版 Excel（.xls 工作簿会先整体加载）", 0)
+
         rows_per_chunk = spreadsheet_rows_per_chunk or self.rows_per_chunk
         workbook = CalamineWorkbook.from_path(path)
         ordinal = 0
