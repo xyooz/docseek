@@ -35,6 +35,7 @@ from .chunk_store import ChunkSearchResult, ChunkStore
 from .indexer import DirectoryIndexer, IndexCancelled, IndexStats
 from .query_parser import parse_query, query_filter_chips, remove_query_filter
 from .search_db import SearchDatabase
+from .search_sort import SORT_FILENAME, SORT_MODIFIED, SORT_RELEVANCE
 from .search_worker import SearchRequest, SearchResponse, SearchWorker
 from .settings_dialog import IndexSettingsDialog
 from .watcher import WatchBatch, WatchManager
@@ -51,6 +52,12 @@ FILE_FILTERS = [
     ("Excel", ".xlsx"),
     ("PowerPoint", ".pptx"),
     ("文本", ".txt"),
+]
+
+SORT_OPTIONS = [
+    ("相关性", SORT_RELEVANCE),
+    ("最近修改", SORT_MODIFIED),
+    ("文件名", SORT_FILENAME),
 ]
 
 
@@ -198,6 +205,15 @@ class MainWindow(QMainWindow):
         self.type_filter.setMinimumHeight(38)
         self.type_filter.setMinimumWidth(105)
 
+        self.sort_filter = QComboBox()
+        for label, sort_mode in SORT_OPTIONS:
+            self.sort_filter.addItem(label, sort_mode)
+        self.sort_filter.setMinimumHeight(38)
+        self.sort_filter.setMinimumWidth(105)
+        self.sort_filter.setToolTip(
+            "排序方式：有正文关键词时默认按相关性；无关键词纯筛选时“相关性”按最近修改显示"
+        )
+
         self.filter_chip_panel = QWidget()
         self.filter_chip_panel.setVisible(False)
         self.filter_chip_panel.setObjectName("filterChipPanel")
@@ -293,6 +309,7 @@ class MainWindow(QMainWindow):
         top_bar = QHBoxLayout()
         top_bar.addWidget(self.search_input, 1)
         top_bar.addWidget(self.type_filter)
+        top_bar.addWidget(self.sort_filter)
         top_bar.addWidget(self.choose_button)
         top_bar.addWidget(self.refresh_button)
         top_bar.addWidget(self.settings_button)
@@ -321,6 +338,7 @@ class MainWindow(QMainWindow):
         self.search_input.textChanged.connect(self._refresh_filter_chips)
         self.search_input.returnPressed.connect(self._perform_search)
         self.type_filter.currentIndexChanged.connect(self._perform_search)
+        self.sort_filter.currentIndexChanged.connect(self._perform_search)
         self.choose_button.clicked.connect(self._choose_directory)
         self.refresh_button.clicked.connect(self._refresh_all_roots)
         self.settings_button.clicked.connect(self._open_index_settings)
@@ -411,7 +429,6 @@ class MainWindow(QMainWindow):
                 self._start_index(roots, automatic=True)
             else:
                 self.results.setRowCount(0)
-                self.preview.clear()
 
     def _refresh_all_roots(self) -> None:
         roots = [Path(root) for root in self.database.get_index_roots()]
@@ -629,6 +646,7 @@ class MainWindow(QMainWindow):
             modified_before=parsed.modified_before,
             min_size=parsed.min_size,
             max_size=parsed.max_size,
+            sort_mode=self.sort_filter.currentData() or SORT_RELEVANCE,
             select_first=select_first,
             is_filter_only=not parsed.terms,
         )
