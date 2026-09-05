@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import os
 import runpy
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from docseek import bootstrap
 from docseek.chunk_store import ChunkStore
 from docseek.chunks import DocumentChunk
 from docseek.index_maintenance import create_index_backup, stage_index_restore
+from docseek.legacy_worker import iter_chunk_file
 from docseek.search_db import SearchDatabase
 
 
@@ -71,14 +74,18 @@ class BootstrapTests(unittest.TestCase):
             self.assertEqual(restored.search("临时索引内容"), [])
             self.assertFalse((base / "restore-error.txt").exists())
 
-    def test_windows_launcher_smoke_branch_imports_bootstrap_and_maintenance(self) -> None:
+    @staticmethod
+    def _launcher_namespace():
         launcher = (
             Path(__file__).resolve().parents[1]
             / "packaging"
             / "windows"
             / "docseek_launcher.py"
         )
-        namespace = runpy.run_path(str(launcher), run_name="docseek_launcher_test")
+        return runpy.run_path(str(launcher), run_name="docseek_launcher_test")
+
+    def test_windows_launcher_smoke_branch_imports_bootstrap_and_maintenance(self) -> None:
+        namespace = self._launcher_namespace()
         previous = os.environ.get("DOCSEEK_FROZEN_SMOKE")
         os.environ["DOCSEEK_FROZEN_SMOKE"] = "1"
         try:
@@ -88,6 +95,26 @@ class BootstrapTests(unittest.TestCase):
                 os.environ.pop("DOCSEEK_FROZEN_SMOKE", None)
             else:
                 os.environ["DOCSEEK_FROZEN_SMOKE"] = previous
+
+    def test_windows_launcher_can_run_hidden_extract_worker(self) -> None:
+        namespace = self._launcher_namespace()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "sample.txt"
+            output = Path(temp_dir) / "chunks.bin"
+            source.write_text("隐藏 worker 正文", encoding="utf-8")
+            argv = [
+                "DocSeek.exe",
+                "--docseek-extract-worker",
+                str(source),
+                str(output),
+            ]
+            with mock.patch.object(sys, "argv", argv):
+                self.assertEqual(namespace["main"](), 0)
+            self.assertTrue(output.exists())
+            self.assertIn(
+                "隐藏 worker 正文",
+                "\n".join(chunk.content for chunk in iter_chunk_file(output)),
+            )
 
 
 if __name__ == "__main__":
