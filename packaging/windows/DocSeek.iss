@@ -33,8 +33,11 @@ CloseApplications=yes
 RestartApplications=no
 UsePreviousAppDir=yes
 
+; The standard runner installation only guarantees Inno Setup's built-in
+; English messages. Keep the installer build self-contained; the DocSeek app
+; itself remains Chinese-first. A vetted Chinese .isl can be added later as a
+; versioned source file instead of being downloaded opportunistically at build time.
 [Languages]
-Name: "chinesesimp"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
