@@ -9,9 +9,9 @@ from .chunks import (
     XLSX_PROGRESS_ROW_INTERVAL,
     ChunkProgressCallback,
     DocumentChunk,
+    _iter_direct_document_chunks,
     _xlsx_chunk_content,
     _xlsx_row_text,
-    iter_document_chunks,
 )
 from .document_types import (
     CALAMINE_CANDIDATE_EXTENSIONS,
@@ -37,6 +37,8 @@ class DocumentAdapter(Protocol):
         self,
         path: Path,
         *,
+        target_chars: int = 12_000,
+        spreadsheet_rows_per_chunk: int = 200,
         on_progress: ChunkProgressCallback | None = None,
     ) -> Iterator[DocumentChunk]: ...
 
@@ -56,9 +58,16 @@ class DirectDocumentAdapter:
         self,
         path: Path,
         *,
+        target_chars: int = 12_000,
+        spreadsheet_rows_per_chunk: int = 200,
         on_progress: ChunkProgressCallback | None = None,
     ) -> Iterator[DocumentChunk]:
-        yield from iter_document_chunks(path, on_progress=on_progress)
+        yield from _iter_direct_document_chunks(
+            path,
+            target_chars=target_chars,
+            spreadsheet_rows_per_chunk=spreadsheet_rows_per_chunk,
+            on_progress=on_progress,
+        )
 
 
 @dataclass(slots=True, frozen=True)
@@ -83,8 +92,11 @@ class CalamineSpreadsheetAdapter:
         self,
         path: Path,
         *,
+        target_chars: int = 12_000,
+        spreadsheet_rows_per_chunk: int = 200,
         on_progress: ChunkProgressCallback | None = None,
     ) -> Iterator[DocumentChunk]:
+        del target_chars  # spreadsheets are chunked by rows, not character budget.
         if not self.is_available():
             raise AdapterUnavailable(
                 "读取该表格格式需要可选组件 python-calamine；"
@@ -93,6 +105,7 @@ class CalamineSpreadsheetAdapter:
 
         from python_calamine import CalamineWorkbook
 
+        rows_per_chunk = spreadsheet_rows_per_chunk or self.rows_per_chunk
         workbook = CalamineWorkbook.from_path(path)
         ordinal = 0
         try:
@@ -112,7 +125,7 @@ class CalamineSpreadsheetAdapter:
                             first_row = row_no
                         buffer.append(row_text)
                         last_row = row_no
-                    if buffer and len(buffer) >= self.rows_per_chunk:
+                    if buffer and len(buffer) >= rows_per_chunk:
                         yield DocumentChunk(
                             ordinal,
                             f"工作表 {sheet_name} · 行 {first_row}-{last_row}",
@@ -143,10 +156,11 @@ class CalamineSpreadsheetAdapter:
 
 @dataclass(slots=True, frozen=True)
 class WpsNativeAdapter:
-    """Thin local bridge to the installed WPS client.
+    """Thin vendor fallback to the installed WPS client.
 
-    WPS/legacy files are converted to a temporary OOXML copy and then handed to
-    the already-tested direct chunk parsers. The source file is never modified
+    WPS-native/legacy files are converted to a temporary OOXML copy and then
+    handed to the already-tested direct parsers. This adapter is intentionally
+    lower priority than native/open parsers; the source file is never modified
     and no online conversion service is used.
     """
 
@@ -155,8 +169,6 @@ class WpsNativeAdapter:
     extensions: frozenset[str] = WPS_LOCAL_CANDIDATE_EXTENSIONS
 
     def is_available(self) -> bool:
-        # Availability is format-family specific, so registry selection performs
-        # the final check through supports_path().
         return any(can_convert_extension(extension) for extension in self.extensions)
 
     def supports_path(self, path: Path) -> bool:
@@ -166,6 +178,8 @@ class WpsNativeAdapter:
         self,
         path: Path,
         *,
+        target_chars: int = 12_000,
+        spreadsheet_rows_per_chunk: int = 200,
         on_progress: ChunkProgressCallback | None = None,
     ) -> Iterator[DocumentChunk]:
         if not self.supports_path(path):
@@ -173,7 +187,14 @@ class WpsNativeAdapter:
                 f"{path.suffix.lower()} 需要本机 WPS Office 自动化组件和 DocSeek wps 可选依赖"
             )
         with converted_openxml(path) as converted:
-            yield from iter_document_chunks(converted, on_progress=on_progress)
+            # Use the private direct parser here, not the public broker entry,
+            # so a vendor fallback cannot recursively select itself.
+            yield from _iter_direct_document_chunks(
+                converted,
+                target_chars=target_chars,
+                spreadsheet_rows_per_chunk=spreadsheet_rows_per_chunk,
+                on_progress=on_progress,
+            )
 
 
 class DocumentAdapterRegistry:
@@ -186,13 +207,15 @@ class DocumentAdapterRegistry:
                 WpsNativeAdapter(),
             )
         )
-        self._adapters = tuple(sorted(registered, key=lambda adapter: adapter.priority, reverse=True))
+        self._adapters = tuple(
+            sorted(registered, key=lambda adapter: adapter.priority, reverse=True)
+        )
 
     @property
     def known_extensions(self) -> frozenset[str]:
         # Include every registered product capability, even when its optional
-        # parser is missing. This lets the indexer persist a useful issue instead
-        # of silently pretending a known WPS/legacy file does not exist.
+        # parser is missing. The indexer can then persist a useful issue instead
+        # of silently pretending a known office file does not exist.
         return frozenset(FORMAT_CAPABILITIES)
 
     def is_known_path(self, path: Path) -> bool:
@@ -235,10 +258,17 @@ class DocumentAdapterRegistry:
         self,
         path: Path,
         *,
+        target_chars: int = 12_000,
+        spreadsheet_rows_per_chunk: int = 200,
         on_progress: ChunkProgressCallback | None = None,
     ) -> Iterator[DocumentChunk]:
         adapter = self.adapter_for(path)
-        yield from adapter.iter_chunks(path, on_progress=on_progress)
+        yield from adapter.iter_chunks(
+            path,
+            target_chars=target_chars,
+            spreadsheet_rows_per_chunk=spreadsheet_rows_per_chunk,
+            on_progress=on_progress,
+        )
 
 
 DEFAULT_ADAPTER_REGISTRY = DocumentAdapterRegistry()
