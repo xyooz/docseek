@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QMenu,
+    QProgressBar,
     QPushButton,
     QSplitter,
     QStatusBar,
@@ -50,6 +51,15 @@ FILE_FILTERS = [
     ("PowerPoint", ".pptx"),
     ("文本", ".txt"),
 ]
+
+
+def split_index_progress_display(path: str) -> tuple[str, str]:
+    """Split a normal path or XLSX row-progress display into two UI fields."""
+    marker = " · 工作表 "
+    if marker in path and " · 已读取 " in path:
+        filename, detail = path.split(" · ", 1)
+        return filename, detail
+    return Path(path).name, ""
 
 
 class IndexSignals(QObject):
@@ -182,6 +192,39 @@ class MainWindow(QMainWindow):
         self.scope_label = QLabel()
         self.scope_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
 
+        self.index_progress_panel = QWidget()
+        self.index_progress_panel.setVisible(False)
+        self.index_progress_panel.setObjectName("indexProgressPanel")
+        self.index_progress_panel.setStyleSheet(
+            "QWidget#indexProgressPanel { border: 1px solid palette(mid); border-radius: 6px; }"
+        )
+        progress_layout = QHBoxLayout(self.index_progress_panel)
+        progress_layout.setContentsMargins(10, 7, 10, 7)
+        progress_layout.setSpacing(10)
+
+        self.index_progress_bar = QProgressBar()
+        self.index_progress_bar.setRange(0, 0)
+        self.index_progress_bar.setTextVisible(False)
+        self.index_progress_bar.setFixedWidth(110)
+        self.index_progress_bar.setFixedHeight(10)
+
+        progress_text = QVBoxLayout()
+        progress_text.setContentsMargins(0, 0, 0, 0)
+        progress_text.setSpacing(2)
+        self.index_file_label = QLabel("准备建立索引…")
+        self.index_detail_label = QLabel("")
+        self.index_detail_label.setStyleSheet("color: palette(mid); font-size: 11px;")
+        progress_text.addWidget(self.index_file_label)
+        progress_text.addWidget(self.index_detail_label)
+
+        self.index_counts_label = QLabel("已处理 0 · 更新 0")
+        self.index_counts_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.index_counts_label.setMinimumWidth(150)
+
+        progress_layout.addWidget(self.index_progress_bar)
+        progress_layout.addLayout(progress_text, 1)
+        progress_layout.addWidget(self.index_counts_label)
+
         self.results = QTableWidget(0, 6)
         self.results.setHorizontalHeaderLabels(
             ["文件名", "命中位置", "类型", "大小", "修改时间", "路径"]
@@ -224,6 +267,7 @@ class MainWindow(QMainWindow):
         layout.setSpacing(10)
         layout.addLayout(top_bar)
         layout.addWidget(self.scope_label)
+        layout.addWidget(self.index_progress_panel)
         layout.addWidget(splitter, 1)
 
         container = QWidget()
@@ -308,6 +352,11 @@ class MainWindow(QMainWindow):
         self.refresh_button.setEnabled(False)
         self.settings_button.setEnabled(False)
         self.cancel_button.setVisible(not automatic)
+        self.index_progress_panel.setVisible(True)
+        self.index_file_label.setText("准备建立索引…")
+        self.index_file_label.setToolTip("")
+        self.index_detail_label.setText("")
+        self.index_counts_label.setText("已处理 0 · 更新 0")
         self.current_worker = worker
         worker.signals.progress.connect(self._index_progress)
         worker.signals.finished.connect(self._index_finished)
@@ -341,13 +390,16 @@ class MainWindow(QMainWindow):
     def _cancel_index(self) -> None:
         if self.current_worker:
             self.current_worker.cancel()
+            self.index_detail_label.setText("正在停止…")
             self.statusBar().showMessage("正在停止索引…")
 
     def _index_progress(self, path: str, scanned: int, indexed: int) -> None:
-        filename = Path(path).name
-        self.statusBar().showMessage(
-            f"正在索引：{filename}  ·  已处理 {scanned}  ·  更新 {indexed}"
-        )
+        filename, detail = split_index_progress_display(path)
+        self.index_file_label.setText(filename)
+        if not detail:
+            self.index_file_label.setToolTip(path)
+        self.index_detail_label.setText(detail)
+        self.index_counts_label.setText(f"已处理 {scanned:,} · 更新 {indexed:,}")
 
     def _index_finished(self, stats: IndexStats) -> None:
         worker = self.current_worker
@@ -382,6 +434,7 @@ class MainWindow(QMainWindow):
         self.refresh_button.setEnabled(True)
         self.settings_button.setEnabled(True)
         self.cancel_button.setVisible(False)
+        self.index_progress_panel.setVisible(False)
         self.current_worker = None
         self._refresh_status()
 
