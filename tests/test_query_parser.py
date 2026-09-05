@@ -3,7 +3,8 @@ from __future__ import annotations
 import unittest
 from datetime import datetime
 
-from docseek.query_parser import parse_query
+from docseek.query_parser import parse_query, query_filter_chips, remove_query_filter
+from docseek.structure_ranking import parse_structure_query
 
 
 class QueryParserTests(unittest.TestCase):
@@ -64,6 +65,57 @@ class QueryParserTests(unittest.TestCase):
     def test_unmatched_quote_falls_back_instead_of_failing(self) -> None:
         parsed = parse_query('客户 "经理')
         self.assertTrue(parsed.terms)
+
+    def test_filter_chips_reflect_effective_filters(self) -> None:
+        chips = query_filter_chips(
+            '信贷 ext:pdf ext:docx path:"业务 制度" '
+            "after:2026-01-01 before:2026-09-01 size:>10MB size:<20MB"
+        )
+        self.assertEqual(
+            [chip.key for chip in chips],
+            ["extension", "path", "after", "before", "size"],
+        )
+        self.assertEqual(chips[0].label, "类型 · DOCX")
+        self.assertEqual(chips[1].label, "路径 · 业务 制度")
+        self.assertIn("2026-01-01", chips[2].label)
+        self.assertIn("2026-09-01", chips[3].label)
+        self.assertTrue(chips[4].label.startswith("大小 · "))
+
+    def test_remove_filter_preserves_other_query_semantics(self) -> None:
+        raw = (
+            '"客户 经理" sheet:"客户 数据" ext:pdf path:"业务 制度" '
+            "after:2026-01-01 size:>10MB"
+        )
+        updated = remove_query_filter(raw, "path")
+        parsed = parse_query(updated)
+        self.assertIsNone(parsed.path_contains)
+        self.assertEqual(parsed.extension, ".pdf")
+        self.assertIsNotNone(parsed.modified_after)
+        self.assertEqual(parsed.min_size, 10 * 1024 * 1024 + 1)
+        self.assertIn("客户 经理", parsed.terms)
+
+        structured = parse_structure_query(parsed.text)
+        self.assertEqual(structured.hints.sheet, "客户 数据")
+        self.assertIn("客户 经理", structured.text)
+
+    def test_remove_size_chip_clears_both_bounds(self) -> None:
+        updated = remove_query_filter(
+            "制度 ext:pdf size:>=1MB size:<=10MB", "size"
+        )
+        parsed = parse_query(updated)
+        self.assertEqual(parsed.terms, ("制度",))
+        self.assertEqual(parsed.extension, ".pdf")
+        self.assertIsNone(parsed.min_size)
+        self.assertIsNone(parsed.max_size)
+
+    def test_remove_filter_does_not_drop_malformed_filter_like_term(self) -> None:
+        updated = remove_query_filter(
+            "客户 ext:pdf after:not-a-date owner:zhang", "extension"
+        )
+        parsed = parse_query(updated)
+        self.assertIsNone(parsed.extension)
+        self.assertIn("after:not-a-date", parsed.terms)
+        self.assertIn("owner:zhang", parsed.terms)
 
 
 if __name__ == "__main__":
