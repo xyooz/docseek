@@ -40,6 +40,9 @@ jobs:
       - name: One-shot compressed raw chunk experiment
         if: contains(github.event.head_commit.message, '[compression-bench]')
         run: python benchmarks/benchmark_chunk_compression.py --files 5000 --chunks 3 --payload-kb 4 --iterations 5 --delete-documents 100 --limit 100
+      - name: One-shot varied-text compression experiment
+        if: contains(github.event.head_commit.message, '[compression-varied-bench]')
+        run: python benchmarks/benchmark_chunk_compression.py --files 5000 --chunks 3 --payload-kb 4 --iterations 5 --delete-documents 100 --limit 100 --profile varied
       - name: Directory scan smoke
         run: python benchmarks/benchmark_scan.py --files 20
       - name: Test
