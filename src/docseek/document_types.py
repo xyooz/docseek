@@ -32,10 +32,18 @@ class FormatCapability:
 
 
 _FORMATS = (
+    # Lightweight textual formats stay on the direct streaming path.
     FormatCapability(".txt", DocumentFamily.TEXT, (SupportMode.DIRECT,), "Text"),
     FormatCapability(".md", DocumentFamily.TEXT, (SupportMode.DIRECT,), "Markdown"),
     FormatCapability(".log", DocumentFamily.TEXT, (SupportMode.DIRECT,), "Log"),
     FormatCapability(".csv", DocumentFamily.TEXT, (SupportMode.DIRECT,), "CSV"),
+    FormatCapability(".tsv", DocumentFamily.TEXT, (SupportMode.DIRECT,), "TSV"),
+    FormatCapability(".json", DocumentFamily.TEXT, (SupportMode.DIRECT,), "JSON"),
+    FormatCapability(".jsonl", DocumentFamily.TEXT, (SupportMode.DIRECT,), "JSON Lines"),
+    FormatCapability(".yaml", DocumentFamily.TEXT, (SupportMode.DIRECT,), "YAML"),
+    FormatCapability(".yml", DocumentFamily.TEXT, (SupportMode.DIRECT,), "YAML"),
+
+    # Mature structure-preserving parsers for the most common office formats.
     FormatCapability(
         ".docx", DocumentFamily.WRITER, (SupportMode.DIRECT,), "Word / WPS Writer"
     ),
@@ -46,9 +54,10 @@ _FORMATS = (
         ".pptx", DocumentFamily.PRESENTATION, (SupportMode.DIRECT,), "PowerPoint / WPS Presentation"
     ),
     FormatCapability(".pdf", DocumentFamily.PDF, (SupportMode.DIRECT,), "PDF"),
+
     # Calamine preserves spreadsheet row/sheet structure and is therefore the
-    # preferred mature backend for legacy/binary/OpenDocument workbooks. Native
-    # Tika is a broad compatibility fallback; WPS is the final vendor fallback.
+    # preferred backend for legacy/binary/OpenDocument workbooks. Tika and WPS
+    # provide independent compatibility paths where available.
     FormatCapability(
         ".xls",
         DocumentFamily.SPREADSHEET,
@@ -56,7 +65,10 @@ _FORMATS = (
         "Excel 97-2003",
     ),
     FormatCapability(
-        ".xlsb", DocumentFamily.SPREADSHEET, (SupportMode.CALAMINE,), "Excel Binary Workbook"
+        ".xlsb",
+        DocumentFamily.SPREADSHEET,
+        (SupportMode.CALAMINE, SupportMode.TIKA_NATIVE),
+        "Excel Binary Workbook",
     ),
     FormatCapability(
         ".ods",
@@ -64,10 +76,10 @@ _FORMATS = (
         (SupportMode.CALAMINE, SupportMode.TIKA_NATIVE),
         "OpenDocument Spreadsheet",
     ),
-    # Native Tika gives broad local compatibility for older Writer/Presentation
-    # formats without requiring a Java service. Because it may expose only flat
-    # text for some legacy files, DocIR will mark those chunks as generic rather
-    # than inventing page/slide/table structure.
+
+    # Native Tika is the broad compatibility layer. It gives DocSeek one
+    # isolated extraction interface for legacy Office, OpenDocument, web,
+    # e-book, e-mail and iWork content instead of maintaining bespoke parsers.
     FormatCapability(
         ".doc",
         DocumentFamily.WRITER,
@@ -104,8 +116,30 @@ _FORMATS = (
     FormatCapability(
         ".odp", DocumentFamily.PRESENTATION, (SupportMode.TIKA_NATIVE,), "OpenDocument Presentation"
     ),
-    # Kingsoft-native formats deliberately remain vendor/system-plugin territory.
-    # DocSeek does not implement their proprietary binary formats.
+
+    # Web / structured-text documents. Tika removes markup and indexes the
+    # readable text rather than filling search results with HTML/XML tags.
+    FormatCapability(".html", DocumentFamily.TEXT, (SupportMode.TIKA_NATIVE,), "HTML"),
+    FormatCapability(".htm", DocumentFamily.TEXT, (SupportMode.TIKA_NATIVE,), "HTML"),
+    FormatCapability(".xhtml", DocumentFamily.TEXT, (SupportMode.TIKA_NATIVE,), "XHTML"),
+    FormatCapability(".xml", DocumentFamily.TEXT, (SupportMode.TIKA_NATIVE,), "XML"),
+
+    # E-books and local mail stores are common sources of long-lived reference
+    # material. Tika can expose their text and embedded/attachment content.
+    FormatCapability(".epub", DocumentFamily.WRITER, (SupportMode.TIKA_NATIVE,), "EPUB"),
+    FormatCapability(".eml", DocumentFamily.WRITER, (SupportMode.TIKA_NATIVE,), "E-mail Message"),
+    FormatCapability(".msg", DocumentFamily.WRITER, (SupportMode.TIKA_NATIVE,), "Outlook Message"),
+    FormatCapability(".mbox", DocumentFamily.WRITER, (SupportMode.TIKA_NATIVE,), "Mailbox"),
+    FormatCapability(".pst", DocumentFamily.WRITER, (SupportMode.TIKA_NATIVE,), "Outlook Data File"),
+
+    # Apache Tika also exposes parsers for Apple iWork packages. These remain in
+    # the isolated compatibility lane because package variants differ widely.
+    FormatCapability(".pages", DocumentFamily.WRITER, (SupportMode.TIKA_NATIVE,), "Apple Pages"),
+    FormatCapability(".numbers", DocumentFamily.SPREADSHEET, (SupportMode.TIKA_NATIVE,), "Apple Numbers"),
+    FormatCapability(".key", DocumentFamily.PRESENTATION, (SupportMode.TIKA_NATIVE,), "Apple Keynote"),
+
+    # Kingsoft-native formats deliberately remain vendor/system-plugin
+    # territory. They still participate in the same isolated/retry pipeline.
     FormatCapability(".wps", DocumentFamily.WRITER, (SupportMode.WPS_LOCAL,), "WPS Writer"),
     FormatCapability(".wpt", DocumentFamily.WRITER, (SupportMode.WPS_LOCAL,), "WPS Writer Template"),
     FormatCapability(".et", DocumentFamily.SPREADSHEET, (SupportMode.WPS_LOCAL,), "WPS Spreadsheet"),
