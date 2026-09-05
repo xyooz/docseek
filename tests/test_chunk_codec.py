@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -120,7 +119,9 @@ class ChunkCodecTests(unittest.TestCase):
 
         # Simulate the on-disk state of a v6 database: raw chunk content was
         # plain TEXT, while the two contentless FTS indexes already existed.
-        with sqlite3.connect(self.db_path) as conn:
+        # ChunkStore.connect() closes the handle on context-manager exit, which
+        # matters on Windows where an open sqlite handle locks temp-file cleanup.
+        with self.store.connect() as conn:
             conn.execute(
                 """
                 UPDATE chunks SET content = ?
@@ -129,7 +130,6 @@ class ChunkCodecTests(unittest.TestCase):
                 (content, path),
             )
             conn.execute("PRAGMA user_version = 6")
-            conn.commit()
 
         reopened = ChunkStore(self.db_path)
         with reopened.connect() as conn:
