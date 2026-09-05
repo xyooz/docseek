@@ -25,10 +25,9 @@ class ExtractionDecision:
 class ContentExtractionBroker:
     """Choose a mature local extractor and expose one streaming DocIR contract.
 
-    The broker does not own file-format parsing. It routes a document to the
-    best available adapter for the current machine, then lifts the adapter's
-    location-aware chunk stream into DocIR. This keeps format compatibility
-    replaceable while the indexing/retrieval layer stays stable.
+    The broker owns routing, not file-format parsing. Every production document
+    now flows through this layer, which keeps parser selection replaceable while
+    the indexing/search contract remains stable.
     """
 
     def __init__(self, registry: DocumentAdapterRegistry | None = None) -> None:
@@ -56,21 +55,35 @@ class ContentExtractionBroker:
         self,
         path: Path,
         *,
+        target_chars: int = 12_000,
+        spreadsheet_rows_per_chunk: int = 200,
         on_progress: ChunkProgressCallback | None = None,
     ) -> Iterator[DocumentBlock]:
         decision = self.decision_for(path)
         adapter = self.registry.adapter_for(path)
-        for chunk in adapter.iter_chunks(path, on_progress=on_progress):
+        for chunk in adapter.iter_chunks(
+            path,
+            target_chars=target_chars,
+            spreadsheet_rows_per_chunk=spreadsheet_rows_per_chunk,
+            on_progress=on_progress,
+        ):
             yield block_from_chunk(path, decision.family, chunk)
 
     def iter_chunks(
         self,
         path: Path,
         *,
+        target_chars: int = 12_000,
+        spreadsheet_rows_per_chunk: int = 200,
         on_progress: ChunkProgressCallback | None = None,
     ) -> Iterator[DocumentChunk]:
         """Compatibility stream for the existing v7 search/index schema."""
-        for block in self.iter_blocks(path, on_progress=on_progress):
+        for block in self.iter_blocks(
+            path,
+            target_chars=target_chars,
+            spreadsheet_rows_per_chunk=spreadsheet_rows_per_chunk,
+            on_progress=on_progress,
+        ):
             yield block.as_chunk()
 
 
