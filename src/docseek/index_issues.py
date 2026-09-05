@@ -4,6 +4,7 @@ import sqlite3
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterable
 
 
 class _ClosingConnection(sqlite3.Connection):
@@ -44,12 +45,14 @@ class IndexIssueStore:
     def connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=10, factory=_ClosingConnection)
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         return conn
 
     def _init_schema(self) -> None:
         with self.connect() as conn:
+            # journal_mode changes are relatively expensive on Windows; set it
+            # once instead of on every clear/record connection.
+            conn.execute("PRAGMA journal_mode=WAL")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS index_issues (
@@ -65,8 +68,17 @@ class IndexIssueStore:
             )
 
     def record(self, path: str, error_code: str, detail: str = "") -> None:
+        self.record_many([(path, error_code, detail)])
+
+    def record_many(self, issues: Iterable[tuple[str, str, str]]) -> None:
+        rows = [
+            (path, error_code, detail[:1000], time.time())
+            for path, error_code, detail in issues
+        ]
+        if not rows:
+            return
         with self.connect() as conn:
-            conn.execute(
+            conn.executemany(
                 """
                 INSERT INTO index_issues(path, error_code, detail, updated_at)
                 VALUES (?, ?, ?, ?)
@@ -75,12 +87,21 @@ class IndexIssueStore:
                     detail=excluded.detail,
                     updated_at=excluded.updated_at
                 """,
-                (path, error_code, detail[:1000], time.time()),
+                rows,
             )
 
     def clear(self, path: str) -> None:
+        self.clear_many([path])
+
+    def clear_many(self, paths: Iterable[str]) -> None:
+        unique = list(dict.fromkeys(paths))
+        if not unique:
+            return
         with self.connect() as conn:
-            conn.execute("DELETE FROM index_issues WHERE path = ?", (path,))
+            conn.executemany(
+                "DELETE FROM index_issues WHERE path = ?",
+                [(path,) for path in unique],
+            )
 
     def clear_under_root_if_missing(self, root: str, existing_paths: set[str]) -> int:
         """Remove stale issues only when absence can be established safely.
@@ -112,9 +133,7 @@ class IndexIssueStore:
             if not exists:
                 stale.append(issue_path)
 
-        if stale:
-            with self.connect() as conn:
-                conn.executemany("DELETE FROM index_issues WHERE path = ?", [(path,) for path in stale])
+        self.clear_many(stale)
         return len(stale)
 
     def list(self, *, limit: int = 500) -> list[IndexIssue]:
