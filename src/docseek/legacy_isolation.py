@@ -80,6 +80,12 @@ def _terminate_process(process: subprocess.Popen[bytes]) -> None:
         process.wait(timeout=2)
 
 
+def _close_worker_stderr(process: subprocess.Popen[bytes]) -> None:
+    """Close the parent's pipe handle after a killed/cancelled worker."""
+    if process.stderr is not None and not process.stderr.closed:
+        process.stderr.close()
+
+
 def wait_for_worker(
     process: subprocess.Popen[bytes],
     *,
@@ -190,7 +196,11 @@ def iter_legacy_chunks_isolated(
                     )
                 except LegacyExtractionTimeout:
                     attempts.append(f"{adapter_name}: 超时")
+                    _close_worker_stderr(process)
                     continue
+                except BaseException:
+                    _close_worker_stderr(process)
+                    raise
             finally:
                 if process.poll() is None:
                     _terminate_process(process)
@@ -200,7 +210,7 @@ def iter_legacy_chunks_isolated(
                 try:
                     stderr = process.stderr.read()[-4000:]
                 finally:
-                    process.stderr.close()
+                    _close_worker_stderr(process)
 
             if code != 0:
                 detail = _worker_error_detail(
