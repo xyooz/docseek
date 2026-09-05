@@ -1,8 +1,19 @@
 from __future__ import annotations
 
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtWidgets import QGroupBox, QLabel, QVBoxLayout
+from PySide6.QtWidgets import (
+    QGroupBox,
+    QLabel,
+    QMessageBox,
+    QPlainTextEdit,
+    QVBoxLayout,
+)
 
+from .file_exclusions import (
+    FileExclusionStore,
+    InvalidFileExclusionPattern,
+    normalize_file_exclusion_patterns,
+)
 from .index_health import (
     capture_index_health,
     format_index_health,
@@ -20,7 +31,9 @@ class PausableIndexSettingsDialog(IndexSettingsDialog):
 
     def __init__(self, database, parent=None) -> None:
         super().__init__(database, parent)
+        self.resize(720, 700)
         self.root_state_store = IndexRootStateStore(database)
+        self.file_exclusion_store = FileExclusionStore(database)
 
         note = QLabel(
             "勾选 = 正常监测和刷新；取消勾选 = 暂停更新，但保留现有索引和搜索结果。"
@@ -38,6 +51,29 @@ class PausableIndexSettingsDialog(IndexSettingsDialog):
         self.root_list.setToolTip(
             "取消勾选目录可暂停 watcher 和手动刷新；重新勾选并保存后会自动进行增量校准。"
         )
+
+        patterns = self.file_exclusion_store.patterns()
+        self._original_file_pattern_text = "\n".join(patterns)
+        self.file_pattern_edit = QPlainTextEdit()
+        self.file_pattern_edit.setPlainText(self._original_file_pattern_text)
+        self.file_pattern_edit.setPlaceholderText("每行一条，例如：*.log   *.bak   测试_*   .tmp")
+        self.file_pattern_edit.setMaximumHeight(92)
+        self.file_pattern_edit.setToolTip(
+            "只匹配文件名，大小写不敏感；.log 会自动按 *.log 处理。"
+        )
+
+        pattern_hint = QLabel(
+            "每行一条文件名通配规则，例如 *.log、*.bak、测试_*。"
+            "只匹配文件名，不支持路径或正则；保存后会校准活动目录并清理已有匹配索引。"
+        )
+        pattern_hint.setWordWrap(True)
+        pattern_hint.setStyleSheet("color: palette(mid); font-size: 11px;")
+
+        pattern_group = QGroupBox("排除文件规则")
+        pattern_layout = QVBoxLayout()
+        pattern_layout.addWidget(self.file_pattern_edit)
+        pattern_layout.addWidget(pattern_hint)
+        pattern_group.setLayout(pattern_layout)
 
         self.health_summary_label = QLabel()
         self.health_summary_label.setWordWrap(True)
@@ -59,9 +95,10 @@ class PausableIndexSettingsDialog(IndexSettingsDialog):
         health_group.setLayout(health_layout)
 
         # Base layout is: note, roots, excludes, performance, issues, buttons.
-        # Put health immediately before issue recovery so status and remediation
-        # read as one coherent section.
-        self.layout().insertWidget(4, health_group)
+        # Keep filename exclusions beside directory exclusions, then status and
+        # remediation together below them.
+        self.layout().insertWidget(4, pattern_group)
+        self.layout().insertWidget(5, health_group)
         self._refresh_health_summary()
 
     @staticmethod
@@ -84,11 +121,18 @@ class PausableIndexSettingsDialog(IndexSettingsDialog):
             if self.root_list.item(row).checkState() == Qt.CheckState.Unchecked
         ]
 
+    def _file_patterns_from_ui(self) -> list[str]:
+        return normalize_file_exclusion_patterns(
+            self.file_pattern_edit.toPlainText().splitlines()
+        )
+
     def _has_unsaved_changes(self) -> bool:
         return (
             set(self._items(self.root_list)) != self._original_roots
             or set(self._items(self.exclude_list)) != self._original_excluded
             or set(self._paused_roots_from_ui()) != self._original_paused
+            or self.file_pattern_edit.toPlainText().strip()
+            != self._original_file_pattern_text.strip()
             or self.max_size.value() != self.database.get_max_file_size_mb()
         )
 
@@ -157,6 +201,16 @@ class PausableIndexSettingsDialog(IndexSettingsDialog):
             )
 
     def accept(self) -> None:
+        try:
+            file_patterns = self._file_patterns_from_ui()
+        except InvalidFileExclusionPattern as exc:
+            QMessageBox.warning(self, "排除规则无效", str(exc))
+            return
+
+        # Validate the file rules before mutating any persisted settings. This
+        # keeps Save atomic from the user's point of view when a rule is invalid.
+        self.file_exclusion_store.set_patterns(file_patterns)
+
         # Write the complete intended root-state set before the base dialog
         # applies root additions/removals. paused_roots() always filters against
         # the roots that actually exist, so a failed root mutation cannot make
