@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 
 from docseek.chunk_store import ChunkStore
+from docseek.chunk_writer import ChunkBatchWriter
 from docseek.chunks import DocumentChunk
 from docseek.search_db import SearchDatabase
 
@@ -57,6 +58,7 @@ def build_synthetic_index(
     files: int,
     chunks_per_file: int,
     payload_kb: int,
+    batch_size: int,
 ) -> tuple[float, int, int]:
     SearchDatabase(db_path)
     store = ChunkStore(db_path)
@@ -64,29 +66,30 @@ def build_synthetic_index(
     logical_source_bytes = 0
 
     started = time.perf_counter()
-    for index in range(files):
-        extension = ".pdf" if index % 2 == 0 else ".docx"
-        filename = f"业务制度_{index:06d}{extension}"
-        path = str(Path("C:/benchmark") / filename)
-        chunks: list[DocumentChunk] = []
-        for chunk_no in range(chunks_per_file):
-            content = _payload_text(index, chunk_no, payload_bytes)
-            logical_source_bytes += len(content.encode("utf-8"))
-            chunks.append(
-                DocumentChunk(
-                    ordinal=chunk_no,
-                    location=f"块 {chunk_no + 1}",
-                    content=content,
+    with ChunkBatchWriter(store, batch_size=batch_size) as writer:
+        for index in range(files):
+            extension = ".pdf" if index % 2 == 0 else ".docx"
+            filename = f"业务制度_{index:06d}{extension}"
+            path = str(Path("C:/benchmark") / filename)
+            chunks: list[DocumentChunk] = []
+            for chunk_no in range(chunks_per_file):
+                content = _payload_text(index, chunk_no, payload_bytes)
+                logical_source_bytes += len(content.encode("utf-8"))
+                chunks.append(
+                    DocumentChunk(
+                        ordinal=chunk_no,
+                        location=f"块 {chunk_no + 1}",
+                        content=content,
+                    )
                 )
+            writer.replace_document(
+                path=path,
+                filename=filename,
+                extension=extension,
+                modified_time=float(index),
+                size=sum(len(chunk.content.encode("utf-8")) for chunk in chunks),
+                chunks=chunks,
             )
-        store.replace_document(
-            path=path,
-            filename=filename,
-            extension=extension,
-            modified_time=float(index),
-            size=sum(len(chunk.content.encode("utf-8")) for chunk in chunks),
-            chunks=chunks,
-        )
     elapsed = time.perf_counter() - started
     return elapsed, _database_bytes(db_path), logical_source_bytes
 
@@ -139,6 +142,7 @@ def main() -> None:
     parser.add_argument("--files", type=int, default=1000, help="number of synthetic files")
     parser.add_argument("--chunks", type=int, default=3, help="chunks per file")
     parser.add_argument("--payload-kb", type=int, default=4, help="approximate UTF-8 payload per chunk")
+    parser.add_argument("--batch-size", type=int, default=32, help="documents committed per index transaction")
     parser.add_argument("--iterations", type=int, default=20, help="timed repetitions per query")
     parser.add_argument("--warmups", type=int, default=1, help="untimed warmups after the cold query")
     parser.add_argument("--limit", type=int, default=100, help="result page size")
@@ -149,12 +153,13 @@ def main() -> None:
         args.files < 1
         or args.chunks < 1
         or args.payload_kb < 1
+        or args.batch_size < 1
         or args.iterations < 1
         or args.limit < 1
         or args.warmups < 0
     ):
         parser.error(
-            "--files, --chunks, --payload-kb, --iterations and --limit must be >= 1; "
+            "--files, --chunks, --payload-kb, --batch-size, --iterations and --limit must be >= 1; "
             "--warmups must be >= 0"
         )
 
@@ -174,6 +179,7 @@ def main() -> None:
         files=args.files,
         chunks_per_file=args.chunks,
         payload_kb=args.payload_kb,
+        batch_size=args.batch_size,
     )
     query_stats = benchmark_queries(
         db_path,
@@ -191,7 +197,7 @@ def main() -> None:
     print("DocSeek benchmark")
     print(
         f"files={args.files:,} chunks/file={args.chunks} payload/chunk~={args.payload_kb} KiB "
-        f"page={args.limit}"
+        f"batch={args.batch_size} page={args.limit}"
     )
     print(
         f"index_time={index_seconds:.3f}s files_per_second={args.files / index_seconds:.1f} "
