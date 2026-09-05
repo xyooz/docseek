@@ -33,6 +33,7 @@ from .chunk_store import ChunkSearchResult, ChunkStore
 from .indexer import DirectoryIndexer, IndexCancelled, IndexStats
 from .query_parser import parse_query
 from .search_db import SearchDatabase
+from .search_worker import SearchRequest, SearchResponse, SearchWorker
 from .settings_dialog import IndexSettingsDialog
 from .watcher import WatchBatch, WatchManager
 
@@ -129,6 +130,12 @@ class MainWindow(QMainWindow):
         self.database = SearchDatabase(DB_PATH)
         self.chunk_store = ChunkStore(DB_PATH)
         self.thread_pool = QThreadPool.globalInstance()
+        self.search_thread_pool = QThreadPool(self)
+        self.search_thread_pool.setMaxThreadCount(2)
+        self.active_search_workers: set[SearchWorker] = set()
+        self.search_generation = 0
+        self.loading_generation: int | None = None
+
         self.current_worker: IndexWorker | None = None
         self.current_results: list[ChunkSearchResult] = []
         self.search_offset = 0
@@ -262,6 +269,8 @@ class MainWindow(QMainWindow):
         self.search_input.setFocus()
 
     def closeEvent(self, event) -> None:  # noqa: N802
+        self.search_generation += 1
+        self.search_thread_pool.clear()
         self.watch_manager.stop()
         super().closeEvent(event)
 
@@ -408,8 +417,14 @@ class MainWindow(QMainWindow):
         )
 
     def _perform_search(self) -> None:
+        # Incrementing the generation invalidates every in-flight response from
+        # previous text/filter values. Those SQLite statements may finish in
+        # their worker thread, but they can no longer mutate the visible UI.
+        self.search_generation += 1
         self.search_offset = 0
         self.has_more_results = False
+        self.loading_more = False
+        self.loading_generation = None
         self.current_results = []
         self.seen_result_paths.clear()
         self.results.setRowCount(0)
@@ -417,7 +432,7 @@ class MainWindow(QMainWindow):
         self._load_next_page(select_first=True)
 
     def _load_next_page(self, *, select_first: bool = False) -> None:
-        if self.loading_more:
+        if self.loading_more and self.loading_generation == self.search_generation:
             return
 
         raw_query = self.search_input.text().strip()
@@ -427,26 +442,54 @@ class MainWindow(QMainWindow):
             self._refresh_status()
             return
 
-        self.loading_more = True
-        try:
-            page = self.chunk_store.search_page(
-                parsed.text,
-                limit=PAGE_SIZE,
-                offset=self.search_offset,
-                extension=extension,
-                path_contains=parsed.path_contains,
-                modified_after=parsed.modified_after,
-                modified_before=parsed.modified_before,
-                min_size=parsed.min_size,
-                max_size=parsed.max_size,
+        request = SearchRequest(
+            generation=self.search_generation,
+            query=parsed.text,
+            limit=PAGE_SIZE,
+            offset=self.search_offset,
+            extension=extension,
+            path_contains=parsed.path_contains,
+            modified_after=parsed.modified_after,
+            modified_before=parsed.modified_before,
+            min_size=parsed.min_size,
+            max_size=parsed.max_size,
+            select_first=select_first,
+            is_filter_only=not parsed.terms,
+        )
+        worker = SearchWorker(self.chunk_store, request)
+        worker.signals.finished.connect(
+            lambda response, current=worker: self._search_finished(current, response)
+        )
+        worker.signals.failed.connect(
+            lambda generation, message, current=worker: self._search_failed(
+                current, generation, message
             )
-            rows = page.items
-        except Exception as exc:
-            self.statusBar().showMessage(f"搜索失败：{exc}", 8000)
-            return
-        finally:
-            self.loading_more = False
+        )
+        self.active_search_workers.add(worker)
+        self.loading_more = True
+        self.loading_generation = request.generation
+        if request.offset == 0:
+            self.statusBar().showMessage("正在搜索…")
+        self.search_thread_pool.start(worker)
 
+    def _search_finished(self, worker: SearchWorker, response: SearchResponse) -> None:
+        self.active_search_workers.discard(worker)
+        request = response.request
+        if request.generation != self.search_generation:
+            return
+
+        if self.loading_generation == request.generation:
+            self.loading_more = False
+            self.loading_generation = None
+
+        # A page from the current generation is only valid at the offset it was
+        # requested for. This also protects against future changes that allow
+        # more than one pagination request to be queued at once.
+        if request.offset != self.search_offset:
+            return
+
+        page = response.page
+        rows = page.items
         unique_rows = [row for row in rows if row.path not in self.seen_result_paths]
         for row in unique_rows:
             self.seen_result_paths.add(row.path)
@@ -460,12 +503,27 @@ class MainWindow(QMainWindow):
         self.search_offset += len(rows)
         self.has_more_results = self.search_offset < page.total_count
         suffix = " · 向下滚动继续加载" if self.has_more_results else ""
-        mode = "筛选结果" if not parsed.terms else "搜索结果"
-        self.statusBar().showMessage(
-            f"{mode}：已显示 {len(self.current_results):,} / 共 {page.total_count:,} 个文件{suffix}"
+        mode = "筛选结果" if request.is_filter_only else "搜索结果"
+        latency = (
+            f"{response.elapsed_ms:.1f} ms"
+            if response.elapsed_ms < 10
+            else f"{response.elapsed_ms:.0f} ms"
         )
-        if select_first and self.current_results:
+        self.statusBar().showMessage(
+            f"{mode}：已显示 {len(self.current_results):,} / 共 {page.total_count:,} 个文件"
+            f" · {latency}{suffix}"
+        )
+        if request.select_first and self.current_results:
             self.results.selectRow(0)
+
+    def _search_failed(self, worker: SearchWorker, generation: int, message: str) -> None:
+        self.active_search_workers.discard(worker)
+        if generation != self.search_generation:
+            return
+        if self.loading_generation == generation:
+            self.loading_more = False
+            self.loading_generation = None
+        self.statusBar().showMessage(f"搜索失败：{message}", 8000)
 
     def _populate_result_row(self, row_index: int, row: ChunkSearchResult) -> None:
         name_item = QTableWidgetItem(row.filename)
