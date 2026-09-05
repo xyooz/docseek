@@ -23,6 +23,8 @@ DEFAULT_IGNORED_DIR_NAMES = {
     "$recycle.bin",
     "system volume information",
 }
+FULL_SCAN_BATCH_SIZE = 128
+FULL_SCAN_BATCH_TEXT_CHARS = 8_000_000
 
 
 @dataclass(slots=True)
@@ -329,7 +331,11 @@ class DirectoryIndexer:
         successful_paths: set[str] = set()
         index_state = self._load_index_state()
 
-        with ChunkBatchWriter(self.chunk_store, batch_size=32) as writer:
+        with ChunkBatchWriter(
+            self.chunk_store,
+            batch_size=FULL_SCAN_BATCH_SIZE,
+            max_batch_text_chars=FULL_SCAN_BATCH_TEXT_CHARS,
+        ) as writer:
             for path in self._iter_supported_files(root, stats):
                 if self._cancel.is_set():
                     writer.flush()
