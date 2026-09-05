@@ -8,12 +8,14 @@ def main() -> int:
     # DocSeek and all production entry-point modules without opening a window.
     if os.environ.get("DOCSEEK_FROZEN_SMOKE") == "1":
         import docseek.app  # noqa: F401
+        import docseek.bootstrap  # noqa: F401
         import docseek.document_adapters  # noqa: F401
         import docseek.indexer  # noqa: F401
+        import docseek.index_maintenance  # noqa: F401
 
         return 0
 
-    from docseek.app import main as run_docseek
+    from docseek.bootstrap import main as run_docseek
 
     run_docseek()
     return 0

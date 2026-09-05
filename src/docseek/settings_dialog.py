@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
 
 from .index_issues import IndexIssueStore
 from .index_issues_dialog import IndexIssuesDialog
+from .index_maintenance import purge_root_index
 from .search_db import SearchDatabase
 
 
@@ -90,16 +91,16 @@ class IndexSettingsDialog(QDialog):
         issues_layout.addWidget(self.issue_button)
         issues_group.setLayout(issues_layout)
 
-        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
+        self.button_box = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        self.button_box.accepted.connect(self.accept)
+        self.button_box.rejected.connect(self.reject)
 
         layout = QVBoxLayout()
         layout.addWidget(roots_group)
         layout.addWidget(exclude_group)
         layout.addWidget(advanced_group)
         layout.addWidget(issues_group)
-        layout.addWidget(buttons)
+        layout.addWidget(self.button_box)
         self.setLayout(layout)
 
         self._original_roots = set(database.get_index_roots())
@@ -155,8 +156,11 @@ class IndexSettingsDialog(QDialog):
         excluded = set(self._items(self.exclude_list))
 
         for root in sorted(self._original_roots - roots):
+            # Purge through the production chunk index rather than the legacy
+            # file-level FTS tables. This also removes extraction state and
+            # stale issue records for the removed root, but never source files.
+            purge_root_index(self.database.db_path, root)
             self.database.remove_index_root(root)
-            self.database.purge_root(root)
         for root in sorted(roots - self._original_roots):
             self.database.add_index_root(root)
 
