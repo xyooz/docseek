@@ -28,12 +28,16 @@ class ExactGroupedSearchTests(unittest.TestCase):
         filename: str | None = None,
         extension: str = ".pdf",
         chunks: list[str],
+        locations: list[str] | None = None,
         modified_time: float | None = None,
         size: int | None = None,
         folder: str = "docs",
     ) -> None:
         filename = filename or f"doc_{index:03d}{extension}"
         path = str(Path("C:/") / folder / filename)
+        if locations is None:
+            locations = [f"位置 {chunk_no + 1}" for chunk_no in range(len(chunks))]
+        self.assertEqual(len(locations), len(chunks))
         self.store.replace_document(
             path=path,
             filename=filename,
@@ -41,7 +45,7 @@ class ExactGroupedSearchTests(unittest.TestCase):
             modified_time=float(index if modified_time is None else modified_time),
             size=size if size is not None else 1000 + index,
             chunks=[
-                DocumentChunk(chunk_no, f"位置 {chunk_no + 1}", content)
+                DocumentChunk(chunk_no, locations[chunk_no], content)
                 for chunk_no, content in enumerate(chunks)
             ],
         )
@@ -98,6 +102,48 @@ class ExactGroupedSearchTests(unittest.TestCase):
         expected = self.store.search_page('"customer manager"')
         actual = self.grouped.search_page('"customer manager"')
         self.assertEqual(self._signature(actual), self._signature(expected))
+
+    def test_page_hint_prefers_matching_pdf_page(self) -> None:
+        self._add(
+            0,
+            chunks=["信贷业务", "信贷业务"],
+            locations=["第 1 页", "第 2 页"],
+        )
+        plain = self.grouped.search_page("信贷业务")
+        hinted = self.grouped.search_page("信贷业务 page:2")
+        self.assertEqual(plain.items[0].location, "第 1 页")
+        self.assertEqual(hinted.items[0].location, "第 2 页")
+        self.assertNotIn("page:2", hinted.items[0].snippet)
+
+    def test_slide_hint_prefers_matching_slide(self) -> None:
+        self._add(
+            0,
+            extension=".pptx",
+            chunks=["风险管理", "风险管理"],
+            locations=["幻灯片 1", "幻灯片 4"],
+        )
+        page = self.grouped.search_page("风险管理 slide:4")
+        self.assertEqual(page.items[0].location, "幻灯片 4")
+
+    def test_sheet_hint_prefers_matching_sheet(self) -> None:
+        self._add(
+            0,
+            extension=".xlsx",
+            chunks=["客户经理汇总", "客户经理汇总"],
+            locations=["工作表 汇总 · 行 1-20", "工作表 客户 数据 · 行 1-20"],
+        )
+        page = self.grouped.search_page('客户经理 sheet:"客户 数据"')
+        self.assertEqual(page.items[0].location, "工作表 客户 数据 · 行 1-20")
+
+    def test_structure_hint_does_not_change_file_count(self) -> None:
+        for index in range(4):
+            self._add(
+                index,
+                chunks=["信贷业务", "信贷业务"],
+                locations=["第 1 页", "第 2 页"],
+            )
+        self.assertEqual(self.grouped.count_files("信贷业务 page:2"), 4)
+        self.assertEqual(self.grouped.search_page("信贷业务 page:2").total_count, 4)
 
     def test_count_matches_exact_file_total(self) -> None:
         for index in range(8):
