@@ -5,6 +5,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from openpyxl import Workbook
+
 from docseek.chunk_store import ChunkStore
 from docseek.index_issues import IndexIssueStore
 from docseek.indexer import DirectoryIndexer
@@ -156,6 +158,32 @@ class DirectoryIndexerTests(unittest.TestCase):
         self.assertEqual(stats.indexed, 1)
         self.assertEqual(self.issues.count(), 0)
         self.assertEqual([row.filename for row in self.chunks.search("信贷")], ["retry.txt"])
+
+    def test_xlsx_detail_progress_is_propagated_during_scan(self) -> None:
+        target = self.root / "客户清单.xlsx"
+        workbook = Workbook(write_only=True)
+        worksheet = workbook.create_sheet("客户明细")
+        for row_no in range(1, 1_506):
+            worksheet.append([row_no, f"客户{row_no}"])
+        workbook.save(target)
+        workbook.close()
+
+        progress: list[tuple[str, str, int]] = []
+        stats = DirectoryIndexer(self.db).scan(
+            self.root,
+            on_detail=lambda path, location, current: progress.append(
+                (path.name, location, current)
+            ),
+        )
+
+        self.assertEqual(stats.indexed, 1)
+        self.assertEqual(
+            progress,
+            [
+                ("客户清单.xlsx", "工作表 客户明细", 1_000),
+                ("客户清单.xlsx", "工作表 客户明细", 1_505),
+            ],
+        )
 
 
 if __name__ == "__main__":
