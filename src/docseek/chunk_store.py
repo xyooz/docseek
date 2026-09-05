@@ -50,11 +50,13 @@ class ChunkStore:
     - ``chunk_index_cjk2`` for Chinese substring search using overlapping
       bigrams and FTS phrase matching.
 
-    Earlier versions also maintained a full trigram copy. Schema v4 removes
-    that copy because a contiguous Chinese query of length >= 2 can be
-    represented exactly as an overlapping-bigram phrase (for example
-    ``客户经理`` -> ``客户 户经 经理``). This reduces write amplification and
-    database size without giving up contiguous Chinese substring matching.
+    Schema v4 removed the old trigram copy because a contiguous Chinese query
+    of length >= 2 can be represented exactly as an overlapping-bigram phrase.
+    Schema v5 keeps the source ``path`` column temporarily for safe rollback,
+    but also assigns every chunk the integer ``files.id``. Production search
+    now joins and partitions by that compact integer key instead of repeatedly
+    comparing long Windows path strings. A later schema may drop the duplicate
+    chunk path after 10k/50k migration benchmarks confirm the layout.
     """
 
     def __init__(self, db_path: Path) -> None:
@@ -90,6 +92,7 @@ class ChunkStore:
             else:
                 self._create_v4_schema(conn)
 
+            self._ensure_v5_file_ids(conn)
             mark_schema_current(conn)
 
     @staticmethod
@@ -123,6 +126,45 @@ class ChunkStore:
             """
         )
 
+    @staticmethod
+    def _ensure_v5_file_ids(conn: sqlite3.Connection) -> None:
+        """Backfill a compact integer relationship without rebuilding FTS.
+
+        ``path`` intentionally remains in ``chunks`` for schema v5. This makes
+        the migration reversible and lets an older v4-shaped index be repaired
+        from its own metadata. Search/write hot paths already use ``file_id``.
+        """
+        columns = {
+            str(row[1])
+            for row in conn.execute("PRAGMA table_info(chunks)").fetchall()
+        }
+        if "file_id" not in columns:
+            conn.execute("ALTER TABLE chunks ADD COLUMN file_id INTEGER")
+
+        conn.execute(
+            """
+            UPDATE chunks
+            SET file_id = (
+                SELECT f.id FROM files f WHERE f.path = chunks.path
+            )
+            WHERE file_id IS NULL
+            """
+        )
+        orphan_count = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM chunks WHERE file_id IS NULL"
+            ).fetchone()[0]
+        )
+        if orphan_count:
+            raise RuntimeError(
+                "索引升级到 v5 时发现无法映射到文件元数据的内容块："
+                f"{orphan_count} 个。为避免静默丢失搜索结果，升级已中止。"
+            )
+
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_chunks_file_id ON chunks(file_id)"
+        )
+
     def _migrate_v3_to_v4(self, conn: sqlite3.Connection) -> None:
         """Rebuild only the compact inverted indexes; source files stay closed."""
         conn.execute("DROP TABLE IF EXISTS chunk_index")
@@ -147,7 +189,7 @@ class ChunkStore:
             )
 
     def _migrate_pre_v3_chunks(self, conn: sqlite3.Connection) -> None:
-        """Move v1/v2 chunk data into the single-copy v4 layout."""
+        """Move v1/v2 chunk data into the single-copy v4/v5 layout."""
         if not self._table_exists(conn, "chunk_fts"):
             return
 
@@ -217,6 +259,11 @@ class ChunkStore:
             (chunk_id, self._cjk_bigrams(filename), self._cjk_bigrams(content)),
         )
 
+    @staticmethod
+    def _file_id_for_path(conn: sqlite3.Connection, path: str) -> int | None:
+        row = conn.execute("SELECT id FROM files WHERE path = ?", (path,)).fetchone()
+        return int(row[0]) if row else None
+
     def replace_document(
         self,
         *,
@@ -242,11 +289,18 @@ class ChunkStore:
                 """,
                 (path, filename, extension, modified_time, size),
             )
-            self._delete_chunks(conn, path)
+            file_id = self._file_id_for_path(conn, path)
+            if file_id is None:
+                raise RuntimeError(f"无法为索引文件分配 file_id：{path}")
+
+            self._delete_chunks(conn, path, file_id=file_id)
             for chunk in chunks:
                 cursor = conn.execute(
-                    "INSERT INTO chunks(path, ordinal, location, content) VALUES (?, ?, ?, ?)",
-                    (path, chunk.ordinal, chunk.location, chunk.content),
+                    """
+                    INSERT INTO chunks(path, file_id, ordinal, location, content)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (path, file_id, chunk.ordinal, chunk.location, chunk.content),
                 )
                 chunk_id = int(cursor.lastrowid)
                 self._insert_fts_rows(conn, chunk_id, filename, chunk.content)
@@ -255,7 +309,8 @@ class ChunkStore:
 
     def remove_document(self, path: str) -> None:
         with self.connect() as conn:
-            self._delete_chunks(conn, path)
+            file_id = self._file_id_for_path(conn, path)
+            self._delete_chunks(conn, path, file_id=file_id)
             conn.execute("DELETE FROM files WHERE path = ?", (path,))
 
     @staticmethod
@@ -272,17 +327,40 @@ class ChunkStore:
             (rowid, first, second),
         )
 
-    def _delete_chunks(self, conn: sqlite3.Connection, path: str) -> None:
-        rows = conn.execute(
-            """
-            SELECT c.id, c.content, f.filename
-            FROM chunks c
-            JOIN files f ON f.path = c.path
-            WHERE c.path = ?
-            ORDER BY c.id
-            """,
-            (path,),
-        ).fetchall()
+    def _delete_chunks(
+        self,
+        conn: sqlite3.Connection,
+        path: str,
+        *,
+        file_id: int | None = None,
+    ) -> None:
+        if file_id is None:
+            file_id = self._file_id_for_path(conn, path)
+
+        if file_id is not None:
+            rows = conn.execute(
+                """
+                SELECT c.id, c.content, f.filename
+                FROM chunks c
+                JOIN files f ON f.id = c.file_id
+                WHERE c.file_id = ?
+                ORDER BY c.id
+                """,
+                (file_id,),
+            ).fetchall()
+        else:
+            # Compatibility fallback for an interrupted pre-v5 migration.
+            rows = conn.execute(
+                """
+                SELECT c.id, c.content, f.filename
+                FROM chunks c
+                JOIN files f ON f.path = c.path
+                WHERE c.path = ?
+                ORDER BY c.id
+                """,
+                (path,),
+            ).fetchall()
+
         for row in rows:
             chunk_id = int(row["id"])
             content = str(row["content"] or "")
@@ -295,7 +373,11 @@ class ChunkStore:
                 self._cjk_bigrams(filename),
                 self._cjk_bigrams(content),
             )
-        conn.execute("DELETE FROM chunks WHERE path = ?", (path,))
+
+        if file_id is not None:
+            conn.execute("DELETE FROM chunks WHERE file_id = ?", (file_id,))
+        else:
+            conn.execute("DELETE FROM chunks WHERE path = ?", (path,))
 
     def remove_missing_under_root(self, root: str, existing_paths: set[str]) -> int:
         root_path = Path(root).resolve()
@@ -365,8 +447,6 @@ class ChunkStore:
             text and self._cjk_only(text) == "".join(text.split())
             for text, _quoted in terms
         ):
-            # Preserve AND semantics between user terms while each individual
-            # CJK term is matched as an exact contiguous substring.
             return (
                 "chunk_index_cjk2",
                 " AND ".join(self._cjk_phrase("".join(text.split())) for text, _quoted in terms),
@@ -554,6 +634,7 @@ class ChunkStore:
             WITH hits AS (
                 SELECT
                     c.id AS chunk_id,
+                    f.id AS file_id,
                     f.path,
                     f.filename,
                     f.extension,
@@ -565,7 +646,7 @@ class ChunkStore:
                     {filename_boost_expr} AS filename_boost
                 FROM {table}
                 JOIN chunks c ON c.id = {table}.rowid
-                JOIN files f ON f.path = c.path
+                JOIN files f ON f.id = c.file_id
                 WHERE {' AND '.join(clauses)}
             ),
             ranked AS (
@@ -573,21 +654,21 @@ class ChunkStore:
                     *,
                     bm25_score + filename_boost AS relevance_score,
                     ROW_NUMBER() OVER (
-                        PARTITION BY path
+                        PARTITION BY file_id
                         ORDER BY bm25_score + filename_boost ASC, ordinal ASC
                     ) AS file_rank
                 FROM hits
             ),
             file_hits AS (
                 SELECT
-                    chunk_id, path, filename, extension, modified_time, size,
+                    chunk_id, file_id, path, filename, extension, modified_time, size,
                     ordinal, location, relevance_score
                 FROM ranked
                 WHERE file_rank = 1
             ),
             paged AS (
                 SELECT
-                    chunk_id, path, filename, extension, modified_time, size,
+                    chunk_id, file_id, path, filename, extension, modified_time, size,
                     ordinal, location, relevance_score,
                     COUNT(*) OVER() AS total_count
                 FROM file_hits
@@ -610,20 +691,20 @@ class ChunkStore:
                 count_sql = f"""
                     WITH hits AS (
                         SELECT
-                            f.path,
+                            f.id AS file_id,
                             c.ordinal AS ordinal,
                             {score_expr} AS bm25_score,
                             {filename_boost_expr} AS filename_boost
                         FROM {table}
                         JOIN chunks c ON c.id = {table}.rowid
-                        JOIN files f ON f.path = c.path
+                        JOIN files f ON f.id = c.file_id
                         WHERE {' AND '.join(clauses)}
                     ),
                     ranked AS (
                         SELECT
-                            path,
+                            file_id,
                             ROW_NUMBER() OVER (
-                                PARTITION BY path
+                                PARTITION BY file_id
                                 ORDER BY bm25_score + filename_boost ASC, ordinal ASC
                             ) AS file_rank
                         FROM hits
