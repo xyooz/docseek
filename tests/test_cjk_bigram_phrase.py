@@ -44,7 +44,7 @@ class CjkBigramPhraseTests(unittest.TestCase):
                 SELECT DISTINCT f.filename
                 FROM chunk_index_cjk2 idx
                 JOIN chunks c ON c.id = idx.rowid
-                JOIN files f ON f.path = c.path
+                JOIN files f ON f.id = c.file_id
                 WHERE chunk_index_cjk2 MATCH ?
                 ORDER BY f.filename
                 """,
