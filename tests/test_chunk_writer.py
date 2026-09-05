@@ -65,6 +65,32 @@ class ChunkBatchWriterTests(unittest.TestCase):
             ).fetchone()
         self.assertIsNone(broken)
 
+    def test_extracted_text_budget_flushes_large_batch(self) -> None:
+        path = r"C:\docs\large.txt"
+        with ChunkBatchWriter(
+            self.store,
+            batch_size=128,
+            max_batch_text_chars=5,
+        ) as writer:
+            writer.replace_document(
+                path=path,
+                filename="large.txt",
+                extension=".txt",
+                modified_time=1.0,
+                size=2,
+                chunks=[DocumentChunk(0, "行 1", "超过五个字符的正文")],
+            )
+            self.assertEqual(writer.pending_documents, 0)
+            self.assertEqual(writer.pending_text_chars, 0)
+
+            # A separate connection can see it immediately, proving the text
+            # budget committed the batch instead of only resetting counters.
+            with self.store.connect() as conn:
+                visible = conn.execute(
+                    "SELECT 1 FROM files WHERE path = ? LIMIT 1", (path,)
+                ).fetchone()
+            self.assertIsNotNone(visible)
+
 
 if __name__ == "__main__":
     unittest.main()
