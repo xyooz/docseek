@@ -119,7 +119,13 @@ class DirectoryIndexer:
     def _has_chunk_index(self, path: str) -> bool:
         with self.chunk_store.connect() as conn:
             row = conn.execute(
-                "SELECT 1 FROM chunks WHERE path = ? LIMIT 1",
+                """
+                SELECT 1
+                FROM files f
+                JOIN chunks c ON c.file_id = f.id
+                WHERE f.path = ?
+                LIMIT 1
+                """,
                 (path,),
             ).fetchone()
         return row is not None
@@ -142,21 +148,27 @@ class DirectoryIndexer:
     def _load_index_state(self) -> dict[str, tuple[float, int, bool]]:
         """Load metadata/chunk presence once for a full reconciliation scan."""
         with self.chunk_store.connect() as conn:
-            file_rows = conn.execute(
-                "SELECT path, modified_time, size FROM files"
-            ).fetchall()
-            chunk_rows = conn.execute(
-                "SELECT DISTINCT path FROM chunks"
+            rows = conn.execute(
+                """
+                SELECT
+                    f.path,
+                    f.modified_time,
+                    f.size,
+                    EXISTS(
+                        SELECT 1 FROM chunks c
+                        WHERE c.file_id = f.id
+                    ) AS has_chunk
+                FROM files f
+                """
             ).fetchall()
 
-        chunk_paths = {str(row["path"]) for row in chunk_rows}
         return {
             str(row["path"]): (
                 float(row["modified_time"]),
                 int(row["size"]),
-                str(row["path"]) in chunk_paths,
+                bool(row["has_chunk"]),
             )
-            for row in file_rows
+            for row in rows
         }
 
     def _remove_indexed_path(self, path: str, stats: IndexStats) -> None:
