@@ -15,11 +15,13 @@ class ChunkBatchWriter:
     FTS5 creates index segments at transaction boundaries. During a full scan,
     committing every file causes many small segments and many fsyncs. This
     writer keeps one explicit write transaction open across a bounded number
-    of documents, but wraps each document in a SAVEPOINT so a broken parser or
-    file cannot corrupt or roll back the rest of the batch.
+    of changed documents, but wraps each document in a SAVEPOINT so a broken
+    parser or file cannot corrupt or roll back the rest of the batch.
 
-    Watcher-driven single-file updates intentionally keep using
-    ``ChunkStore.replace_document`` for simple per-file atomicity.
+    The write transaction is acquired lazily. An unchanged-only reconciliation
+    scan therefore does not hold SQLite's writer lock for the duration of the
+    filesystem walk. Watcher-driven single-file updates intentionally keep
+    using ``ChunkStore.replace_document`` for simple per-file atomicity.
     """
 
     def __init__(self, store: ChunkStore, *, batch_size: int = 32) -> None:
@@ -28,12 +30,12 @@ class ChunkBatchWriter:
         self.conn: sqlite3.Connection | None = None
         self.pending_documents = 0
         self._savepoint_id = 0
+        self._transaction_open = False
 
     def __enter__(self) -> Self:
         if self.conn is not None:
             raise RuntimeError("ChunkBatchWriter is already open")
         self.conn = self.store.connect()
-        self.conn.execute("BEGIN IMMEDIATE")
         return self
 
     def __exit__(
@@ -47,21 +49,24 @@ class ChunkBatchWriter:
         if conn is None:
             return False
         try:
-            if exc_type is None:
-                conn.commit()
-            else:
-                conn.rollback()
+            if self._transaction_open:
+                if exc_type is None:
+                    conn.commit()
+                else:
+                    conn.rollback()
         finally:
+            self._transaction_open = False
+            self.pending_documents = 0
             conn.close()
         return False
 
     def flush(self) -> None:
+        """Commit the current batch and release the SQLite writer lock."""
         conn = self._require_connection()
-        if not self.pending_documents:
-            return
-        conn.commit()
+        if self._transaction_open:
+            conn.commit()
+            self._transaction_open = False
         self.pending_documents = 0
-        conn.execute("BEGIN IMMEDIATE")
 
     def replace_document(
         self,
@@ -74,6 +79,7 @@ class ChunkBatchWriter:
         chunks: Iterable[DocumentChunk],
     ) -> int:
         conn = self._require_connection()
+        self._ensure_transaction(conn)
         self._savepoint_id += 1
         savepoint = f"docseek_document_{self._savepoint_id}"
         conn.execute(f"SAVEPOINT {savepoint}")
@@ -113,6 +119,11 @@ class ChunkBatchWriter:
         if self.pending_documents >= self.batch_size:
             self.flush()
         return count
+
+    def _ensure_transaction(self, conn: sqlite3.Connection) -> None:
+        if not self._transaction_open:
+            conn.execute("BEGIN IMMEDIATE")
+            self._transaction_open = True
 
     def _require_connection(self) -> sqlite3.Connection:
         if self.conn is None:
