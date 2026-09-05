@@ -5,6 +5,7 @@ import importlib.util
 import platform
 import tempfile
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Iterator
 
@@ -44,9 +45,13 @@ _COMPONENTS = {
 
 
 def pywin32_available() -> bool:
-    return importlib.util.find_spec("win32com.client") is not None and importlib.util.find_spec(
-        "pythoncom"
-    ) is not None
+    # Looking up a dotted module can raise ModuleNotFoundError when the parent
+    # package is absent, so probe win32com first. Optional WPS support must never
+    # break normal DocSeek startup on machines without pywin32.
+    return (
+        importlib.util.find_spec("win32com") is not None
+        and importlib.util.find_spec("pythoncom") is not None
+    )
 
 
 def wps_component_registered(component: WpsComponent) -> bool:
@@ -61,6 +66,7 @@ def wps_component_registered(component: WpsComponent) -> bool:
         return False
 
 
+@lru_cache(maxsize=1)
 def available_wps_families() -> frozenset[DocumentFamily]:
     if not pywin32_available():
         return frozenset()
@@ -108,8 +114,6 @@ def _open_and_save(app, component: WpsComponent, source: Path, target: Path) -> 
             document = app.Workbooks.Open(str(source), ReadOnly=True)
             document.SaveAs(str(target), component.save_format)
         elif component.family == DocumentFamily.PRESENTATION:
-            # WithWindow=False prevents a visible presentation window where the
-            # installed WPS build supports the Office-compatible argument.
             try:
                 document = app.Presentations.Open(str(source), WithWindow=False)
             except Exception:
@@ -131,7 +135,7 @@ def convert_with_wps(source: Path, target: Path) -> None:
     try:
         import pythoncom
         from win32com.client import DispatchEx
-    except ImportError as exc:  # defensive: availability is rechecked above.
+    except ImportError as exc:
         raise WpsAdapterUnavailable("pywin32 is required for WPS local automation") from exc
 
     app = None
