@@ -10,6 +10,7 @@ from .chunk_store import ChunkStore
 from .chunk_writer import ChunkBatchWriter
 from .chunks import iter_document_chunks
 from .extractors import SUPPORTED_EXTENSIONS
+from .index_cleanup import remove_missing_under_root
 from .index_issues import IndexIssueStore
 from .search_db import SearchDatabase
 
@@ -369,7 +370,7 @@ class DirectoryIndexer:
                     self.issues.record(normalized, self._error_code(exc), str(exc))
 
         self.issues.clear_many(successful_paths)
-        stats.removed += self.chunk_store.remove_missing_under_root(str(root), seen_paths)
+        stats.removed += remove_missing_under_root(self.chunk_store, str(root), seen_paths)
         self.issues.clear_under_root_if_missing(str(root), seen_paths)
         self.database.add_index_root(str(root))
         return stats
