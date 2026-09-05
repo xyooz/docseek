@@ -11,13 +11,7 @@ from .document_types import DocumentFamily
 
 
 class BlockKind(StrEnum):
-    """Format-neutral structural units used by the retrieval layer.
-
-    The first version deliberately models only structure that DocSeek can
-    already identify reliably. Adapters may enrich blocks later (headings,
-    table headers, key/value pairs, visual regions) without changing the
-    storage/search contract all at once.
-    """
+    """Format-neutral structural units used by the retrieval layer."""
 
     TEXT_RANGE = "text-range"
     WRITER_BLOCK = "writer-block"
@@ -45,10 +39,9 @@ class BlockLocator:
 class DocumentBlock:
     """One streaming DocIR block.
 
-    ``text`` remains the exact text handed to the existing FTS pipeline. The
-    structured fields are additive metadata for future structure-aware ranking
-    and previews. This means introducing DocIR does not silently change current
-    search semantics or require a schema migration.
+    ``text`` is exactly what the existing FTS pipeline receives. Structure is
+    additive metadata; adapters that cannot prove a locator are represented as
+    ``GENERIC`` rather than inventing page/slide/table coordinates.
     """
 
     ordinal: int
@@ -73,95 +66,101 @@ _LINE_LOCATION = re.compile(r"^行\s+(\d+)-(\d+)$")
 _WRITER_LOCATION = re.compile(r"^文档块\s+(\d+)-(\d+)$")
 
 
+def _generic_block(
+    family: DocumentFamily,
+    chunk: DocumentChunk,
+) -> DocumentBlock:
+    return DocumentBlock(
+        chunk.ordinal,
+        BlockKind.GENERIC,
+        chunk.content,
+        BlockLocator(chunk.location),
+        family,
+    )
+
+
 def block_from_chunk(
     path: Path,
     family: DocumentFamily,
     chunk: DocumentChunk,
 ) -> DocumentBlock:
-    """Lift the current location-aware chunk stream into DocIR.
-
-    This compatibility bridge is intentionally lossless: the generated chunk
-    can be converted back with ``as_chunk()`` byte-for-byte at the text level.
-    New adapters may produce richer DocumentBlock objects directly later.
-    """
-
+    """Lift the current location-aware chunk stream into DocIR losslessly."""
+    del path  # reserved for future provenance/enricher metadata.
     location = chunk.location
 
     if family == DocumentFamily.PDF:
         match = _PDF_LOCATION.match(location)
-        page = int(match.group(1)) if match else None
+        if not match:
+            return _generic_block(family, chunk)
         return DocumentBlock(
             chunk.ordinal,
             BlockKind.PAGE,
             chunk.content,
-            BlockLocator(location, page=page),
+            BlockLocator(location, page=int(match.group(1))),
             family,
         )
 
     if family == DocumentFamily.PRESENTATION:
         match = _SLIDE_LOCATION.match(location)
-        slide = int(match.group(1)) if match else None
+        if not match:
+            return _generic_block(family, chunk)
         return DocumentBlock(
             chunk.ordinal,
             BlockKind.SLIDE,
             chunk.content,
-            BlockLocator(location, slide=slide),
+            BlockLocator(location, slide=int(match.group(1))),
             family,
         )
 
     if family == DocumentFamily.SPREADSHEET:
         match = _SHEET_LOCATION.match(location)
-        if match:
-            sheet, start, end = match.groups()
-            return DocumentBlock(
-                chunk.ordinal,
-                BlockKind.SHEET_ROWS,
-                chunk.content,
-                BlockLocator(
-                    location,
-                    sheet=sheet,
-                    row_start=int(start),
-                    row_end=int(end),
-                ),
-                family,
-                title=sheet,
-            )
+        if not match:
+            return _generic_block(family, chunk)
+        sheet, start, end = match.groups()
         return DocumentBlock(
             chunk.ordinal,
             BlockKind.SHEET_ROWS,
             chunk.content,
-            BlockLocator(location),
+            BlockLocator(
+                location,
+                sheet=sheet,
+                row_start=int(start),
+                row_end=int(end),
+            ),
             family,
+            title=sheet,
         )
 
     if family == DocumentFamily.TEXT:
         match = _LINE_LOCATION.match(location)
-        start = int(match.group(1)) if match else None
-        end = int(match.group(2)) if match else None
+        if not match:
+            return _generic_block(family, chunk)
         return DocumentBlock(
             chunk.ordinal,
             BlockKind.TEXT_RANGE,
             chunk.content,
-            BlockLocator(location, line_start=start, line_end=end),
+            BlockLocator(
+                location,
+                line_start=int(match.group(1)),
+                line_end=int(match.group(2)),
+            ),
             family,
         )
 
     if family == DocumentFamily.WRITER:
         match = _WRITER_LOCATION.match(location)
-        start = int(match.group(1)) if match else None
-        end = int(match.group(2)) if match else None
+        if not match:
+            return _generic_block(family, chunk)
         return DocumentBlock(
             chunk.ordinal,
             BlockKind.WRITER_BLOCK,
             chunk.content,
-            BlockLocator(location, block_start=start, block_end=end),
+            BlockLocator(
+                location,
+                block_start=int(match.group(1)),
+                block_end=int(match.group(2)),
+            ),
             family,
         )
 
-    return DocumentBlock(
-        chunk.ordinal,
-        BlockKind.GENERIC,
-        chunk.content,
-        BlockLocator(location),
-        family,
-    )
+    return _generic_block(family, chunk)
