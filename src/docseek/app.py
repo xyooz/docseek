@@ -2,11 +2,17 @@ from __future__ import annotations
 
 import sys
 
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QAction
-from PySide6.QtWidgets import QApplication, QMenu, QToolButton
+from PySide6.QtWidgets import QApplication, QHeaderView, QMenu, QToolButton
 
 from . import app_base
+from .results_layout import (
+    DEFAULT_COLUMN_WIDTHS,
+    RESULTS_HEADER_STATE_KEY,
+    decode_header_state,
+    encode_header_state,
+)
 from .search_help import SearchHelpDialog
 from .search_presets import SearchState, SearchStateStore, search_state_label
 from .search_session import close_persistent_search_stores
@@ -29,10 +35,11 @@ empty_result_html = app_base.empty_result_html
 
 
 class MainWindow(app_base.MainWindow):
-    """Desktop window with persisted recent and saved searches."""
+    """Desktop window with persisted product-level search preferences."""
 
     HISTORY_DELAY_MS = 1200
     SEARCH_SHUTDOWN_TIMEOUT_MS = 10_000
+    RESULTS_LAYOUT_SAVE_DELAY_MS = 350
 
     def __init__(self) -> None:
         self._history_ui_ready = False
@@ -51,6 +58,7 @@ class MainWindow(app_base.MainWindow):
         self.history_record_timer.timeout.connect(self._record_history_candidate)
 
         self._install_search_state_controls()
+        self._install_results_layout()
         self.search_input.textChanged.connect(self._refresh_saved_button)
         self.type_filter.currentIndexChanged.connect(self._refresh_saved_button)
         self.sort_filter.currentIndexChanged.connect(self._refresh_saved_button)
@@ -59,7 +67,10 @@ class MainWindow(app_base.MainWindow):
         self._refresh_saved_button()
 
     def closeEvent(self, event) -> None:  # noqa: N802
-        """Finish in-flight searches and release persistent SQLite handles."""
+        """Persist UI state, finish searches and release SQLite handles."""
+        if hasattr(self, "results_layout_timer"):
+            self.results_layout_timer.stop()
+            self._save_results_layout()
         if hasattr(self, "history_record_timer"):
             self.history_record_timer.stop()
         self.search_timer.stop()
@@ -107,6 +118,88 @@ class MainWindow(app_base.MainWindow):
         help_action.triggered.connect(self._show_search_help)
         self.addAction(help_action)
         self.search_help_action = help_action
+
+    def _install_results_layout(self) -> None:
+        """Make result columns user-adjustable and restore the last layout."""
+        header = self.results.horizontalHeader()
+        header.setSectionsMovable(True)
+        header.setStretchLastSection(False)
+        header.setMinimumSectionSize(44)
+
+        for section, width in enumerate(DEFAULT_COLUMN_WIDTHS):
+            header.setSectionResizeMode(section, QHeaderView.Interactive)
+            header.resizeSection(section, width)
+
+        saved = decode_header_state(self.database._get_setting(RESULTS_HEADER_STATE_KEY))
+        if saved is not None:
+            header.restoreState(saved)
+            # Saved states from Qt also include resize modes. Keep all columns
+            # interactive so restored widths remain user-adjustable.
+            for section in range(header.count()):
+                header.setSectionResizeMode(section, QHeaderView.Interactive)
+
+        # The filename column is the one invariant: a result table without it
+        # is too easy to make unusable by accident.
+        header.setSectionHidden(0, False)
+
+        self.results_layout_timer = QTimer(self)
+        self.results_layout_timer.setSingleShot(True)
+        self.results_layout_timer.setInterval(self.RESULTS_LAYOUT_SAVE_DELAY_MS)
+        self.results_layout_timer.timeout.connect(self._save_results_layout)
+        header.sectionResized.connect(lambda *_args: self.results_layout_timer.start())
+        header.sectionMoved.connect(lambda *_args: self.results_layout_timer.start())
+
+        header.setContextMenuPolicy(Qt.CustomContextMenu)
+        header.customContextMenuRequested.connect(self._show_results_header_menu)
+
+    def _save_results_layout(self) -> None:
+        state = encode_header_state(self.results.horizontalHeader().saveState())
+        self.database._set_setting(RESULTS_HEADER_STATE_KEY, state)
+
+    def _set_result_column_visible(self, section: int, visible: bool) -> None:
+        if section == 0:
+            visible = True
+        self.results.horizontalHeader().setSectionHidden(section, not visible)
+        self.results_layout_timer.stop()
+        self._save_results_layout()
+
+    def _show_results_header_menu(self, point) -> None:
+        header = self.results.horizontalHeader()
+        menu = QMenu(self)
+        menu.addSection("显示列")
+        for section, label in enumerate(self.results_model.HEADERS):
+            action = menu.addAction(label)
+            action.setCheckable(True)
+            action.setChecked(not header.isSectionHidden(section))
+            if section == 0:
+                action.setEnabled(False)
+            else:
+                action.toggled.connect(
+                    lambda checked, current=section: self._set_result_column_visible(
+                        current, checked
+                    )
+                )
+        menu.addSeparator()
+        menu.addAction("恢复默认列布局", self._reset_results_layout)
+        menu.exec(header.mapToGlobal(point))
+
+    def _reset_results_layout(self) -> None:
+        header = self.results.horizontalHeader()
+        self.results_layout_timer.stop()
+        for section in range(header.count()):
+            header.setSectionHidden(section, False)
+            header.setSectionResizeMode(section, QHeaderView.Interactive)
+
+        # Restore logical column order even after arbitrary user moves.
+        for logical_index in range(header.count()):
+            visual_index = header.visualIndex(logical_index)
+            if visual_index != logical_index:
+                header.moveSection(visual_index, logical_index)
+
+        for section, width in enumerate(DEFAULT_COLUMN_WIDTHS):
+            header.resizeSection(section, width)
+        self._save_results_layout()
+        self.statusBar().showMessage("已恢复默认列布局", 3000)
 
     def _show_search_help(self, *_args) -> None:
         SearchHelpDialog(self).exec()
