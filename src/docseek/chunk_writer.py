@@ -126,6 +126,9 @@ class ChunkBatchWriter:
                 raise RuntimeError(f"无法为索引文件分配 file_id：{path}")
 
             self.store._delete_chunks(conn, path, file_id=file_id)
+            # The filename is identical for every chunk in this document.
+            # Tokenize it once instead of once per PDF page / Excel chunk.
+            filename_tokens = self.store._cjk_bigrams(filename)
             for chunk in chunks:
                 document_text_chars += len(chunk.content)
                 cursor = conn.execute(
@@ -141,7 +144,22 @@ class ChunkBatchWriter:
                     ),
                 )
                 chunk_id = int(cursor.lastrowid)
-                self.store._insert_fts_rows(conn, chunk_id, filename, chunk.content)
+                conn.execute(
+                    "INSERT INTO chunk_index(rowid, filename, content) VALUES (?, ?, ?)",
+                    (chunk_id, filename, chunk.content),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO chunk_index_cjk2(
+                        rowid, filename_tokens, content_tokens
+                    ) VALUES (?, ?, ?)
+                    """,
+                    (
+                        chunk_id,
+                        filename_tokens,
+                        self.store._cjk_bigrams(chunk.content),
+                    ),
+                )
                 count += 1
         except Exception:
             conn.execute(f"ROLLBACK TO {savepoint}")
