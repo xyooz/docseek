@@ -205,6 +205,7 @@ class DirectoryIndexer:
         stats: IndexStats,
         *,
         on_progress: Callable[[Path, IndexStats], None] | None = None,
+        on_detail: Callable[[Path, str, int], None] | None = None,
         prefetched_state: tuple[float, int, bool] | None = None,
         state_prefetched: bool = False,
         writer: ChunkBatchWriter | None = None,
@@ -249,6 +250,12 @@ class DirectoryIndexer:
         if on_progress:
             on_progress(path, stats)
 
+        def report_detail(location: str, current: int) -> None:
+            if self._cancel.is_set():
+                raise IndexCancelled()
+            if on_detail:
+                on_detail(path, location, current)
+
         replace = writer.replace_document if writer is not None else self.chunk_store.replace_document
         chunk_count = replace(
             path=normalized,
@@ -256,7 +263,10 @@ class DirectoryIndexer:
             extension=path.suffix.lower(),
             modified_time=stat.st_mtime,
             size=stat.st_size,
-            chunks=iter_document_chunks(path),
+            chunks=iter_document_chunks(
+                path,
+                on_progress=report_detail if on_detail or path.suffix.lower() == ".xlsx" else None,
+            ),
         )
         if clear_issue:
             self.issues.clear(normalized)
@@ -269,6 +279,7 @@ class DirectoryIndexer:
         paths: Iterable[Path],
         *,
         on_progress: Callable[[Path, IndexStats], None] | None = None,
+        on_detail: Callable[[Path, str, int], None] | None = None,
     ) -> IndexStats:
         """Update only the changed filesystem paths reported by the watcher."""
         stats = IndexStats()
@@ -308,6 +319,7 @@ class DirectoryIndexer:
                     normalized,
                     stats,
                     on_progress=on_progress,
+                    on_detail=on_detail,
                 )
             except IndexCancelled:
                 raise
@@ -325,6 +337,7 @@ class DirectoryIndexer:
         root: Path,
         *,
         on_progress: Callable[[Path, IndexStats], None] | None = None,
+        on_detail: Callable[[Path, str, int], None] | None = None,
     ) -> IndexStats:
         root = root.resolve()
         stats = IndexStats()
@@ -352,6 +365,7 @@ class DirectoryIndexer:
                         normalized,
                         stats,
                         on_progress=on_progress,
+                        on_detail=on_detail,
                         prefetched_state=index_state.get(normalized),
                         state_prefetched=True,
                         writer=writer,
