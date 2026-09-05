@@ -119,17 +119,19 @@ class MetadataPrefilterSearchEngine:
                     c.id AS chunk_id,
                     c.ordinal,
                     c.location,
+                    ef.id AS file_id,
                     ef.path,
                     ef.filename,
                     ef.extension,
                     ef.modified_time,
                     ef.size
                 FROM eligible_files ef
-                JOIN chunks c ON c.path = ef.path
+                JOIN chunks c ON c.file_id = ef.id
             ),
             hits AS (
                 SELECT
                     ec.chunk_id,
+                    ec.file_id,
                     ec.path,
                     ec.filename,
                     ec.extension,
@@ -149,21 +151,21 @@ class MetadataPrefilterSearchEngine:
                     *,
                     bm25_score + filename_boost AS relevance_score,
                     ROW_NUMBER() OVER (
-                        PARTITION BY path
+                        PARTITION BY file_id
                         ORDER BY bm25_score + filename_boost ASC, ordinal ASC
                     ) AS file_rank
                 FROM hits
             ),
             file_hits AS (
                 SELECT
-                    chunk_id, path, filename, extension, modified_time, size,
+                    chunk_id, file_id, path, filename, extension, modified_time, size,
                     ordinal, location, relevance_score
                 FROM ranked
                 WHERE file_rank = 1
             ),
             paged AS (
                 SELECT
-                    chunk_id, path, filename, extension, modified_time, size,
+                    chunk_id, file_id, path, filename, extension, modified_time, size,
                     ordinal, location, relevance_score,
                     COUNT(*) OVER() AS total_count
                 FROM file_hits
@@ -257,16 +259,16 @@ class MetadataPrefilterSearchEngine:
         where = " AND ".join(clauses) or "1"
         sql = f"""
             WITH eligible_files AS MATERIALIZED (
-                SELECT f.id, f.path
+                SELECT f.id
                 FROM files f
                 WHERE {where}
             ),
             eligible_chunks AS MATERIALIZED (
-                SELECT c.id AS chunk_id, ef.path
+                SELECT c.id AS chunk_id, ef.id AS file_id
                 FROM eligible_files ef
-                JOIN chunks c ON c.path = ef.path
+                JOIN chunks c ON c.file_id = ef.id
             )
-            SELECT COUNT(DISTINCT ec.path) AS n
+            SELECT COUNT(DISTINCT ec.file_id) AS n
             FROM eligible_chunks ec
             CROSS JOIN {table}
             WHERE {table}.rowid = ec.chunk_id
