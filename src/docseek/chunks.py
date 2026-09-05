@@ -132,6 +132,27 @@ def _iter_docx_chunks(path: Path, *, target_chars: int) -> Iterator[DocumentChun
         yield chunk
 
 
+def _xlsx_row_text(row: tuple[object, ...]) -> str:
+    """Render one Excel row without shifting later columns to the left.
+
+    Empty cells between populated cells are represented by empty tab fields.
+    Trailing empty cells are removed so a wide formatted worksheet does not
+    generate enormous runs of meaningless separators.
+    """
+    cells = ["" if value is None else str(value) for value in row]
+    while cells and not cells[-1]:
+        cells.pop()
+    if not cells or not any(cells):
+        return ""
+    return "\t".join(cells)
+
+
+def _xlsx_chunk_content(sheet_title: str, rows: list[str]) -> str:
+    # Sheet names are useful business context (e.g. “客户明细”/“逾期清单”) and
+    # should be searchable even when they do not appear inside worksheet cells.
+    return f"工作表: {sheet_title}\n" + "\n".join(rows)
+
+
 def _iter_xlsx_chunks(path: Path, *, rows_per_chunk: int) -> Iterator[DocumentChunk]:
     workbook = load_workbook(path, read_only=True, data_only=True)
     ordinal = 0
@@ -141,17 +162,17 @@ def _iter_xlsx_chunks(path: Path, *, rows_per_chunk: int) -> Iterator[DocumentCh
             first_row = 1
             last_row = 0
             for row_no, row in enumerate(worksheet.iter_rows(values_only=True), start=1):
-                values = [str(value) for value in row if value is not None]
-                if values:
+                row_text = _xlsx_row_text(row)
+                if row_text:
                     if not buffer:
                         first_row = row_no
-                    buffer.append("\t".join(values))
+                    buffer.append(row_text)
                     last_row = row_no
                 if buffer and len(buffer) >= rows_per_chunk:
                     yield DocumentChunk(
                         ordinal,
                         f"工作表 {worksheet.title} · 行 {first_row}-{last_row}",
-                        "\n".join(buffer),
+                        _xlsx_chunk_content(worksheet.title, buffer),
                     )
                     ordinal += 1
                     buffer = []
@@ -159,7 +180,7 @@ def _iter_xlsx_chunks(path: Path, *, rows_per_chunk: int) -> Iterator[DocumentCh
                 yield DocumentChunk(
                     ordinal,
                     f"工作表 {worksheet.title} · 行 {first_row}-{last_row}",
-                    "\n".join(buffer),
+                    _xlsx_chunk_content(worksheet.title, buffer),
                 )
                 ordinal += 1
     finally:
