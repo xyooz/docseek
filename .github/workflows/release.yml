@@ -126,10 +126,15 @@ jobs:
           set -euo pipefail
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$TAG" release-assets/* --clobber --repo "$GITHUB_REPOSITORY"
+            gh release edit "$TAG" \
+              --prerelease \
+              --title "DocSeek $VERSION Beta" \
+              --repo "$GITHUB_REPOSITORY"
           else
             gh release create "$TAG" release-assets/* \
               --verify-tag \
               --generate-notes \
-              --title "DocSeek $VERSION" \
+              --prerelease \
+              --title "DocSeek $VERSION Beta" \
               --repo "$GITHUB_REPOSITORY"
           fi
