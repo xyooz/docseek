@@ -65,13 +65,24 @@ def peak_rss_bytes() -> int:
 
         counters = PROCESS_MEMORY_COUNTERS()
         counters.cb = ctypes.sizeof(counters)
-        process = ctypes.windll.kernel32.GetCurrentProcess()
-        ok = ctypes.windll.psapi.GetProcessMemoryInfo(
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        psapi = ctypes.WinDLL("psapi", use_last_error=True)
+        kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+        psapi.GetProcessMemoryInfo.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(PROCESS_MEMORY_COUNTERS),
+            ctypes.c_ulong,
+        ]
+        psapi.GetProcessMemoryInfo.restype = ctypes.c_int
+        process = kernel32.GetCurrentProcess()
+        ok = psapi.GetProcessMemoryInfo(
             process,
             ctypes.byref(counters),
             counters.cb,
         )
-        return int(counters.PeakWorkingSetSize) if ok else 0
+        if not ok:
+            raise OSError(ctypes.get_last_error(), "GetProcessMemoryInfo failed")
+        return int(counters.PeakWorkingSetSize)
 
     try:
         import resource
