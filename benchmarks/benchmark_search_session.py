@@ -52,6 +52,7 @@ def main() -> None:
     parser.add_argument("--files", type=int, default=1000)
     parser.add_argument("--chunks", type=int, default=3)
     parser.add_argument("--payload-kb", type=int, default=4)
+    parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--iterations", type=int, default=5)
     parser.add_argument("--limit", type=int, default=100)
     parser.add_argument("--queries", nargs="*", default=DEFAULT_QUERIES)
@@ -64,7 +65,7 @@ def main() -> None:
             files=args.files,
             chunks_per_file=args.chunks,
             payload_kb=args.payload_kb,
-            batch_size=32,
+            batch_size=args.batch_size,
         )
 
         regular = ChunkStore(db_path)
@@ -74,7 +75,7 @@ def main() -> None:
             print("DocSeek persistent exact-search benchmark")
             print(
                 f"files={args.files:,} chunks/file={args.chunks} payload/chunk~={args.payload_kb}KiB "
-                f"page={args.limit}"
+                f"batch={args.batch_size} page={args.limit}"
             )
             source_mib = logical_source_bytes / (1024 * 1024)
             db_mib = database_bytes / (1024 * 1024)
