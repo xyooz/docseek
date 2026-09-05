@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator
+from typing import Callable, Iterator
 
 import pymupdf
 from docx import Document
@@ -18,6 +18,8 @@ class DocumentChunk:
 
 
 TEXT_EXTENSIONS = {".txt", ".md", ".log", ".csv"}
+XLSX_PROGRESS_ROW_INTERVAL = 1_000
+ChunkProgressCallback = Callable[[str, int], None]
 
 
 def iter_document_chunks(
@@ -25,15 +27,26 @@ def iter_document_chunks(
     *,
     target_chars: int = 12_000,
     xlsx_rows_per_chunk: int = 200,
+    on_progress: ChunkProgressCallback | None = None,
 ) -> Iterator[DocumentChunk]:
-    """Yield bounded, location-aware chunks without building one giant body string."""
+    """Yield bounded, location-aware chunks without building one giant body string.
+
+    XLSX callers may provide ``on_progress`` to receive lightweight streaming
+    row progress. The callback is invoked at a bounded cadence while the same
+    read-only worksheet iterator is already being consumed, so progress
+    reporting does not require a second workbook pass or retain worksheet rows.
+    """
     suffix = path.suffix.lower()
     if suffix in TEXT_EXTENSIONS:
         yield from _iter_text_chunks(path, target_chars=target_chars)
     elif suffix == ".docx":
         yield from _iter_docx_chunks(path, target_chars=target_chars)
     elif suffix == ".xlsx":
-        yield from _iter_xlsx_chunks(path, rows_per_chunk=xlsx_rows_per_chunk)
+        yield from _iter_xlsx_chunks(
+            path,
+            rows_per_chunk=xlsx_rows_per_chunk,
+            on_progress=on_progress,
+        )
     elif suffix == ".pptx":
         yield from _iter_pptx_chunks(path)
     elif suffix == ".pdf":
@@ -153,7 +166,12 @@ def _xlsx_chunk_content(sheet_title: str, rows: list[str]) -> str:
     return f"工作表: {sheet_title}\n" + "\n".join(rows)
 
 
-def _iter_xlsx_chunks(path: Path, *, rows_per_chunk: int) -> Iterator[DocumentChunk]:
+def _iter_xlsx_chunks(
+    path: Path,
+    *,
+    rows_per_chunk: int,
+    on_progress: ChunkProgressCallback | None = None,
+) -> Iterator[DocumentChunk]:
     workbook = load_workbook(path, read_only=True, data_only=True)
     ordinal = 0
     try:
@@ -161,7 +179,10 @@ def _iter_xlsx_chunks(path: Path, *, rows_per_chunk: int) -> Iterator[DocumentCh
             buffer: list[str] = []
             first_row = 1
             last_row = 0
+            processed_row = 0
+            progress_label = f"工作表 {worksheet.title}"
             for row_no, row in enumerate(worksheet.iter_rows(values_only=True), start=1):
+                processed_row = row_no
                 row_text = _xlsx_row_text(row)
                 if row_text:
                     if not buffer:
@@ -176,6 +197,8 @@ def _iter_xlsx_chunks(path: Path, *, rows_per_chunk: int) -> Iterator[DocumentCh
                     )
                     ordinal += 1
                     buffer = []
+                if on_progress and row_no % XLSX_PROGRESS_ROW_INTERVAL == 0:
+                    on_progress(progress_label, row_no)
             if buffer:
                 yield DocumentChunk(
                     ordinal,
@@ -183,6 +206,12 @@ def _iter_xlsx_chunks(path: Path, *, rows_per_chunk: int) -> Iterator[DocumentCh
                     _xlsx_chunk_content(worksheet.title, buffer),
                 )
                 ordinal += 1
+            if (
+                on_progress
+                and processed_row > 0
+                and processed_row % XLSX_PROGRESS_ROW_INTERVAL != 0
+            ):
+                on_progress(progress_label, processed_row)
     finally:
         workbook.close()
 
