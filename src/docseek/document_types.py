@@ -15,6 +15,7 @@ class DocumentFamily(StrEnum):
 class SupportMode(StrEnum):
     DIRECT = "direct"
     CALAMINE = "calamine"
+    TIKA_NATIVE = "tika-native"
     WPS_LOCAL = "wps-local"
 
 
@@ -45,36 +46,78 @@ _FORMATS = (
         ".pptx", DocumentFamily.PRESENTATION, (SupportMode.DIRECT,), "PowerPoint / WPS Presentation"
     ),
     FormatCapability(".pdf", DocumentFamily.PDF, (SupportMode.DIRECT,), "PDF"),
-    # Mature Rust-backed spreadsheet parsing is preferred for legacy/binary and
-    # OpenDocument workbooks. WPS remains a local fallback for .xls where the
-    # client is available, but DocSeek does not implement the binary format.
+    # Calamine preserves spreadsheet row/sheet structure and is therefore the
+    # preferred mature backend for legacy/binary/OpenDocument workbooks. Native
+    # Tika is a broad compatibility fallback; WPS is the final vendor fallback.
     FormatCapability(
         ".xls",
         DocumentFamily.SPREADSHEET,
-        (SupportMode.CALAMINE, SupportMode.WPS_LOCAL),
+        (SupportMode.CALAMINE, SupportMode.TIKA_NATIVE, SupportMode.WPS_LOCAL),
         "Excel 97-2003",
     ),
     FormatCapability(
         ".xlsb", DocumentFamily.SPREADSHEET, (SupportMode.CALAMINE,), "Excel Binary Workbook"
     ),
     FormatCapability(
-        ".ods", DocumentFamily.SPREADSHEET, (SupportMode.CALAMINE,), "OpenDocument Spreadsheet"
+        ".ods",
+        DocumentFamily.SPREADSHEET,
+        (SupportMode.CALAMINE, SupportMode.TIKA_NATIVE),
+        "OpenDocument Spreadsheet",
     ),
-    # WPS native and legacy Writer/Presentation formats use the installed WPS
-    # client as a thin local compatibility bridge. They are known formats, not
-    # unconditional support claims: runtime availability is checked separately.
+    # Native Tika gives broad local compatibility for older Writer/Presentation
+    # formats without requiring a Java service. Because it may expose only flat
+    # text for some legacy files, DocIR will mark those chunks as generic rather
+    # than inventing page/slide/table structure.
+    FormatCapability(
+        ".doc",
+        DocumentFamily.WRITER,
+        (SupportMode.TIKA_NATIVE, SupportMode.WPS_LOCAL),
+        "Word 97-2003",
+    ),
+    FormatCapability(
+        ".dot",
+        DocumentFamily.WRITER,
+        (SupportMode.TIKA_NATIVE, SupportMode.WPS_LOCAL),
+        "Word Template",
+    ),
+    FormatCapability(
+        ".rtf",
+        DocumentFamily.WRITER,
+        (SupportMode.TIKA_NATIVE, SupportMode.WPS_LOCAL),
+        "Rich Text Format",
+    ),
+    FormatCapability(
+        ".odt", DocumentFamily.WRITER, (SupportMode.TIKA_NATIVE,), "OpenDocument Text"
+    ),
+    FormatCapability(
+        ".ppt",
+        DocumentFamily.PRESENTATION,
+        (SupportMode.TIKA_NATIVE, SupportMode.WPS_LOCAL),
+        "PowerPoint 97-2003",
+    ),
+    FormatCapability(
+        ".pps",
+        DocumentFamily.PRESENTATION,
+        (SupportMode.TIKA_NATIVE, SupportMode.WPS_LOCAL),
+        "PowerPoint Show",
+    ),
+    FormatCapability(
+        ".odp", DocumentFamily.PRESENTATION, (SupportMode.TIKA_NATIVE,), "OpenDocument Presentation"
+    ),
+    # Kingsoft-native formats deliberately remain vendor/system-plugin territory.
+    # DocSeek does not implement their proprietary binary formats.
     FormatCapability(".wps", DocumentFamily.WRITER, (SupportMode.WPS_LOCAL,), "WPS Writer"),
     FormatCapability(".wpt", DocumentFamily.WRITER, (SupportMode.WPS_LOCAL,), "WPS Writer Template"),
-    FormatCapability(".doc", DocumentFamily.WRITER, (SupportMode.WPS_LOCAL,), "Word 97-2003"),
-    FormatCapability(".dot", DocumentFamily.WRITER, (SupportMode.WPS_LOCAL,), "Word Template"),
-    FormatCapability(".rtf", DocumentFamily.WRITER, (SupportMode.WPS_LOCAL,), "Rich Text Format"),
     FormatCapability(".et", DocumentFamily.SPREADSHEET, (SupportMode.WPS_LOCAL,), "WPS Spreadsheet"),
     FormatCapability(".ett", DocumentFamily.SPREADSHEET, (SupportMode.WPS_LOCAL,), "WPS Spreadsheet Template"),
-    FormatCapability(".xlt", DocumentFamily.SPREADSHEET, (SupportMode.WPS_LOCAL,), "Excel Template"),
+    FormatCapability(
+        ".xlt",
+        DocumentFamily.SPREADSHEET,
+        (SupportMode.TIKA_NATIVE, SupportMode.WPS_LOCAL),
+        "Excel Template",
+    ),
     FormatCapability(".dps", DocumentFamily.PRESENTATION, (SupportMode.WPS_LOCAL,), "WPS Presentation"),
     FormatCapability(".dpt", DocumentFamily.PRESENTATION, (SupportMode.WPS_LOCAL,), "WPS Presentation Template"),
-    FormatCapability(".ppt", DocumentFamily.PRESENTATION, (SupportMode.WPS_LOCAL,), "PowerPoint 97-2003"),
-    FormatCapability(".pps", DocumentFamily.PRESENTATION, (SupportMode.WPS_LOCAL,), "PowerPoint Show"),
 )
 
 FORMAT_CAPABILITIES = {capability.extension: capability for capability in _FORMATS}
@@ -88,6 +131,11 @@ CALAMINE_CANDIDATE_EXTENSIONS = frozenset(
     capability.extension
     for capability in _FORMATS
     if SupportMode.CALAMINE in capability.modes
+)
+TIKA_NATIVE_CANDIDATE_EXTENSIONS = frozenset(
+    capability.extension
+    for capability in _FORMATS
+    if SupportMode.TIKA_NATIVE in capability.modes
 )
 WPS_LOCAL_CANDIDATE_EXTENSIONS = frozenset(
     capability.extension
