@@ -7,7 +7,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, QTimer, Signal
+from PySide6.QtCore import QEvent, QObject, QRunnable, Qt, QThreadPool, QTimer, Signal
 from PySide6.QtGui import QAction, QGuiApplication
 from PySide6.QtWidgets import (
     QApplication,
@@ -61,6 +61,13 @@ def split_index_progress_display(path: str) -> tuple[str, str]:
         filename, detail = path.split(" · ", 1)
         return filename, detail
     return Path(path).name, ""
+
+
+def result_entry_row(row_count: int, *, move_down: bool) -> int | None:
+    """Choose the row entered when moving from the search box into results."""
+    if row_count <= 0:
+        return None
+    return 0 if move_down else row_count - 1
 
 
 class IndexSignals(QObject):
@@ -167,7 +174,8 @@ class MainWindow(QMainWindow):
         )
         self.search_input.setToolTip(
             "支持：ext:pdf 类型 · path:制度 路径 · after:2026-01-01 / before:2026-09-01 日期 · "
-            "size:>10MB 大小 · 引号用于短语；筛选条件可单独使用"
+            "size:>10MB 大小 · 引号用于短语；筛选条件可单独使用\n"
+            "快捷键：↑/↓ 进入结果 · Enter 搜索/打开 · Esc 清空搜索"
         )
         self.search_input.setMinimumHeight(38)
 
@@ -306,6 +314,8 @@ class MainWindow(QMainWindow):
         self.results.itemSelectionChanged.connect(self._show_preview)
         self.results.customContextMenuRequested.connect(self._show_context_menu)
         self.results.verticalScrollBar().valueChanged.connect(self._on_results_scroll)
+        self.search_input.installEventFilter(self)
+        self.results.installEventFilter(self)
 
         open_action = QAction("打开", self)
         open_action.setShortcut("Ctrl+O")
@@ -327,6 +337,38 @@ class MainWindow(QMainWindow):
         self._refresh_status()
         self._restart_watcher()
         self.search_input.setFocus()
+
+    def eventFilter(self, watched, event) -> bool:  # noqa: N802
+        if event.type() == QEvent.KeyPress:
+            key = event.key()
+
+            if watched is self.search_input and key in (Qt.Key_Down, Qt.Key_Up):
+                row = result_entry_row(
+                    self.results.rowCount(), move_down=key == Qt.Key_Down
+                )
+                if row is not None:
+                    self.results.setCurrentCell(row, 0)
+                    self.results.selectRow(row)
+                    item = self.results.item(row, 0)
+                    if item is not None:
+                        self.results.scrollToItem(item)
+                    self.results.setFocus()
+                    return True
+
+            if watched is self.results and key in (Qt.Key_Return, Qt.Key_Enter):
+                self._open_selected()
+                return True
+
+            if watched is self.results and key == Qt.Key_Up and self.results.currentRow() <= 0:
+                self.search_input.setFocus()
+                self.search_input.setCursorPosition(len(self.search_input.text()))
+                return True
+
+            if watched in (self.search_input, self.results) and key == Qt.Key_Escape:
+                self._clear_search()
+                return True
+
+        return super().eventFilter(watched, event)
 
     def closeEvent(self, event) -> None:  # noqa: N802
         self.search_generation += 1
@@ -517,6 +559,22 @@ class MainWindow(QMainWindow):
         updated = remove_query_filter(self.search_input.text(), key)
         self.search_input.setText(updated)
         self.search_input.setCursorPosition(len(updated))
+        self.search_input.setFocus()
+
+    def _clear_search(self) -> None:
+        """Clear text and the explicit type selector without firing duplicate searches."""
+        self.search_timer.stop()
+        search_signals_were_blocked = self.search_input.blockSignals(True)
+        type_signals_were_blocked = self.type_filter.blockSignals(True)
+        try:
+            self.search_input.clear()
+            self.type_filter.setCurrentIndex(0)
+        finally:
+            self.search_input.blockSignals(search_signals_were_blocked)
+            self.type_filter.blockSignals(type_signals_were_blocked)
+
+        self._refresh_filter_chips()
+        self._perform_search()
         self.search_input.setFocus()
 
     def _perform_search(self) -> None:
