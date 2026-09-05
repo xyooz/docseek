@@ -9,6 +9,7 @@ from typing import Callable, Iterable
 from .chunk_store import ChunkStore
 from .chunk_writer import ChunkBatchWriter
 from .chunks import iter_document_chunks
+from .extraction_revision import current_extraction_revision
 from .extractors import SUPPORTED_EXTENSIONS
 from .index_cleanup import remove_missing_under_root
 from .index_issues import IndexIssueStore
@@ -138,18 +139,37 @@ class DirectoryIndexer:
             row = conn.execute("SELECT 1 FROM files WHERE path = ? LIMIT 1", (path,)).fetchone()
         return row is not None
 
-    def _is_unchanged(self, path: str, *, modified_time: float, size: int) -> bool:
+    def _is_unchanged(
+        self,
+        path: str,
+        *,
+        modified_time: float,
+        size: int,
+        extraction_revision: int,
+    ) -> bool:
         with self.chunk_store.connect() as conn:
             row = conn.execute(
-                "SELECT modified_time, size FROM files WHERE path = ?",
+                """
+                SELECT
+                    f.modified_time,
+                    f.size,
+                    COALESCE(s.revision, 0) AS extraction_revision
+                FROM files f
+                LEFT JOIN extraction_state s ON s.path = f.path
+                WHERE f.path = ?
+                """,
                 (path,),
             ).fetchone()
         if row is None:
             return False
-        return float(row["modified_time"]) == float(modified_time) and int(row["size"]) == int(size)
+        return (
+            float(row["modified_time"]) == float(modified_time)
+            and int(row["size"]) == int(size)
+            and int(row["extraction_revision"]) >= int(extraction_revision)
+        )
 
-    def _load_index_state(self) -> dict[str, tuple[float, int, bool]]:
-        """Load metadata/chunk presence once for a full reconciliation scan."""
+    def _load_index_state(self) -> dict[str, tuple[float, int, bool, int]]:
+        """Load metadata/chunk presence/revision once for a reconciliation scan."""
         with self.chunk_store.connect() as conn:
             rows = conn.execute(
                 """
@@ -160,8 +180,10 @@ class DirectoryIndexer:
                     EXISTS(
                         SELECT 1 FROM chunks c
                         WHERE c.file_id = f.id
-                    ) AS has_chunk
+                    ) AS has_chunk,
+                    COALESCE(s.revision, 0) AS extraction_revision
                 FROM files f
+                LEFT JOIN extraction_state s ON s.path = f.path
                 """
             ).fetchall()
 
@@ -170,9 +192,21 @@ class DirectoryIndexer:
                 float(row["modified_time"]),
                 int(row["size"]),
                 bool(row["has_chunk"]),
+                int(row["extraction_revision"]),
             )
             for row in rows
         }
+
+    def _record_extraction_revision(self, path: str, revision: int) -> None:
+        with self.chunk_store.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO extraction_state(path, revision)
+                VALUES (?, ?)
+                ON CONFLICT(path) DO UPDATE SET revision=excluded.revision
+                """,
+                (path, int(revision)),
+            )
 
     def _remove_indexed_path(self, path: str, stats: IndexStats) -> None:
         if self._has_file_record(path):
@@ -206,7 +240,7 @@ class DirectoryIndexer:
         *,
         on_progress: Callable[[Path, IndexStats], None] | None = None,
         on_detail: Callable[[Path, str, int], None] | None = None,
-        prefetched_state: tuple[float, int, bool] | None = None,
+        prefetched_state: tuple[float, int, bool, int] | None = None,
         state_prefetched: bool = False,
         writer: ChunkBatchWriter | None = None,
         clear_issue: bool = True,
@@ -226,11 +260,13 @@ class DirectoryIndexer:
             )
             return False
 
+        extraction_revision = current_extraction_revision(path.suffix)
         if state_prefetched:
             unchanged = (
                 prefetched_state is not None
                 and float(prefetched_state[0]) == float(stat.st_mtime)
                 and int(prefetched_state[1]) == int(stat.st_size)
+                and int(prefetched_state[3]) >= extraction_revision
             )
             has_chunk = bool(prefetched_state[2]) if prefetched_state is not None else False
         else:
@@ -238,6 +274,7 @@ class DirectoryIndexer:
                 normalized,
                 modified_time=stat.st_mtime,
                 size=stat.st_size,
+                extraction_revision=extraction_revision,
             )
             has_chunk = self._has_chunk_index(normalized) if unchanged else False
 
@@ -263,18 +300,28 @@ class DirectoryIndexer:
                 display = Path(f"{path.name} · {location} · 已读取 {current:,} 行")
                 on_progress(display, stats)
 
-        replace = writer.replace_document if writer is not None else self.chunk_store.replace_document
-        chunk_count = replace(
-            path=normalized,
-            filename=path.name,
-            extension=path.suffix.lower(),
-            modified_time=stat.st_mtime,
-            size=stat.st_size,
-            chunks=iter_document_chunks(
+        common_args = {
+            "path": normalized,
+            "filename": path.name,
+            "extension": path.suffix.lower(),
+            "modified_time": stat.st_mtime,
+            "size": stat.st_size,
+            "chunks": iter_document_chunks(
                 path,
-                on_progress=report_detail if on_detail or on_progress or path.suffix.lower() == ".xlsx" else None,
+                on_progress=report_detail
+                if on_detail or on_progress or path.suffix.lower() == ".xlsx"
+                else None,
             ),
-        )
+        }
+        if writer is not None:
+            chunk_count = writer.replace_document(
+                **common_args,
+                extraction_revision=extraction_revision,
+            )
+        else:
+            chunk_count = self.chunk_store.replace_document(**common_args)
+            self._record_extraction_revision(normalized, extraction_revision)
+
         if clear_issue:
             self.issues.clear(normalized)
         stats.indexed += 1
