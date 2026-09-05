@@ -1,0 +1,71 @@
+name: windows-portable
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "packaging/windows/**"
+      - "pyproject.toml"
+      - "src/docseek/__init__.py"
+      - ".github/workflows/windows-portable.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build-portable:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install packaging dependencies
+        run: python -m pip install -e ".[calamine,tika,wps,package]"
+
+      - name: Build portable ZIP
+        shell: pwsh
+        run: ./packaging/windows/build_portable.ps1
+
+      - name: Verify ZIP can run after extraction
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $zip = Get-ChildItem dist\DocSeek-*-Windows-x64.zip | Select-Object -First 1
+          if (-not $zip) { throw "Portable ZIP was not found" }
+
+          $verifyRoot = Join-Path $env:RUNNER_TEMP "docseek-portable-verify"
+          if (Test-Path $verifyRoot) { Remove-Item -Recurse -Force $verifyRoot }
+          New-Item -ItemType Directory -Path $verifyRoot | Out-Null
+          Expand-Archive -Path $zip.FullName -DestinationPath $verifyRoot
+
+          $exe = Join-Path $verifyRoot "DocSeek.exe"
+          if (-not (Test-Path $exe)) { throw "Extracted DocSeek.exe was not found" }
+
+          $env:DOCSEEK_FROZEN_SMOKE = "1"
+          try {
+            $process = Start-Process -FilePath $exe -Wait -PassThru
+            if ($process.ExitCode -ne 0) {
+              throw "Extracted portable smoke failed with exit code $($process.ExitCode)"
+            }
+          }
+          finally {
+            Remove-Item Env:DOCSEEK_FROZEN_SMOKE -ErrorAction SilentlyContinue
+          }
+
+      - name: Report artifact
+        shell: pwsh
+        run: |
+          $zip = Get-ChildItem dist\DocSeek-*-Windows-x64.zip | Select-Object -First 1
+          $sizeMiB = [Math]::Round($zip.Length / 1MB, 1)
+          Write-Host "Portable ZIP: $($zip.Name) ($sizeMiB MiB)"
+          Get-FileHash $zip.FullName -Algorithm SHA256 | Format-List
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: docseek-windows-portable
+          path: dist/DocSeek-*-Windows-x64.zip
+          if-no-files-found: error
+          retention-days: 14
