@@ -14,6 +14,7 @@ class DocumentFamily(StrEnum):
 
 class SupportMode(StrEnum):
     DIRECT = "direct"
+    CALAMINE = "calamine"
     WPS_LOCAL = "wps-local"
 
 
@@ -21,51 +22,79 @@ class SupportMode(StrEnum):
 class FormatCapability:
     extension: str
     family: DocumentFamily
-    mode: SupportMode
+    modes: tuple[SupportMode, ...]
     label: str
 
+    @property
+    def preferred_mode(self) -> SupportMode:
+        return self.modes[0]
 
-_DIRECT_FORMATS = (
-    FormatCapability(".txt", DocumentFamily.TEXT, SupportMode.DIRECT, "Text"),
-    FormatCapability(".md", DocumentFamily.TEXT, SupportMode.DIRECT, "Markdown"),
-    FormatCapability(".log", DocumentFamily.TEXT, SupportMode.DIRECT, "Log"),
-    FormatCapability(".csv", DocumentFamily.TEXT, SupportMode.DIRECT, "CSV"),
-    FormatCapability(".docx", DocumentFamily.WRITER, SupportMode.DIRECT, "Word / WPS Writer"),
-    FormatCapability(".xlsx", DocumentFamily.SPREADSHEET, SupportMode.DIRECT, "Excel / WPS Spreadsheet"),
-    FormatCapability(".pptx", DocumentFamily.PRESENTATION, SupportMode.DIRECT, "PowerPoint / WPS Presentation"),
-    FormatCapability(".pdf", DocumentFamily.PDF, SupportMode.DIRECT, "PDF"),
+
+_FORMATS = (
+    FormatCapability(".txt", DocumentFamily.TEXT, (SupportMode.DIRECT,), "Text"),
+    FormatCapability(".md", DocumentFamily.TEXT, (SupportMode.DIRECT,), "Markdown"),
+    FormatCapability(".log", DocumentFamily.TEXT, (SupportMode.DIRECT,), "Log"),
+    FormatCapability(".csv", DocumentFamily.TEXT, (SupportMode.DIRECT,), "CSV"),
+    FormatCapability(
+        ".docx", DocumentFamily.WRITER, (SupportMode.DIRECT,), "Word / WPS Writer"
+    ),
+    FormatCapability(
+        ".xlsx", DocumentFamily.SPREADSHEET, (SupportMode.DIRECT,), "Excel / WPS Spreadsheet"
+    ),
+    FormatCapability(
+        ".pptx", DocumentFamily.PRESENTATION, (SupportMode.DIRECT,), "PowerPoint / WPS Presentation"
+    ),
+    FormatCapability(".pdf", DocumentFamily.PDF, (SupportMode.DIRECT,), "PDF"),
+    # Mature Rust-backed spreadsheet parsing is preferred for legacy/binary and
+    # OpenDocument workbooks. WPS remains a local fallback for .xls where the
+    # client is available, but DocSeek does not implement the binary format.
+    FormatCapability(
+        ".xls",
+        DocumentFamily.SPREADSHEET,
+        (SupportMode.CALAMINE, SupportMode.WPS_LOCAL),
+        "Excel 97-2003",
+    ),
+    FormatCapability(
+        ".xlsb", DocumentFamily.SPREADSHEET, (SupportMode.CALAMINE,), "Excel Binary Workbook"
+    ),
+    FormatCapability(
+        ".ods", DocumentFamily.SPREADSHEET, (SupportMode.CALAMINE,), "OpenDocument Spreadsheet"
+    ),
+    # WPS native and legacy Writer/Presentation formats use the installed WPS
+    # client as a thin local compatibility bridge. They are known formats, not
+    # unconditional support claims: runtime availability is checked separately.
+    FormatCapability(".wps", DocumentFamily.WRITER, (SupportMode.WPS_LOCAL,), "WPS Writer"),
+    FormatCapability(".wpt", DocumentFamily.WRITER, (SupportMode.WPS_LOCAL,), "WPS Writer Template"),
+    FormatCapability(".doc", DocumentFamily.WRITER, (SupportMode.WPS_LOCAL,), "Word 97-2003"),
+    FormatCapability(".dot", DocumentFamily.WRITER, (SupportMode.WPS_LOCAL,), "Word Template"),
+    FormatCapability(".rtf", DocumentFamily.WRITER, (SupportMode.WPS_LOCAL,), "Rich Text Format"),
+    FormatCapability(".et", DocumentFamily.SPREADSHEET, (SupportMode.WPS_LOCAL,), "WPS Spreadsheet"),
+    FormatCapability(".ett", DocumentFamily.SPREADSHEET, (SupportMode.WPS_LOCAL,), "WPS Spreadsheet Template"),
+    FormatCapability(".xlt", DocumentFamily.SPREADSHEET, (SupportMode.WPS_LOCAL,), "Excel Template"),
+    FormatCapability(".dps", DocumentFamily.PRESENTATION, (SupportMode.WPS_LOCAL,), "WPS Presentation"),
+    FormatCapability(".dpt", DocumentFamily.PRESENTATION, (SupportMode.WPS_LOCAL,), "WPS Presentation Template"),
+    FormatCapability(".ppt", DocumentFamily.PRESENTATION, (SupportMode.WPS_LOCAL,), "PowerPoint 97-2003"),
+    FormatCapability(".pps", DocumentFamily.PRESENTATION, (SupportMode.WPS_LOCAL,), "PowerPoint Show"),
 )
 
-# These formats are deliberately registered as WPS-local candidates instead of
-# being added to DIRECT_SUPPORTED_EXTENSIONS. DocSeek must not silently claim a
-# format is indexable unless the local WPS adapter can actually handle it.
-_WPS_LOCAL_FORMATS = (
-    FormatCapability(".wps", DocumentFamily.WRITER, SupportMode.WPS_LOCAL, "WPS Writer"),
-    FormatCapability(".wpt", DocumentFamily.WRITER, SupportMode.WPS_LOCAL, "WPS Writer Template"),
-    FormatCapability(".doc", DocumentFamily.WRITER, SupportMode.WPS_LOCAL, "Word 97-2003"),
-    FormatCapability(".dot", DocumentFamily.WRITER, SupportMode.WPS_LOCAL, "Word Template"),
-    FormatCapability(".rtf", DocumentFamily.WRITER, SupportMode.WPS_LOCAL, "Rich Text Format"),
-    FormatCapability(".et", DocumentFamily.SPREADSHEET, SupportMode.WPS_LOCAL, "WPS Spreadsheet"),
-    FormatCapability(".ett", DocumentFamily.SPREADSHEET, SupportMode.WPS_LOCAL, "WPS Spreadsheet Template"),
-    FormatCapability(".xls", DocumentFamily.SPREADSHEET, SupportMode.WPS_LOCAL, "Excel 97-2003"),
-    FormatCapability(".xlt", DocumentFamily.SPREADSHEET, SupportMode.WPS_LOCAL, "Excel Template"),
-    FormatCapability(".dps", DocumentFamily.PRESENTATION, SupportMode.WPS_LOCAL, "WPS Presentation"),
-    FormatCapability(".dpt", DocumentFamily.PRESENTATION, SupportMode.WPS_LOCAL, "WPS Presentation Template"),
-    FormatCapability(".ppt", DocumentFamily.PRESENTATION, SupportMode.WPS_LOCAL, "PowerPoint 97-2003"),
-    FormatCapability(".pps", DocumentFamily.PRESENTATION, SupportMode.WPS_LOCAL, "PowerPoint Show"),
-)
-
-FORMAT_CAPABILITIES = {
-    capability.extension: capability
-    for capability in (*_DIRECT_FORMATS, *_WPS_LOCAL_FORMATS)
-}
+FORMAT_CAPABILITIES = {capability.extension: capability for capability in _FORMATS}
 
 DIRECT_SUPPORTED_EXTENSIONS = frozenset(
-    capability.extension for capability in _DIRECT_FORMATS
+    capability.extension
+    for capability in _FORMATS
+    if SupportMode.DIRECT in capability.modes
+)
+CALAMINE_CANDIDATE_EXTENSIONS = frozenset(
+    capability.extension
+    for capability in _FORMATS
+    if SupportMode.CALAMINE in capability.modes
 )
 WPS_LOCAL_CANDIDATE_EXTENSIONS = frozenset(
-    capability.extension for capability in _WPS_LOCAL_FORMATS
+    capability.extension
+    for capability in _FORMATS
+    if SupportMode.WPS_LOCAL in capability.modes
 )
+KNOWN_DOCUMENT_EXTENSIONS = frozenset(FORMAT_CAPABILITIES)
 
 
 def normalize_extension(extension: str) -> str:
