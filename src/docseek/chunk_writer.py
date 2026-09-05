@@ -19,17 +19,35 @@ class ChunkBatchWriter:
     of changed documents, but wraps each document in a SAVEPOINT so a broken
     parser or file cannot corrupt or roll back the rest of the batch.
 
+    Batches are bounded by both document count and extracted-text characters.
+    The latter matters for compressed Office files whose on-disk size can be
+    much smaller than the text written into the two FTS indexes. A single large
+    document remains atomic, but it is committed before another document is
+    added once the text budget has been crossed.
+
     The write transaction is acquired lazily. An unchanged-only reconciliation
     scan therefore does not hold SQLite's writer lock for the duration of the
     filesystem walk. Watcher-driven single-file updates intentionally keep
     using ``ChunkStore.replace_document`` for simple per-file atomicity.
     """
 
-    def __init__(self, store: ChunkStore, *, batch_size: int = 32) -> None:
+    def __init__(
+        self,
+        store: ChunkStore,
+        *,
+        batch_size: int = 32,
+        max_batch_text_chars: int | None = 8_000_000,
+    ) -> None:
         self.store = store
         self.batch_size = max(1, int(batch_size))
+        self.max_batch_text_chars = (
+            None
+            if max_batch_text_chars is None
+            else max(1, int(max_batch_text_chars))
+        )
         self.conn: sqlite3.Connection | None = None
         self.pending_documents = 0
+        self.pending_text_chars = 0
         self._savepoint_id = 0
         self._transaction_open = False
 
@@ -58,6 +76,7 @@ class ChunkBatchWriter:
         finally:
             self._transaction_open = False
             self.pending_documents = 0
+            self.pending_text_chars = 0
             conn.close()
         return False
 
@@ -68,6 +87,7 @@ class ChunkBatchWriter:
             conn.commit()
             self._transaction_open = False
         self.pending_documents = 0
+        self.pending_text_chars = 0
 
     def replace_document(
         self,
@@ -86,6 +106,7 @@ class ChunkBatchWriter:
         conn.execute(f"SAVEPOINT {savepoint}")
 
         count = 0
+        document_text_chars = 0
         try:
             conn.execute(
                 """
@@ -106,6 +127,7 @@ class ChunkBatchWriter:
 
             self.store._delete_chunks(conn, path, file_id=file_id)
             for chunk in chunks:
+                document_text_chars += len(chunk.content)
                 cursor = conn.execute(
                     """
                     INSERT INTO chunks(file_id, ordinal, location, content)
@@ -129,7 +151,13 @@ class ChunkBatchWriter:
             conn.execute(f"RELEASE {savepoint}")
 
         self.pending_documents += 1
-        if self.pending_documents >= self.batch_size:
+        self.pending_text_chars += document_text_chars
+        hit_document_limit = self.pending_documents >= self.batch_size
+        hit_text_limit = (
+            self.max_batch_text_chars is not None
+            and self.pending_text_chars >= self.max_batch_text_chars
+        )
+        if hit_document_limit or hit_text_limit:
             self.flush()
         return count
 
