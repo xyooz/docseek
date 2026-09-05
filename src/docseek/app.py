@@ -1,839 +1,236 @@
 from __future__ import annotations
 
-import html
-import os
-import subprocess
 import sys
-from pathlib import Path
 
-from PySide6.QtCore import QEvent, QObject, QRunnable, Qt, QThreadPool, QTimer, Signal
-from PySide6.QtGui import QAction, QGuiApplication
-from PySide6.QtWidgets import (
-    QAbstractItemView,
-    QApplication,
-    QComboBox,
-    QFileDialog,
-    QHBoxLayout,
-    QHeaderView,
-    QLabel,
-    QLineEdit,
-    QMainWindow,
-    QMenu,
-    QProgressBar,
-    QPushButton,
-    QSplitter,
-    QStatusBar,
-    QTableView,
-    QTextBrowser,
-    QToolButton,
-    QVBoxLayout,
-    QWidget,
-)
+from PySide6.QtCore import QTimer
+from PySide6.QtWidgets import QApplication, QMenu, QToolButton
 
-from .chunk_store import ChunkStore
-from .indexer import DirectoryIndexer, IndexCancelled, IndexStats
-from .query_parser import parse_query, query_filter_chips, remove_query_filter
-from .results_model import SearchResultsModel
-from .search_db import SearchDatabase
-from .search_sort import SORT_FILENAME, SORT_MODIFIED, SORT_RELEVANCE
-from .search_worker import SearchRequest, SearchResponse, SearchWorker
-from .settings_dialog import IndexSettingsDialog
-from .watcher import WatchBatch, WatchManager
+from . import app_base
+from .search_presets import SearchState, SearchStateStore, search_state_label
+from .search_sort import SORT_RELEVANCE
+
+# Keep the established public helpers available from docseek.app. Existing
+# tests, scripts and users should not need to know that the stable core window
+# now lives in app_base.py.
+APP_DIR = app_base.APP_DIR
+DB_PATH = app_base.DB_PATH
+PAGE_SIZE = app_base.PAGE_SIZE
+FILE_FILTERS = app_base.FILE_FILTERS
+SORT_OPTIONS = app_base.SORT_OPTIONS
+IndexSignals = app_base.IndexSignals
+WatchSignals = app_base.WatchSignals
+IndexWorker = app_base.IndexWorker
+split_index_progress_display = app_base.split_index_progress_display
+result_entry_row = app_base.result_entry_row
+empty_result_html = app_base.empty_result_html
 
 
-APP_DIR = Path.home() / ".docseek"
-DB_PATH = APP_DIR / "docseek.db"
-PAGE_SIZE = 100
+class MainWindow(app_base.MainWindow):
+    """Desktop window with persisted recent and saved searches.
 
-FILE_FILTERS = [
-    ("全部类型", None),
-    ("PDF", ".pdf"),
-    ("Word", ".docx"),
-    ("Excel", ".xlsx"),
-    ("PowerPoint", ".pptx"),
-    ("文本", ".txt"),
-]
+    The search/index/result-view core stays in ``app_base.MainWindow``. This
+    layer only owns product-level search-state history so the new persistence
+    behavior cannot accidentally change ranking, pagination or indexing.
+    """
 
-SORT_OPTIONS = [
-    ("相关性", SORT_RELEVANCE),
-    ("最近修改", SORT_MODIFIED),
-    ("文件名", SORT_FILENAME),
-]
+    HISTORY_DELAY_MS = 1200
 
-
-def split_index_progress_display(path: str) -> tuple[str, str]:
-    """Split a normal path or XLSX row-progress display into two UI fields."""
-    marker = " · 工作表 "
-    if marker in path and " · 已读取 " in path:
-        filename, detail = path.split(" · ", 1)
-        return filename, detail
-    return Path(path).name, ""
-
-
-def result_entry_row(row_count: int, *, move_down: bool) -> int | None:
-    """Choose the row entered when moving from the search box into results."""
-    if row_count <= 0:
-        return None
-    return 0 if move_down else row_count - 1
-
-
-def empty_result_html(*, filter_only: bool) -> str:
-    """Return actionable empty-result guidance for the preview pane."""
-    if filter_only:
-        return (
-            "<h3>当前筛选没有匹配文件</h3>"
-            "<p>可以移除上方筛选条件，或调整文件类型、日期、路径和大小范围后再试。</p>"
-        )
-    return (
-        "<h3>没有找到匹配文档</h3>"
-        "<p>可以减少关键词、取消过严的引号短语，或移除部分筛选条件后再试。</p>"
-    )
-
-
-class IndexSignals(QObject):
-    progress = Signal(str, int, int)
-    finished = Signal(object)
-    cancelled = Signal()
-    failed = Signal(str)
-
-
-class WatchSignals(QObject):
-    changed = Signal(object)
-
-
-class IndexWorker(QRunnable):
-    def __init__(
-        self,
-        *,
-        db_path: Path,
-        roots: list[Path] | None = None,
-        paths: list[Path] | None = None,
-    ) -> None:
-        super().__init__()
-        self.roots = roots
-        self.paths = paths
-        self.db_path = db_path
-        self.signals = IndexSignals()
-        self.indexer: DirectoryIndexer | None = None
-
-    @property
-    def is_full_scan(self) -> bool:
-        return self.paths is None
-
-    def cancel(self) -> None:
-        if self.indexer:
-            self.indexer.cancel()
-
-    def run(self) -> None:
-        try:
-            database = SearchDatabase(self.db_path)
-            self.indexer = DirectoryIndexer(database)
-
-            if self.paths is not None:
-                stats = self.indexer.update_paths(
-                    self.paths,
-                    on_progress=lambda path, current: self.signals.progress.emit(
-                        str(path), current.scanned, current.indexed
-                    ),
-                )
-                self.signals.finished.emit(stats)
-                return
-
-            total = IndexStats()
-            for root in self.roots or []:
-                if not root.exists() or not root.is_dir():
-                    continue
-
-                def report(path: Path, stats: IndexStats) -> None:
-                    self.signals.progress.emit(
-                        str(path), total.scanned + stats.scanned, total.indexed + stats.indexed
-                    )
-
-                stats = self.indexer.scan(root, on_progress=report)
-                total.merge(stats)
-
-            self.signals.finished.emit(total)
-        except IndexCancelled:
-            self.signals.cancelled.emit()
-        except Exception as exc:
-            self.signals.failed.emit(str(exc))
-
-
-class MainWindow(QMainWindow):
     def __init__(self) -> None:
+        self._history_ui_ready = False
+        self._history_candidate_generation: int | None = None
+        self._explicit_history_generation: int | None = None
+
+        # Preserve the long-standing test/customization contract where callers
+        # patch docseek.app.DB_PATH before constructing MainWindow.
+        app_base.DB_PATH = DB_PATH
         super().__init__()
-        self.setWindowTitle("DocSeek — 本地文档全文检索")
-        self.resize(1300, 800)
 
-        self.database = SearchDatabase(DB_PATH)
-        self.chunk_store = ChunkStore(DB_PATH)
-        self.thread_pool = QThreadPool.globalInstance()
-        self.search_thread_pool = QThreadPool(self)
-        self.search_thread_pool.setMaxThreadCount(2)
-        self.active_search_workers: set[SearchWorker] = set()
-        self.search_generation = 0
-        self.loading_generation: int | None = None
+        self.search_state_store = SearchStateStore(self.database)
+        self.history_record_timer = QTimer(self)
+        self.history_record_timer.setSingleShot(True)
+        self.history_record_timer.setInterval(self.HISTORY_DELAY_MS)
+        self.history_record_timer.timeout.connect(self._record_history_candidate)
 
-        self.current_worker: IndexWorker | None = None
-        self.search_offset = 0
-        self.has_more_results = False
-        self.loading_more = False
-        self.seen_result_paths: set[str] = set()
-        self.pending_watch_paths: set[str] = set()
-        self.watch_full_rescan_pending = False
+        self._install_search_state_controls()
+        self.search_input.textChanged.connect(self._refresh_saved_button)
+        self.type_filter.currentIndexChanged.connect(self._refresh_saved_button)
+        self.sort_filter.currentIndexChanged.connect(self._refresh_saved_button)
 
-        self.watch_signals = WatchSignals()
-        self.watch_signals.changed.connect(self._on_watch_batch)
-        self.watch_manager = WatchManager(self.watch_signals.changed.emit)
+        self._history_ui_ready = True
+        self._refresh_saved_button()
 
-        self.search_input = QLineEdit()
-        self.search_input.setClearButtonEnabled(True)
-        self.search_input.setPlaceholderText(
-            '搜索正文或直接筛选，例如：信贷 ext:pdf，或 ext:pdf after:2026-01-01'
-        )
-        self.search_input.setToolTip(
-            "支持：ext:pdf 类型 · path:制度 路径 · after:2026-01-01 / before:2026-09-01 日期 · "
-            "size:>10MB 大小 · 引号用于短语；筛选条件可单独使用\n"
-            "快捷键：↑/↓ 进入结果 · Enter 搜索/打开 · Esc 清空搜索"
-        )
-        self.search_input.setMinimumHeight(38)
+    def _install_search_state_controls(self) -> None:
+        self.history_button = QToolButton()
+        self.history_button.setText("历史 ▾")
+        self.history_button.setMinimumHeight(38)
+        self.history_button.setMinimumWidth(72)
+        self.history_button.setToolTip("打开常用搜索和最近搜索")
+        self.history_button.clicked.connect(self._show_search_history_menu)
 
-        self.type_filter = QComboBox()
-        for label, extension in FILE_FILTERS:
-            self.type_filter.addItem(label, extension)
-        self.type_filter.setMinimumHeight(38)
-        self.type_filter.setMinimumWidth(105)
+        self.favorite_button = QToolButton()
+        self.favorite_button.setMinimumHeight(38)
+        self.favorite_button.setMinimumWidth(84)
+        self.favorite_button.setToolTip("收藏当前关键词、筛选和排序，方便以后直接恢复")
+        self.favorite_button.clicked.connect(self._toggle_saved_search)
 
-        self.sort_filter = QComboBox()
-        for label, sort_mode in SORT_OPTIONS:
-            self.sort_filter.addItem(label, sort_mode)
-        self.sort_filter.setMinimumHeight(38)
-        self.sort_filter.setMinimumWidth(105)
-        self.sort_filter.setToolTip(
-            "排序方式：有正文关键词时默认按相关性；无关键词纯筛选时“相关性”按最近修改显示"
-        )
+        root_layout = self.centralWidget().layout()
+        top_bar = root_layout.itemAt(0).layout() if root_layout is not None else None
+        if top_bar is None:
+            raise RuntimeError("DocSeek top search bar is unavailable")
+        insert_at = top_bar.indexOf(self.choose_button)
+        if insert_at < 0:
+            insert_at = top_bar.count()
+        top_bar.insertWidget(insert_at, self.history_button)
+        top_bar.insertWidget(insert_at + 1, self.favorite_button)
 
-        self.filter_chip_panel = QWidget()
-        self.filter_chip_panel.setVisible(False)
-        self.filter_chip_panel.setObjectName("filterChipPanel")
-        self.filter_chip_layout = QHBoxLayout(self.filter_chip_panel)
-        self.filter_chip_layout.setContentsMargins(0, 0, 0, 0)
-        self.filter_chip_layout.setSpacing(6)
-        self.filter_chip_label = QLabel("当前筛选：")
-        self.filter_chip_label.setStyleSheet("color: palette(mid);")
-        self.filter_chip_layout.addWidget(self.filter_chip_label)
-        self.filter_chip_layout.addStretch(1)
-        self.filter_chip_buttons: list[QToolButton] = []
-
-        self.choose_button = QPushButton("添加目录")
-        self.refresh_button = QPushButton("刷新索引")
-        self.settings_button = QPushButton("索引设置")
-        self.cancel_button = QPushButton("停止")
-        for button in (
-            self.choose_button,
-            self.refresh_button,
-            self.settings_button,
-            self.cancel_button,
-        ):
-            button.setMinimumHeight(38)
-        self.cancel_button.setVisible(False)
-
-        self.scope_label = QLabel()
-        self.scope_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-
-        self.index_progress_panel = QWidget()
-        self.index_progress_panel.setVisible(False)
-        self.index_progress_panel.setObjectName("indexProgressPanel")
-        self.index_progress_panel.setStyleSheet(
-            "QWidget#indexProgressPanel { border: 1px solid palette(mid); border-radius: 6px; }"
-        )
-        progress_layout = QHBoxLayout(self.index_progress_panel)
-        progress_layout.setContentsMargins(10, 7, 10, 7)
-        progress_layout.setSpacing(10)
-
-        self.index_progress_bar = QProgressBar()
-        self.index_progress_bar.setRange(0, 0)
-        self.index_progress_bar.setTextVisible(False)
-        self.index_progress_bar.setFixedWidth(110)
-        self.index_progress_bar.setFixedHeight(10)
-
-        progress_text = QVBoxLayout()
-        progress_text.setContentsMargins(0, 0, 0, 0)
-        progress_text.setSpacing(2)
-        self.index_file_label = QLabel("准备建立索引…")
-        self.index_detail_label = QLabel("")
-        self.index_detail_label.setStyleSheet("color: palette(mid); font-size: 11px;")
-        progress_text.addWidget(self.index_file_label)
-        progress_text.addWidget(self.index_detail_label)
-
-        self.index_counts_label = QLabel("已处理 0 · 更新 0")
-        self.index_counts_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        self.index_counts_label.setMinimumWidth(150)
-
-        progress_layout.addWidget(self.index_progress_bar)
-        progress_layout.addLayout(progress_text, 1)
-        progress_layout.addWidget(self.index_counts_label)
-
-        self.results = QTableView()
-        self.results_model = SearchResultsModel(self.results)
-        self.results.setModel(self.results_model)
-        self.results.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.results.setSelectionMode(QAbstractItemView.SingleSelection)
-        self.results.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.results.setSortingEnabled(False)
-        self.results.setWordWrap(False)
-        self.results.verticalHeader().setVisible(False)
-        self.results.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        self.results.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        self.results.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        self.results.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        self.results.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
-        self.results.horizontalHeader().setSectionResizeMode(5, QHeaderView.Stretch)
-        self.results.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.results.setAlternatingRowColors(True)
-
-        self.preview = QTextBrowser()
-        self.preview.setOpenExternalLinks(False)
-        self.preview.setPlaceholderText(
-            "输入记得的正文关键词开始搜索；选中结果后，这里会显示命中上下文和具体位置。"
-        )
-
-        splitter = QSplitter(Qt.Horizontal)
-        splitter.addWidget(self.results)
-        splitter.addWidget(self.preview)
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 2)
-        splitter.setSizes([820, 480])
-
-        top_bar = QHBoxLayout()
-        top_bar.addWidget(self.search_input, 1)
-        top_bar.addWidget(self.type_filter)
-        top_bar.addWidget(self.sort_filter)
-        top_bar.addWidget(self.choose_button)
-        top_bar.addWidget(self.refresh_button)
-        top_bar.addWidget(self.settings_button)
-        top_bar.addWidget(self.cancel_button)
-
-        layout = QVBoxLayout()
-        layout.setContentsMargins(14, 14, 14, 10)
-        layout.setSpacing(10)
-        layout.addLayout(top_bar)
-        layout.addWidget(self.filter_chip_panel)
-        layout.addWidget(self.scope_label)
-        layout.addWidget(self.index_progress_panel)
-        layout.addWidget(splitter, 1)
-
-        container = QWidget()
-        container.setLayout(layout)
-        self.setCentralWidget(container)
-        self.setStatusBar(QStatusBar())
-
-        self.search_timer = QTimer(self)
-        self.search_timer.setSingleShot(True)
-        self.search_timer.setInterval(180)
-        self.search_timer.timeout.connect(self._perform_search)
-
-        self.search_input.textChanged.connect(self.search_timer.start)
-        self.search_input.textChanged.connect(self._refresh_filter_chips)
-        self.search_input.returnPressed.connect(self._perform_search)
-        self.type_filter.currentIndexChanged.connect(self._perform_search)
-        self.sort_filter.currentIndexChanged.connect(self._perform_search)
-        self.choose_button.clicked.connect(self._choose_directory)
-        self.refresh_button.clicked.connect(self._refresh_all_roots)
-        self.settings_button.clicked.connect(self._open_index_settings)
-        self.cancel_button.clicked.connect(self._cancel_index)
-        self.results.doubleClicked.connect(lambda _index: self._open_selected())
-        self.results.selectionModel().selectionChanged.connect(
-            lambda _selected, _deselected: self._show_preview()
-        )
-        self.results.customContextMenuRequested.connect(self._show_context_menu)
-        self.results.verticalScrollBar().valueChanged.connect(self._on_results_scroll)
-        self.search_input.installEventFilter(self)
-        self.results.installEventFilter(self)
-
-        open_action = QAction("打开", self)
-        open_action.setShortcut("Ctrl+O")
-        open_action.triggered.connect(self._open_selected)
-        self.addAction(open_action)
-
-        reveal_action = QAction("打开所在位置", self)
-        reveal_action.setShortcut("Ctrl+Shift+O")
-        reveal_action.triggered.connect(self._reveal_selected)
-        self.addAction(reveal_action)
-
-        focus_action = QAction("聚焦搜索框", self)
-        focus_action.setShortcut("Ctrl+L")
-        focus_action.triggered.connect(self.search_input.setFocus)
-        self.addAction(focus_action)
-
-        self._refresh_filter_chips()
-        self._refresh_scope()
-        self._refresh_status()
-        self._restart_watcher()
-        self.search_input.setFocus()
-
-    def eventFilter(self, watched, event) -> bool:  # noqa: N802
-        if event.type() == QEvent.KeyPress:
-            key = event.key()
-
-            if watched is self.search_input and key in (Qt.Key_Down, Qt.Key_Up):
-                row = result_entry_row(
-                    self.results_model.rowCount(), move_down=key == Qt.Key_Down
-                )
-                if row is not None:
-                    index = self.results_model.index(row, 0)
-                    self.results.setCurrentIndex(index)
-                    self.results.selectRow(row)
-                    self.results.scrollTo(index)
-                    self.results.setFocus()
-                    return True
-
-            if watched is self.results and key in (Qt.Key_Return, Qt.Key_Enter):
-                self._open_selected()
-                return True
-
-            if (
-                watched is self.results
-                and key == Qt.Key_Up
-                and self.results.currentIndex().row() <= 0
-            ):
-                self.search_input.setFocus()
-                self.search_input.setCursorPosition(len(self.search_input.text()))
-                return True
-
-            if watched in (self.search_input, self.results) and key == Qt.Key_Escape:
-                self._clear_search()
-                return True
-
-        return super().eventFilter(watched, event)
-
-    def closeEvent(self, event) -> None:  # noqa: N802
-        self.search_generation += 1
-        self.search_thread_pool.clear()
-        self.watch_manager.stop()
-        super().closeEvent(event)
-
-    def _choose_directory(self) -> None:
-        initial = self.database.get_index_root() or str(Path.home())
-        selected = QFileDialog.getExistingDirectory(self, "选择需要索引的目录", initial)
-        if selected:
-            self._start_index([Path(selected)])
-
-    def _open_index_settings(self) -> None:
-        if self.current_worker is not None:
-            self.statusBar().showMessage("请等待当前索引任务完成后再修改设置", 5000)
-            return
-        dialog = IndexSettingsDialog(self.database, self)
-        if dialog.exec():
-            self._refresh_scope()
-            self._restart_watcher()
-            self._refresh_status()
-            roots = [Path(root) for root in self.database.get_index_roots()]
-            if roots:
-                self._start_index(roots, automatic=True)
-            else:
-                self.results_model.clear()
-
-    def _refresh_all_roots(self) -> None:
-        roots = [Path(root) for root in self.database.get_index_roots()]
-        if not roots:
-            self.statusBar().showMessage("请先添加一个索引目录", 5000)
-            return
-        self._start_index(roots)
-
-    def _launch_worker(self, worker: IndexWorker, *, automatic: bool) -> None:
-        self.choose_button.setEnabled(False)
-        self.refresh_button.setEnabled(False)
-        self.settings_button.setEnabled(False)
-        self.cancel_button.setVisible(not automatic)
-        self.index_progress_panel.setVisible(True)
-        self.index_file_label.setText("准备建立索引…")
-        self.index_file_label.setToolTip("")
-        self.index_detail_label.setText("")
-        self.index_counts_label.setText("已处理 0 · 更新 0")
-        self.current_worker = worker
-        worker.signals.progress.connect(self._index_progress)
-        worker.signals.finished.connect(self._index_finished)
-        worker.signals.cancelled.connect(self._index_cancelled)
-        worker.signals.failed.connect(self._index_failed)
-        self.thread_pool.start(worker)
-
-    def _start_index(self, roots: list[Path], *, automatic: bool = False) -> None:
-        if self.current_worker is not None:
-            if automatic:
-                self.watch_full_rescan_pending = True
-                self.pending_watch_paths.clear()
-            return
-
-        worker = IndexWorker(db_path=DB_PATH, roots=roots)
-        self._launch_worker(worker, automatic=automatic)
-        if automatic:
-            self.statusBar().showMessage("检测到目录结构变化，正在后台校准索引…")
-
-    def _start_path_update(self, paths: list[Path]) -> None:
-        if not paths:
-            return
-        if self.current_worker is not None:
-            self.pending_watch_paths.update(str(path) for path in paths)
-            return
-
-        worker = IndexWorker(db_path=DB_PATH, paths=paths)
-        self._launch_worker(worker, automatic=True)
-        self.statusBar().showMessage(f"检测到文件变化，正在增量更新 {len(paths)} 个文件…")
-
-    def _cancel_index(self) -> None:
-        if self.current_worker:
-            self.current_worker.cancel()
-            self.index_detail_label.setText("正在停止…")
-            self.statusBar().showMessage("正在停止索引…")
-
-    def _index_progress(self, path: str, scanned: int, indexed: int) -> None:
-        filename, detail = split_index_progress_display(path)
-        self.index_file_label.setText(filename)
-        if not detail:
-            self.index_file_label.setToolTip(path)
-        self.index_detail_label.setText(detail)
-        self.index_counts_label.setText(f"已处理 {scanned:,} · 更新 {indexed:,}")
-
-    def _index_finished(self, stats: IndexStats) -> None:
-        worker = self.current_worker
-        was_full_scan = worker.is_full_scan if worker is not None else False
-        self._finish_index_ui()
-        self._refresh_scope()
-        if was_full_scan:
-            self._restart_watcher()
-
-        extra = f"，排除 {stats.excluded}" if stats.excluded else ""
-        chunk_info = f"，生成 {stats.chunks} 个内容块" if stats.chunks else ""
-        self.statusBar().showMessage(
-            f"索引完成：更新 {stats.indexed}，未变化 {stats.unchanged}，"
-            f"删除 {stats.removed}，跳过 {stats.skipped}{chunk_info}{extra}",
-            10000,
-        )
-        self._perform_search()
-        self._drain_watch_queue()
-
-    def _index_cancelled(self) -> None:
-        self._finish_index_ui()
-        self.statusBar().showMessage("索引已停止", 6000)
-        self._drain_watch_queue()
-
-    def _index_failed(self, message: str) -> None:
-        self._finish_index_ui()
-        self.statusBar().showMessage(f"索引失败：{message}", 10000)
-        self._drain_watch_queue()
-
-    def _finish_index_ui(self) -> None:
-        self.choose_button.setEnabled(True)
-        self.refresh_button.setEnabled(True)
-        self.settings_button.setEnabled(True)
-        self.cancel_button.setVisible(False)
-        self.index_progress_panel.setVisible(False)
-        self.current_worker = None
-        self._refresh_status()
-
-    def _on_watch_batch(self, batch: WatchBatch) -> None:
-        if batch.full_rescan:
-            self.watch_full_rescan_pending = True
-            self.pending_watch_paths.clear()
-        elif not self.watch_full_rescan_pending:
-            self.pending_watch_paths.update(batch.paths)
-        self._drain_watch_queue()
-
-    def _drain_watch_queue(self) -> None:
-        if self.current_worker is not None:
-            return
-
-        if self.watch_full_rescan_pending:
-            self.watch_full_rescan_pending = False
-            self.pending_watch_paths.clear()
-            roots = [Path(root) for root in self.database.get_index_roots()]
-            if roots:
-                self._start_index(roots, automatic=True)
-            return
-
-        if self.pending_watch_paths:
-            paths = [Path(path) for path in sorted(self.pending_watch_paths)]
-            self.pending_watch_paths.clear()
-            self._start_path_update(paths)
-
-    def _restart_watcher(self) -> None:
-        self.watch_manager.start(
-            self.database.get_index_roots(),
-            self.database.get_excluded_paths(),
-        )
-
-    def _refresh_filter_chips(self, *_args) -> None:
-        for button in self.filter_chip_buttons:
-            self.filter_chip_layout.removeWidget(button)
-            button.deleteLater()
-        self.filter_chip_buttons.clear()
-
-        chips = query_filter_chips(self.search_input.text())
-        for chip in chips:
-            button = QToolButton(self.filter_chip_panel)
-            label = chip.label if len(chip.label) <= 42 else chip.label[:39] + "…"
-            button.setText(f"{label}  ×")
-            button.setToolTip(f"{chip.label}\n点击移除此筛选")
-            button.setCursor(Qt.PointingHandCursor)
-            button.setStyleSheet(
-                "QToolButton { border: 1px solid palette(mid); border-radius: 10px; "
-                "padding: 3px 8px; background: palette(base); } "
-                "QToolButton:hover { background: palette(alternate-base); }"
-            )
-            button.clicked.connect(
-                lambda _checked=False, key=chip.key: self._remove_filter_chip(key)
-            )
-            self.filter_chip_layout.insertWidget(
-                self.filter_chip_layout.count() - 1, button
-            )
-            self.filter_chip_buttons.append(button)
-
-        self.filter_chip_panel.setVisible(bool(chips))
-
-    def _remove_filter_chip(self, key: str) -> None:
-        updated = remove_query_filter(self.search_input.text(), key)
-        self.search_input.setText(updated)
-        self.search_input.setCursorPosition(len(updated))
-        self.search_input.setFocus()
-
-    def _clear_search(self) -> None:
-        """Clear text and the explicit type selector without firing duplicate searches."""
-        self.search_timer.stop()
-        search_signals_were_blocked = self.search_input.blockSignals(True)
-        type_signals_were_blocked = self.type_filter.blockSignals(True)
-        try:
-            self.search_input.clear()
-            self.type_filter.setCurrentIndex(0)
-        finally:
-            self.search_input.blockSignals(search_signals_were_blocked)
-            self.type_filter.blockSignals(type_signals_were_blocked)
-
-        self._refresh_filter_chips()
-        self._perform_search()
-        self.search_input.setFocus()
-
-    def _perform_search(self) -> None:
-        # Incrementing the generation invalidates every in-flight response from
-        # previous text/filter values. Those SQLite statements may finish in
-        # their worker thread, but they can no longer mutate the visible UI.
-        self.search_generation += 1
-        self.search_offset = 0
-        self.has_more_results = False
-        self.loading_more = False
-        self.loading_generation = None
-        self.seen_result_paths.clear()
-        self.results_model.clear()
-        self.preview.clear()
-        self._load_next_page(select_first=True)
-
-    def _load_next_page(self, *, select_first: bool = False) -> None:
-        if self.loading_more and self.loading_generation == self.search_generation:
-            return
-
-        raw_query = self.search_input.text().strip()
-        parsed = parse_query(raw_query)
-        extension = parsed.extension or self.type_filter.currentData()
-        if not parsed.terms and not parsed.has_filters and extension is None:
-            self._refresh_status()
-            return
-
-        request = SearchRequest(
-            generation=self.search_generation,
-            query=parsed.text,
-            limit=PAGE_SIZE,
-            offset=self.search_offset,
-            extension=extension,
-            path_contains=parsed.path_contains,
-            modified_after=parsed.modified_after,
-            modified_before=parsed.modified_before,
-            min_size=parsed.min_size,
-            max_size=parsed.max_size,
+    def _current_search_state(self) -> SearchState:
+        return SearchState(
+            query=self.search_input.text(),
+            extension=self.type_filter.currentData(),
             sort_mode=self.sort_filter.currentData() or SORT_RELEVANCE,
-            select_first=select_first,
-            is_filter_only=not parsed.terms,
-        )
-        worker = SearchWorker(self.chunk_store, request)
-        worker.signals.finished.connect(
-            lambda response, current=worker: self._search_finished(current, response)
-        )
-        worker.signals.failed.connect(
-            lambda generation, message, current=worker: self._search_failed(
-                current, generation, message
-            )
-        )
-        self.active_search_workers.add(worker)
-        self.loading_more = True
-        self.loading_generation = request.generation
-        if request.offset == 0:
-            self.statusBar().showMessage("正在搜索…")
-        self.search_thread_pool.start(worker)
+        ).normalized()
 
-    def _search_finished(self, worker: SearchWorker, response: SearchResponse) -> None:
-        self.active_search_workers.discard(worker)
+    def _refresh_saved_button(self, *_args) -> None:
+        if not self._history_ui_ready:
+            return
+        state = self._current_search_state()
+        if not state.meaningful:
+            self.favorite_button.setEnabled(False)
+            self.favorite_button.setText("☆ 收藏")
+            return
+        self.favorite_button.setEnabled(True)
+        if self.search_state_store.is_saved(state):
+            self.favorite_button.setText("★ 已收藏")
+            self.favorite_button.setToolTip("当前搜索已收藏；点击取消收藏")
+        else:
+            self.favorite_button.setText("☆ 收藏")
+            self.favorite_button.setToolTip("收藏当前关键词、筛选和排序，方便以后直接恢复")
+
+    def _toggle_saved_search(self, *_args) -> None:
+        state = self._current_search_state()
+        if not state.meaningful:
+            self.statusBar().showMessage("请先输入关键词或选择一个文件类型", 4000)
+            return
+        was_saved = self.search_state_store.is_saved(state)
+        saved_now = self.search_state_store.toggle_saved(state)
+        self._refresh_saved_button()
+        if saved_now and not was_saved:
+            self.statusBar().showMessage("已收藏当前搜索", 3000)
+        else:
+            self.statusBar().showMessage("已取消收藏", 3000)
+
+    def _show_search_history_menu(self, *_args) -> None:
+        menu = QMenu(self)
+        saved = self.search_state_store.saved()
+        history = self.search_state_store.history()
+
+        if saved:
+            menu.addSection("常用搜索")
+            for state in saved[:10]:
+                action = menu.addAction(f"★ {search_state_label(state)}")
+                action.triggered.connect(
+                    lambda _checked=False, selected=state: self._apply_search_state(selected)
+                )
+
+        if history:
+            if saved:
+                menu.addSeparator()
+            menu.addSection("最近搜索")
+            for state in history[:15]:
+                action = menu.addAction(search_state_label(state))
+                action.triggered.connect(
+                    lambda _checked=False, selected=state: self._apply_search_state(selected)
+                )
+            menu.addSeparator()
+            clear_action = menu.addAction("清除最近搜索")
+            clear_action.triggered.connect(self._clear_recent_history)
+
+        if not saved and not history:
+            empty_action = menu.addAction("暂无搜索历史")
+            empty_action.setEnabled(False)
+
+        menu.exec(self.history_button.mapToGlobal(self.history_button.rect().bottomLeft()))
+
+    def _clear_recent_history(self, *_args) -> None:
+        self.search_state_store.clear_history()
+        self.statusBar().showMessage("已清除最近搜索；收藏内容仍保留", 4000)
+
+    def _apply_search_state(self, state: SearchState) -> None:
+        state = state.normalized()
+        self.search_timer.stop()
+        self.history_record_timer.stop()
+        self._history_candidate_generation = None
+
+        search_blocked = self.search_input.blockSignals(True)
+        type_blocked = self.type_filter.blockSignals(True)
+        sort_blocked = self.sort_filter.blockSignals(True)
+        try:
+            self.search_input.setText(state.query)
+            type_index = self.type_filter.findData(state.extension)
+            self.type_filter.setCurrentIndex(type_index if type_index >= 0 else 0)
+            sort_index = self.sort_filter.findData(state.sort_mode)
+            self.sort_filter.setCurrentIndex(sort_index if sort_index >= 0 else 0)
+        finally:
+            self.search_input.blockSignals(search_blocked)
+            self.type_filter.blockSignals(type_blocked)
+            self.sort_filter.blockSignals(sort_blocked)
+
+        self._refresh_filter_chips()
+        self._refresh_saved_button()
+        self._perform_search()
+        # A deliberate history/saved-menu selection should become recent as
+        # soon as its first page succeeds, just like pressing Enter.
+        self._explicit_history_generation = self.search_generation
+        self.search_input.setFocus()
+        self.search_input.setCursorPosition(len(self.search_input.text()))
+
+    def _perform_search(self, *_args) -> None:
+        if self._history_ui_ready:
+            self.history_record_timer.stop()
+            self._history_candidate_generation = None
+            explicit = self.sender() is self.search_input
+            if explicit:
+                # Avoid the pending 180 ms debounce issuing the same Enter
+                # search a second time.
+                self.search_timer.stop()
+        else:
+            explicit = False
+
+        super()._perform_search()
+
+        if self._history_ui_ready:
+            self._explicit_history_generation = self.search_generation if explicit else None
+            self._refresh_saved_button()
+
+    def _search_finished(self, worker, response) -> None:
+        super()._search_finished(worker, response)
+        if not self._history_ui_ready:
+            return
+
         request = response.request
-        if request.generation != self.search_generation:
+        if request.generation != self.search_generation or request.offset != 0:
+            return
+        if response.page.total_count <= 0:
+            if self._explicit_history_generation == request.generation:
+                self._explicit_history_generation = None
             return
 
-        if self.loading_generation == request.generation:
-            self.loading_more = False
-            self.loading_generation = None
+        if self._explicit_history_generation == request.generation:
+            self.search_state_store.record_history(self._current_search_state())
+            self._explicit_history_generation = None
+            self._history_candidate_generation = None
+        else:
+            self._history_candidate_generation = request.generation
+            self.history_record_timer.start()
 
-        # A page from the current generation is only valid at the offset it was
-        # requested for. This also protects against future changes that allow
-        # more than one pagination request to be queued at once.
-        if request.offset != self.search_offset:
-            return
-
-        page = response.page
-        rows = page.items
-        unique_rows = [row for row in rows if row.path not in self.seen_result_paths]
-        for row in unique_rows:
-            self.seen_result_paths.add(row.path)
-        self.results_model.append_items(unique_rows)
-
-        self.search_offset += len(rows)
-        self.has_more_results = self.search_offset < page.total_count
-        suffix = " · 向下滚动继续加载" if self.has_more_results else ""
-        mode = "筛选结果" if request.is_filter_only else "搜索结果"
-        latency = (
-            f"{response.elapsed_ms:.1f} ms"
-            if response.elapsed_ms < 10
-            else f"{response.elapsed_ms:.0f} ms"
-        )
-        displayed = self.results_model.rowCount()
-        self.statusBar().showMessage(
-            f"{mode}：已显示 {displayed:,} / 共 {page.total_count:,} 个文件"
-            f" · {latency}{suffix}"
-        )
-        if page.total_count == 0:
-            self.preview.setHtml(empty_result_html(filter_only=request.is_filter_only))
-        elif request.select_first and displayed:
-            index = self.results_model.index(0, 0)
-            self.results.setCurrentIndex(index)
-            self.results.selectRow(0)
-
-    def _search_failed(self, worker: SearchWorker, generation: int, message: str) -> None:
-        self.active_search_workers.discard(worker)
+    def _record_history_candidate(self) -> None:
+        generation = self._history_candidate_generation
+        self._history_candidate_generation = None
         if generation != self.search_generation:
             return
-        if self.loading_generation == generation:
-            self.loading_more = False
-            self.loading_generation = None
-        self.statusBar().showMessage(f"搜索失败：{message}", 8000)
-
-    def _on_results_scroll(self, value: int) -> None:
-        scrollbar = self.results.verticalScrollBar()
-        if self.has_more_results and value >= scrollbar.maximum() - 2:
-            self._load_next_page()
-
-    def _show_preview(self) -> None:
-        row_index = self.results.currentIndex().row()
-        row = self.results_model.result_at(row_index)
-        if row is None:
-            if self.database.get_index_roots():
-                self.preview.clear()
+        if self.results_model.rowCount() <= 0:
             return
-
-        safe_filename = html.escape(row.filename)
-        safe_path = html.escape(row.path)
-        metadata = (
-            f"<h3>{safe_filename}</h3>"
-            f"<p><b>{html.escape(row.extension.lstrip('.').upper())}</b> · {self._human_size(row.size)}</p>"
-            f"<p style='color:#666'>{safe_path}</p>"
-        )
-
-        if not row.snippet:
-            self.preview.setHtml(
-                metadata
-                + "<hr><p style='color:#666'>当前为筛选浏览结果。输入正文关键词后，可显示具体命中位置和上下文。</p>"
-            )
-            return
-
-        safe_snippet = html.escape(row.snippet)
-        safe_snippet = safe_snippet.replace("[[HIT]]", "<mark>").replace("[[/HIT]]", "</mark>")
-        safe_location = html.escape(row.location)
-        self.preview.setHtml(
-            metadata
-            + f"<p><b>命中位置：</b>{safe_location}</p><hr>"
-            + f"<p style='line-height:1.7'>{safe_snippet}</p>"
-        )
-
-    def _selected_path(self) -> str | None:
-        row = self.results_model.result_at(self.results.currentIndex().row())
-        return row.path if row is not None else None
-
-    def _open_selected(self) -> None:
-        path = self._selected_path()
-        if not path:
-            return
-        try:
-            os.startfile(path)  # type: ignore[attr-defined]
-        except Exception as exc:
-            self.statusBar().showMessage(f"无法打开文件：{exc}", 8000)
-
-    def _reveal_selected(self) -> None:
-        path = self._selected_path()
-        if not path:
-            return
-        try:
-            subprocess.Popen(["explorer", "/select,", os.path.normpath(path)])
-        except Exception as exc:
-            self.statusBar().showMessage(f"无法打开所在位置：{exc}", 8000)
-
-    def _copy_selected_path(self) -> None:
-        path = self._selected_path()
-        if path:
-            QGuiApplication.clipboard().setText(path)
-            self.statusBar().showMessage("已复制文件路径", 3000)
-
-    def _show_context_menu(self, point) -> None:
-        if not self.results.currentIndex().isValid():
-            return
-        menu = QMenu(self)
-        menu.addAction("打开", self._open_selected)
-        menu.addAction("打开所在位置", self._reveal_selected)
-        menu.addSeparator()
-        menu.addAction("复制完整路径", self._copy_selected_path)
-        menu.exec(self.results.viewport().mapToGlobal(point))
-
-    def _refresh_scope(self) -> None:
-        roots = self.database.get_index_roots()
-        excluded = self.database.get_excluded_paths()
-        if not roots:
-            self.scope_label.setText("尚未建立索引，请先添加一个工作目录")
-            self.scope_label.setToolTip("")
-            self.preview.setHtml(
-                "<h3>开始使用 DocSeek</h3>"
-                "<p>点击上方“添加目录”，选择需要检索的工作资料目录。建立索引后，"
-                "直接输入记得的正文内容即可查找文档，不需要记住文件名。</p>"
-            )
-            return
-
-        suffix = f" · 排除 {len(excluded)} 个目录" if excluded else ""
-        if len(roots) == 1:
-            self.scope_label.setText(f"搜索范围：{roots[0]} · 自动监测变化{suffix}")
-        else:
-            self.scope_label.setText(
-                f"搜索范围：{len(roots)} 个目录 · 自动监测变化{suffix} · 最近添加：{roots[-1]}"
-            )
-        tooltip = ["索引目录：", *roots]
-        if excluded:
-            tooltip.extend(["", "排除目录：", *excluded])
-        self.scope_label.setToolTip("\n".join(tooltip))
-
-    def _refresh_status(self) -> None:
-        count = self.database.count_files()
-        self.statusBar().showMessage(f"已索引 {count:,} 个文件")
-
-    @staticmethod
-    def _human_size(size: int) -> str:
-        value = float(size)
-        for unit in ("B", "KB", "MB", "GB"):
-            if value < 1024 or unit == "GB":
-                return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
-            value /= 1024
-        return f"{size} B"
+        self.search_state_store.record_history(self._current_search_state())
 
 
 def main() -> None:
