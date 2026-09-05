@@ -130,11 +130,25 @@ _FORMATS = (
     FormatCapability(".numbers", DocumentFamily.SPREADSHEET, (SupportMode.TIKA_NATIVE,), "Apple Numbers"),
     FormatCapability(".key", DocumentFamily.PRESENTATION, (SupportMode.TIKA_NATIVE,), "Apple Keynote"),
 
-    # Kingsoft-native formats deliberately remain vendor/system-plugin
-    # territory. They still participate in the same isolated/retry pipeline.
-    FormatCapability(".wps", DocumentFamily.WRITER, (SupportMode.WPS_LOCAL,), "WPS Writer"),
+    # Real WPS/ET/DPS samples supplied for DocSeek's regression corpus are
+    # OLE/CFB compound documents with recognizable WordDocument/Workbook/
+    # PowerPoint streams. Try the local native-Tika compatibility parser first;
+    # if it cannot extract a particular WPS variant, the installed WPS client
+    # remains the vendor fallback. Template variants stay vendor-only until we
+    # have representative fixtures proving the same compatibility path.
+    FormatCapability(
+        ".wps",
+        DocumentFamily.WRITER,
+        (SupportMode.TIKA_NATIVE, SupportMode.WPS_LOCAL),
+        "WPS Writer",
+    ),
     FormatCapability(".wpt", DocumentFamily.WRITER, (SupportMode.WPS_LOCAL,), "WPS Writer Template"),
-    FormatCapability(".et", DocumentFamily.SPREADSHEET, (SupportMode.WPS_LOCAL,), "WPS Spreadsheet"),
+    FormatCapability(
+        ".et",
+        DocumentFamily.SPREADSHEET,
+        (SupportMode.TIKA_NATIVE, SupportMode.WPS_LOCAL),
+        "WPS Spreadsheet",
+    ),
     FormatCapability(".ett", DocumentFamily.SPREADSHEET, (SupportMode.WPS_LOCAL,), "WPS Spreadsheet Template"),
     FormatCapability(
         ".xlt",
@@ -142,7 +156,12 @@ _FORMATS = (
         (SupportMode.TIKA_NATIVE, SupportMode.WPS_LOCAL),
         "Excel Template",
     ),
-    FormatCapability(".dps", DocumentFamily.PRESENTATION, (SupportMode.WPS_LOCAL,), "WPS Presentation"),
+    FormatCapability(
+        ".dps",
+        DocumentFamily.PRESENTATION,
+        (SupportMode.TIKA_NATIVE, SupportMode.WPS_LOCAL),
+        "WPS Presentation",
+    ),
     FormatCapability(".dpt", DocumentFamily.PRESENTATION, (SupportMode.WPS_LOCAL,), "WPS Presentation Template"),
 )
 
