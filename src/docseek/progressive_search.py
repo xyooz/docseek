@@ -155,7 +155,7 @@ class ProgressiveSearchEngine:
                     chunk_ids,
                 ).fetchall()
             content_by_id = {
-                int(row["id"]): str(row["content"] or "")
+                int(row["id"]): self.store.decode_content(row["content"])
                 for row in content_rows
             }
 
