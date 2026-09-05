@@ -20,6 +20,7 @@ from .file_exclusions import (
 from .index_cleanup import remove_missing_under_root
 from .index_health import record_successful_reconcile
 from .index_issues import IndexIssueStore
+from .index_priority import prioritize_index_candidates
 from .search_db import SearchDatabase
 
 
@@ -437,7 +438,8 @@ class DirectoryIndexer:
             batch_size=FULL_SCAN_BATCH_SIZE,
             max_batch_text_chars=FULL_SCAN_BATCH_TEXT_CHARS,
         ) as writer:
-            for path in self._iter_supported_files(root, stats):
+            candidates = prioritize_index_candidates(self._iter_supported_files(root, stats))
+            for path in candidates:
                 if self._cancel.is_set():
                     writer.flush()
                     raise IndexCancelled()
