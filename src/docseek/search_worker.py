@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from PySide6.QtCore import QObject, QRunnable, Signal
 
 from .chunk_store import ChunkStore, SearchPage
+from .search_session import get_thread_search_store
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,12 +38,16 @@ class SearchWorkerSignals(QObject):
 
 
 class SearchWorker(QRunnable):
-    """Execute one exact search page on a background Qt thread.
+    """Execute one exact search page on the dedicated background search thread.
 
-    Cancellation is intentionally generation-based: SQLite finishes an already
-    running statement, but the UI ignores any response whose generation is no
-    longer current. This keeps the exact search implementation simple while
-    preventing stale results from replacing a newer query.
+    The first query on a worker thread creates a read-only persistent SQLite
+    session. Later queries reuse that connection and its page cache instead of
+    paying connection/PRAGMA setup on every keystroke.
+
+    Cancellation remains generation-based: SQLite is allowed to finish an
+    already-running exact statement, while the UI ignores any stale response.
+    The UI search pool has one thread and clears queued stale runnables before
+    starting the newest request, so old queries cannot build up indefinitely.
     """
 
     def __init__(self, store: ChunkStore, request: SearchRequest) -> None:
@@ -54,7 +59,8 @@ class SearchWorker(QRunnable):
     def run(self) -> None:
         started = time.perf_counter()
         try:
-            page = self.store.search_page(
+            search_store = get_thread_search_store(self.store.db_path)
+            page = search_store.search_page(
                 self.request.query,
                 limit=self.request.limit,
                 offset=self.request.offset,
