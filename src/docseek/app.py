@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QAction
-from PySide6.QtWidgets import QApplication, QHeaderView, QMenu, QToolButton
+from PySide6.QtWidgets import QApplication, QFileDialog, QHeaderView, QMenu, QToolButton
 
 from . import app_base
+from .index_root_state import IndexRootStateStore
+from .pausable_settings_dialog import PausableIndexSettingsDialog
 from .results_layout import (
     DEFAULT_COLUMN_WIDTHS,
     RESULTS_HEADER_STATE_KEY,
@@ -200,6 +203,158 @@ class MainWindow(app_base.MainWindow):
             header.resizeSection(section, width)
         self._save_results_layout()
         self.statusBar().showMessage("已恢复默认列布局", 3000)
+
+    def _root_state_store(self) -> IndexRootStateStore:
+        # This helper is intentionally constructed on demand: app_base invokes
+        # _refresh_scope/_restart_watcher during its own __init__, before this
+        # subclass can safely attach additional instance attributes.
+        return IndexRootStateStore(self.database)
+
+    def _active_index_roots(self) -> list[str]:
+        return self._root_state_store().active_roots()
+
+    @staticmethod
+    def _path_is_under_roots(path: Path, roots: list[str]) -> bool:
+        try:
+            candidate = path.resolve()
+        except OSError:
+            candidate = path.absolute()
+        for root in roots:
+            try:
+                root_path = Path(root).resolve()
+            except OSError:
+                root_path = Path(root).absolute()
+            if candidate == root_path:
+                return True
+            try:
+                candidate.relative_to(root_path)
+                return True
+            except ValueError:
+                continue
+        return False
+
+    def _choose_directory(self) -> None:
+        initial = self.database.get_index_root() or str(Path.home())
+        selected = QFileDialog.getExistingDirectory(self, "选择需要索引的目录", initial)
+        if selected:
+            # Re-adding a previously removed/paused path must make it active;
+            # otherwise stale pause metadata could silently disable monitoring.
+            self._root_state_store().set_paused(selected, False)
+            self._start_index([Path(selected)])
+
+    def _open_index_settings(self) -> None:
+        if self.current_worker is not None:
+            self.statusBar().showMessage("请等待当前索引任务完成后再修改设置", 5000)
+            return
+
+        dialog = PausableIndexSettingsDialog(self.database, self)
+        if not dialog.exec():
+            return
+
+        # A full active-root reconciliation below subsumes any watcher events
+        # that arrived just before the settings change. Clearing the queue also
+        # guarantees a newly paused root cannot be updated by stale events.
+        self.pending_watch_paths.clear()
+        self.watch_full_rescan_pending = False
+        self._refresh_scope()
+        self._restart_watcher()
+        self._refresh_status()
+
+        roots = self.database.get_index_roots()
+        active_roots = [Path(root) for root in self._active_index_roots()]
+        if active_roots:
+            self._start_index(active_roots, automatic=True)
+        elif roots:
+            self.statusBar().showMessage(
+                "所有索引目录已暂停更新；现有索引仍可正常搜索",
+                6000,
+            )
+        else:
+            self.results_model.clear()
+
+    def _refresh_all_roots(self) -> None:
+        roots = self.database.get_index_roots()
+        active_roots = [Path(root) for root in self._active_index_roots()]
+        if not roots:
+            self.statusBar().showMessage("请先添加一个索引目录", 5000)
+            return
+        if not active_roots:
+            self.statusBar().showMessage(
+                "所有索引目录已暂停；可在“索引设置”中重新勾选后恢复更新",
+                6000,
+            )
+            return
+        self._start_index(active_roots)
+
+    def _drain_watch_queue(self) -> None:
+        if self.current_worker is not None:
+            return
+
+        active_roots = self._active_index_roots()
+        if self.watch_full_rescan_pending:
+            self.watch_full_rescan_pending = False
+            self.pending_watch_paths.clear()
+            if active_roots:
+                self._start_index([Path(root) for root in active_roots], automatic=True)
+            return
+
+        if self.pending_watch_paths:
+            pending = [Path(path) for path in sorted(self.pending_watch_paths)]
+            self.pending_watch_paths.clear()
+            paths = [
+                path
+                for path in pending
+                if self._path_is_under_roots(path, active_roots)
+            ]
+            if paths:
+                self._start_path_update(paths)
+
+    def _restart_watcher(self) -> None:
+        self.watch_manager.start(
+            self._active_index_roots(),
+            self.database.get_excluded_paths(),
+        )
+
+    def _refresh_scope(self) -> None:
+        roots = self.database.get_index_roots()
+        if not roots:
+            super()._refresh_scope()
+            return
+
+        active = self._active_index_roots()
+        paused = set(roots) - set(active)
+        excluded = self.database.get_excluded_paths()
+        suffix = f" · 排除 {len(excluded)} 个目录" if excluded else ""
+
+        if len(roots) == 1:
+            if paused:
+                self.scope_label.setText(
+                    f"搜索范围：{roots[0]} · 已暂停更新 · 现有索引仍可搜索{suffix}"
+                )
+            else:
+                self.scope_label.setText(f"搜索范围：{roots[0]} · 自动监测变化{suffix}")
+        elif not active:
+            self.scope_label.setText(
+                f"搜索范围：{len(roots)} 个目录 · 全部暂停更新 · 现有索引仍可搜索{suffix}"
+            )
+        elif paused:
+            self.scope_label.setText(
+                f"搜索范围：{len(roots)} 个目录 · 自动监测 {len(active)} 个 · "
+                f"暂停 {len(paused)} 个{suffix}"
+            )
+        else:
+            self.scope_label.setText(
+                f"搜索范围：{len(roots)} 个目录 · 自动监测变化{suffix} · 最近添加：{roots[-1]}"
+            )
+
+        tooltip = ["索引目录："]
+        tooltip.extend(
+            f"[暂停] {root}" if root in paused else f"[监测] {root}"
+            for root in roots
+        )
+        if excluded:
+            tooltip.extend(["", "排除目录：", *excluded])
+        self.scope_label.setToolTip("\n".join(tooltip))
 
     def _show_search_help(self, *_args) -> None:
         SearchHelpDialog(self).exec()
