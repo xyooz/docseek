@@ -58,6 +58,14 @@ class ParsedQuery:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class QueryFilterChip:
+    """One effective metadata filter that can be shown as a removable UI chip."""
+
+    key: str
+    label: str
+
+
 def _split_tokens(raw: str) -> list[str]:
     """Split search text while preserving Windows backslashes and quoted spaces."""
     tokens: list[str] = []
@@ -183,3 +191,101 @@ def parse_query(raw: str) -> ParsedQuery:
         min_size=min_size,
         max_size=max_size,
     )
+
+
+def _format_date(timestamp: float) -> str:
+    return datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d")
+
+
+def _format_size(size: int) -> str:
+    value = float(max(0, size))
+    for unit in ("B", "KB", "MB", "GB"):
+        if value < 1024 or unit == "GB":
+            if unit == "B":
+                return f"{int(value):,} B"
+            rounded = round(value, 1)
+            if rounded.is_integer():
+                return f"{int(rounded)} {unit}"
+            return f"{rounded:.1f} {unit}"
+        value /= 1024
+    return f"{size:,} B"
+
+
+def query_filter_chips(raw: str) -> tuple[QueryFilterChip, ...]:
+    """Return user-facing chips for the effective parsed metadata filters.
+
+    Chips describe effective query state, not every token the user typed. This
+    matters for repeated filters such as ``ext:pdf ext:docx`` where only the
+    final extension is effective. Size lower/upper bounds are intentionally
+    represented as one chip because removing it clears the whole size scope.
+    """
+    parsed = parse_query(raw)
+    chips: list[QueryFilterChip] = []
+    if parsed.extension is not None:
+        chips.append(
+            QueryFilterChip("extension", f"类型 · {parsed.extension.lstrip('.').upper()}")
+        )
+    if parsed.path_contains is not None:
+        chips.append(QueryFilterChip("path", f"路径 · {parsed.path_contains}"))
+    if parsed.modified_after is not None:
+        chips.append(
+            QueryFilterChip("after", f"修改时间 ≥ {_format_date(parsed.modified_after)}")
+        )
+    if parsed.modified_before is not None:
+        chips.append(
+            QueryFilterChip("before", f"修改时间 < {_format_date(parsed.modified_before)}")
+        )
+    if parsed.min_size is not None or parsed.max_size is not None:
+        if parsed.min_size is not None and parsed.max_size is not None:
+            if parsed.min_size == parsed.max_size:
+                label = f"大小 · {_format_size(parsed.min_size)}"
+            else:
+                label = (
+                    f"大小 · {_format_size(parsed.min_size)} ～ "
+                    f"{_format_size(parsed.max_size)}"
+                )
+        elif parsed.min_size is not None:
+            label = f"大小 ≥ {_format_size(parsed.min_size)}"
+        else:
+            label = f"大小 ≤ {_format_size(parsed.max_size or 0)}"
+        chips.append(QueryFilterChip("size", label))
+    return tuple(chips)
+
+
+def _quote_filter_value(prefix: str, value: str) -> str:
+    if any(char.isspace() for char in value):
+        return f'{prefix}:"{value}"'
+    return f"{prefix}:{value}"
+
+
+def remove_query_filter(raw: str, key: str) -> str:
+    """Remove one logical metadata filter while preserving search semantics.
+
+    The result is normalized rather than byte-for-byte identical to the input.
+    Unknown/malformed filter-like tokens remain normal terms. A size chip clears
+    both lower and upper bounds because the UI presents them as one logical
+    scope.
+    """
+    parsed = parse_query(raw)
+    parts: list[str] = []
+    if parsed.text:
+        parts.append(parsed.text)
+
+    if key != "extension" and parsed.extension is not None:
+        parts.append(f"ext:{parsed.extension.lstrip('.')}")
+    if key != "path" and parsed.path_contains is not None:
+        parts.append(_quote_filter_value("path", parsed.path_contains))
+    if key != "after" and parsed.modified_after is not None:
+        parts.append(f"after:{_format_date(parsed.modified_after)}")
+    if key != "before" and parsed.modified_before is not None:
+        parts.append(f"before:{_format_date(parsed.modified_before)}")
+    if key != "size":
+        if parsed.min_size is not None and parsed.max_size == parsed.min_size:
+            parts.append(f"size:{parsed.min_size}B")
+        else:
+            if parsed.min_size is not None:
+                parts.append(f"size:>={parsed.min_size}B")
+            if parsed.max_size is not None:
+                parts.append(f"size:<={parsed.max_size}B")
+
+    return " ".join(part for part in parts if part).strip()
