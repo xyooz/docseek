@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -163,6 +164,10 @@ def run_quality_evaluation(k: int) -> tuple[RetrievalMetrics, list[str]]:
 
 
 def main() -> int:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="backslashreplace")
+
     parser = argparse.ArgumentParser(description="Evaluate DocSeek curated retrieval quality")
     parser.add_argument("--k", type=int, default=5)
     parser.add_argument("--assert-baseline", action="store_true")
