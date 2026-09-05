@@ -12,6 +12,18 @@ from pathlib import Path
 from docseek.chunk_store import ChunkStore
 
 
+_VOCABULARY = (
+    "农业银行", "客户经理", "业务流程", "风险管理", "操作规范", "服务记录", "账户管理", "交易审核",
+    "资料归档", "客户服务", "身份核验", "授权管理", "产品信息", "审批流程", "业务申请", "合规检查",
+    "风险提示", "系统操作", "数据维护", "网点服务", "柜面业务", "电子渠道", "移动银行", "跨境业务",
+    "结算账户", "贷款申请", "授信管理", "合同资料", "客户信息", "机构信息", "交易明细", "业务状态",
+    "复核人员", "经办人员", "处理时间", "申请日期", "有效期限", "联系电话", "证件号码", "业务编号",
+    "受理机构", "处理结果", "异常情况", "整改要求", "制度依据", "操作步骤", "注意事项", "业务场景",
+    "审批意见", "风险等级", "客户类型", "账户状态", "产品类别", "渠道类型", "交易金额", "币种信息",
+    "内部管理", "业务部门", "研发中心", "运维支持", "安全审计", "日志记录", "数据查询", "报表统计",
+)
+
+
 def _configure(conn: sqlite3.Connection) -> None:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
@@ -28,7 +40,7 @@ def _db_bytes(path: Path) -> int:
     )
 
 
-def _payload(index: int, ordinal: int, payload_bytes: int) -> str:
+def _payload(index: int, ordinal: int, payload_bytes: int, *, profile: str) -> str:
     terms = [f"文档编号 {index} 内容块 {ordinal}"]
     if index % 4 == 0 and ordinal == 0:
         terms.append("业务流程")
@@ -36,13 +48,53 @@ def _payload(index: int, ordinal: int, payload_bytes: int) -> str:
         terms.append("身份证有效期")
     if index % 200 == 0 and ordinal == 2:
         terms.append("跨境专项复核")
-    seed = " ".join(terms) + " 本地办公资料 业务说明 操作规范 风险提示 服务记录 文档归档 客户服务 "
-    filler = "农业银行 本地文档 检索系统 操作说明 风险管理 客户经理 服务流程 数据归档 "
-    parts = [seed]
-    while len("".join(parts).encode("utf-8")) < payload_bytes:
-        parts.append(filler)
-    text = "".join(parts)
-    encoded = text.encode("utf-8")[:payload_bytes]
+
+    if profile == "repetitive":
+        seed = " ".join(terms) + " 本地办公资料 业务说明 操作规范 风险提示 服务记录 文档归档 客户服务 "
+        filler = "农业银行 本地文档 检索系统 操作说明 风险管理 客户经理 服务流程 数据归档 "
+        parts = [seed]
+        current = len(seed.encode("utf-8"))
+        filler_bytes = len(filler.encode("utf-8"))
+        while current + filler_bytes <= payload_bytes:
+            parts.append(filler)
+            current += filler_bytes
+        if current < payload_bytes:
+            parts.append("x" * (payload_bytes - current))
+        encoded = "".join(parts).encode("utf-8")[:payload_bytes]
+        return encoded.decode("utf-8", errors="ignore")
+
+    # A deterministic, higher-entropy office-like profile. Common business
+    # vocabulary still repeats, but sequence, IDs, dates, amounts and reference
+    # codes vary heavily between chunks. This intentionally makes zlib work
+    # harder than the repetitive baseline without becoming random binary data.
+    parts = [" ".join(terms), " "]
+    current = len("".join(parts).encode("utf-8"))
+    state = ((index + 1) * 0x9E3779B1) ^ ((ordinal + 7) * 0x85EBCA6B)
+    token_no = 0
+    while current < payload_bytes:
+        state = (state * 1664525 + 1013904223) & 0xFFFFFFFF
+        word = _VOCABULARY[state % len(_VOCABULARY)]
+        if token_no % 11 == 0:
+            token = f"{word} REF-{index:06d}-{ordinal:02d}-{state:08X} "
+        elif token_no % 13 == 0:
+            month = 1 + (state % 12)
+            day = 1 + ((state >> 8) % 28)
+            token = f"{word} 2026-{month:02d}-{day:02d} "
+        elif token_no % 17 == 0:
+            amount = (state % 9_000_000) / 100
+            token = f"{word} {amount:.2f}元 "
+        else:
+            token = f"{word} "
+        token_bytes = len(token.encode("utf-8"))
+        if current + token_bytes > payload_bytes:
+            remaining = payload_bytes - current
+            if remaining > 0:
+                parts.append("z" * remaining)
+            break
+        parts.append(token)
+        current += token_bytes
+        token_no += 1
+    encoded = "".join(parts).encode("utf-8")[:payload_bytes]
     return encoded.decode("utf-8", errors="ignore")
 
 
@@ -90,7 +142,15 @@ def _decode_content(value: object, *, compressed: bool) -> str:
     return zlib.decompress(bytes(value)).decode("utf-8")
 
 
-def _build(path: Path, *, compressed: bool, files: int, chunks_per_file: int, payload_kb: int) -> tuple[float, int, int]:
+def _build(
+    path: Path,
+    *,
+    compressed: bool,
+    files: int,
+    chunks_per_file: int,
+    payload_kb: int,
+    profile: str,
+) -> tuple[float, int, int]:
     conn = sqlite3.connect(path)
     _configure(conn)
     _create_schema(conn, compressed=compressed)
@@ -102,7 +162,7 @@ def _build(path: Path, *, compressed: bool, files: int, chunks_per_file: int, pa
         filename = f"2026年广州研发办公资料_业务操作规范_{index:06d}.pdf"
         file_id = int(conn.execute("INSERT INTO files(filename) VALUES (?)", (filename,)).lastrowid)
         for ordinal in range(chunks_per_file):
-            content = _payload(index, ordinal, payload_bytes)
+            content = _payload(index, ordinal, payload_bytes, profile=profile)
             logical_bytes += len(content.encode("utf-8"))
             chunk_id = int(
                 conn.execute(
@@ -233,6 +293,7 @@ def main() -> None:
     parser.add_argument("--iterations", type=int, default=5)
     parser.add_argument("--delete-documents", type=int, default=100)
     parser.add_argument("--limit", type=int, default=100)
+    parser.add_argument("--profile", choices=("repetitive", "varied"), default="repetitive")
     args = parser.parse_args()
 
     with tempfile.TemporaryDirectory() as temp_dir:
@@ -245,6 +306,7 @@ def main() -> None:
             files=args.files,
             chunks_per_file=args.chunks,
             payload_kb=args.payload_kb,
+            profile=args.profile,
         )
         comp_build, comp_bytes, comp_logical = _build(
             compressed_path,
@@ -252,6 +314,7 @@ def main() -> None:
             files=args.files,
             chunks_per_file=args.chunks,
             payload_kb=args.payload_kb,
+            profile=args.profile,
         )
         if logical_bytes != comp_logical:
             raise SystemExit("logical source mismatch")
@@ -284,8 +347,8 @@ def main() -> None:
 
         print("DocSeek raw chunk compression A/B")
         print(
-            f"files={args.files:,} chunks/file={args.chunks} payload/chunk~={args.payload_kb}KiB "
-            f"logical_source={logical_bytes / 1024 / 1024:.2f}MiB"
+            f"profile={args.profile} files={args.files:,} chunks/file={args.chunks} "
+            f"payload/chunk~={args.payload_kb}KiB logical_source={logical_bytes / 1024 / 1024:.2f}MiB"
         )
         print(f"raw:        build={raw_build:.3f}s db={raw_bytes / 1024 / 1024:.2f}MiB")
         print(f"compressed: build={comp_build:.3f}s db={comp_bytes / 1024 / 1024:.2f}MiB")
