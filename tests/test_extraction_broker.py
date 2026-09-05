@@ -64,7 +64,7 @@ class ExtractionBrokerTests(unittest.TestCase):
             (SupportMode.CALAMINE, SupportMode.TIKA_NATIVE, SupportMode.WPS_LOCAL),
         )
         self.assertEqual(doc.modes, (SupportMode.TIKA_NATIVE, SupportMode.WPS_LOCAL))
-        self.assertEqual(wps.modes, (SupportMode.WPS_LOCAL,))
+        self.assertEqual(wps.modes, (SupportMode.TIKA_NATIVE, SupportMode.WPS_LOCAL))
 
     def test_registry_prefers_higher_priority_available_adapter(self) -> None:
         slow = FakeAdapter("fallback", 10, frozenset({".xls"}))
