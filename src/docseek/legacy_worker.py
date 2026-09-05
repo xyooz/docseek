@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import pickle
 import sys
 from pathlib import Path
@@ -42,6 +43,10 @@ def iter_chunk_file(path: Path):
 
 
 def extract_to_file(source: Path, output: Path) -> int:
+    # The extraction broker uses this marker to execute compatibility adapters
+    # directly inside this killable child instead of recursively spawning more
+    # workers.
+    os.environ["DOCSEEK_LEGACY_WORKER"] = "1"
     return write_chunk_file(
         output,
         DEFAULT_EXTRACTION_BROKER.iter_chunks(Path(source)),
