@@ -18,6 +18,10 @@ from docseek.chunks import iter_document_chunks
 from docseek.search_db import SearchDatabase
 
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+
+
 def build_workbook(path: Path, *, rows: int, sheets: int, columns: int) -> None:
     wb = Workbook(write_only=True)
     for sheet_index in range(sheets):
@@ -163,7 +167,9 @@ def index_stage(xlsx: Path, db_path: Path, query_iterations: int) -> dict[str, o
 
 def run_child(*args: str) -> dict[str, object]:
     command = [sys.executable, str(Path(__file__).resolve()), *args]
-    output = subprocess.check_output(command, text=True)
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
+    output = subprocess.check_output(command, text=True, encoding="utf-8", env=env)
     lines = [line for line in output.splitlines() if line.strip()]
     if not lines:
         raise RuntimeError(f"benchmark child produced no output: {command}")
