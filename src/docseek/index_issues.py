@@ -30,6 +30,8 @@ ERROR_LABELS = {
     "BadZipFile": "Office 文件损坏或格式异常",
     "FileDataError": "文件数据异常",
     "EmptyFileError": "空文件或无法解析",
+    "LegacyExtractionTimeout": "旧格式解析超时",
+    "LegacyExtractionError": "旧格式解析失败",
     "os_error": "系统访问错误",
 }
 
@@ -46,6 +48,7 @@ class IndexIssueStore:
         conn = sqlite3.connect(self.db_path, timeout=10, factory=_ClosingConnection)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA busy_timeout=10000")
         return conn
 
     def _init_schema(self) -> None:
