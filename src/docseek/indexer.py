@@ -11,6 +11,12 @@ from .chunk_writer import ChunkBatchWriter
 from .chunks import iter_document_chunks
 from .extraction_revision import current_extraction_revision
 from .extractors import SUPPORTED_EXTENSIONS
+from .file_exclusions import (
+    FILE_EXCLUSION_PATTERNS_KEY,
+    decode_file_exclusion_patterns,
+    matches_file_exclusion,
+    normalize_file_exclusion_patterns,
+)
 from .index_cleanup import remove_missing_under_root
 from .index_health import record_successful_reconcile
 from .index_issues import IndexIssueStore
@@ -64,12 +70,17 @@ class DirectoryIndexer:
         max_file_size: int | None = None,
         ignored_dir_names: set[str] | None = None,
         excluded_paths: list[str] | None = None,
+        excluded_file_patterns: list[str] | None = None,
     ) -> None:
         self.database = database
         self.chunk_store = ChunkStore(database.db_path)
         self.issues = IndexIssueStore(database.db_path)
 
-        configured_max_mb, configured_excluded = self._load_runtime_settings()
+        (
+            configured_max_mb,
+            configured_excluded,
+            configured_file_patterns,
+        ) = self._load_runtime_settings()
         if max_file_size is None:
             max_file_size = configured_max_mb * 1024 * 1024
         self.max_file_size = max_file_size
@@ -78,9 +89,15 @@ class DirectoryIndexer:
         }
         raw_excluded = excluded_paths if excluded_paths is not None else configured_excluded
         self.excluded_paths = [Path(path).resolve() for path in raw_excluded]
+        raw_patterns = (
+            excluded_file_patterns
+            if excluded_file_patterns is not None
+            else configured_file_patterns
+        )
+        self.excluded_file_patterns = normalize_file_exclusion_patterns(raw_patterns)
         self._cancel = threading.Event()
 
-    def _load_runtime_settings(self) -> tuple[int, list[str]]:
+    def _load_runtime_settings(self) -> tuple[int, list[str], list[str]]:
         """Read indexer settings with one lightweight metadata connection.
 
         The legacy SearchDatabase connection still owns compatibility FTS
@@ -91,7 +108,9 @@ class DirectoryIndexer:
         """
         with self.chunk_store.connect() as conn:
             rows = conn.execute(
-                "SELECT key, value FROM settings WHERE key IN ('max_file_size_mb', 'excluded_paths')"
+                "SELECT key, value FROM settings "
+                "WHERE key IN ('max_file_size_mb', 'excluded_paths', ?) ",
+                (FILE_EXCLUSION_PATTERNS_KEY,),
             ).fetchall()
         values = {str(row["key"]): str(row["value"]) for row in rows}
 
@@ -109,7 +128,11 @@ class DirectoryIndexer:
                 parsed = []
             if isinstance(parsed, list):
                 excluded = [str(item) for item in parsed if item]
-        return max_mb, excluded
+
+        file_patterns = decode_file_exclusion_patterns(
+            values.get(FILE_EXCLUSION_PATTERNS_KEY)
+        )
+        return max_mb, excluded, file_patterns
 
     def cancel(self) -> None:
         self._cancel.set()
@@ -232,6 +255,9 @@ class DirectoryIndexer:
             and not name.endswith(".tmp")
             and path.suffix.lower() in SUPPORTED_EXTENSIONS
         )
+
+    def _is_file_pattern_excluded(self, path: Path) -> bool:
+        return matches_file_exclusion(path, self.excluded_file_patterns)
 
     def _index_existing_file(
         self,
@@ -360,6 +386,12 @@ class DirectoryIndexer:
                 if not self._is_supported_candidate(path):
                     self._remove_indexed_path(normalized, stats)
                     self.issues.clear(normalized)
+                    continue
+
+                if self._is_file_pattern_excluded(path):
+                    self._remove_indexed_path(normalized, stats)
+                    self.issues.clear(normalized)
+                    stats.excluded += 1
                     continue
 
                 try:
@@ -493,8 +525,13 @@ class DirectoryIndexer:
                         continue
                     if not path.is_file():
                         continue
-                    if self._is_supported_candidate(path):
-                        yield path
+                    if not self._is_supported_candidate(path):
+                        continue
+                    if self._is_file_pattern_excluded(path):
+                        self.issues.clear(self._normalize(path))
+                        stats.excluded += 1
+                        continue
+                    yield path
                 except OSError as exc:
                     stats.skipped += 1
                     issue_path = self._normalize(path)
