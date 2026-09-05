@@ -1,153 +1,117 @@
 # DocSeek
 
-DocSeek 是一个面向 Windows 办公环境的本地全文检索工具。目标不是做一个“能搜正文的 Demo”，而是把 **Everything 的即时、简洁、低资源体验** 与 **Recoll/DocFetcher 一类全文检索工具的内容索引、相关性排序和预览能力**结合起来，并针对中文 Office 文档和内网办公本进行优化。
+DocSeek 是一个面向 Windows 办公环境的本地全文检索工具：像 Everything 一样快速定位文件，但重点解决“**记得正文内容，不记得文件名**”的问题。
 
-## 核心原则
+当前版本：**0.2.0 Beta**。核心检索、增量索引、Windows 打包和发布流水线已经建立，当前重点从继续堆功能转向 **真实办公机 Beta 验证、长期稳定性和安全边界**。
 
-- **完全本地**：不上传文件内容，不依赖云服务。
-- **搜索与解析解耦**：文件内容提前建立索引，搜索时不遍历磁盘。
-- **增量更新**：未修改文件不重复解析，普通文件变化只更新对应路径。
-- **界面始终可响应**：耗时索引在后台线程执行，可主动停止。
-- **普通用户优先**：默认直接输入关键词即可，不要求学习复杂检索语法。
-- **可解释结果**：显示文件名、路径、大小、修改时间、命中位置和上下文，并按相关性排序。
+> DocSeek 完全本地运行，不上传文档内容；但本地索引会保存从文档中提取的正文，因此索引数据库本身也应按可能包含敏感信息的数据文件对待。
 
 ## 当前能力
 
-- [x] PySide6 Windows 桌面界面
-- [x] 支持多个索引目录和自定义排除目录
-- [x] TXT / Markdown / Log / CSV / DOCX / XLSX / PPTX / PDF 内容解析
-- [x] 按位置流式 Chunk 索引：PDF 页、Excel 工作表与行范围、PPT 幻灯片、文本行范围、Word 内容块
-- [x] SQLite + FTS5 本地全文倒排索引
-- [x] 中文连续文本 overlapping-bigram 辅助索引
-- [x] unicode61 常规索引用于英文、混合文本和带空格短语
-- [x] BM25 + 文件名精确/前缀/包含命中加权排序
-- [x] 文件级正确分页：每批 100 个文件，滚动到底继续加载
-- [x] 180ms debounce 输入即搜
-- [x] 后台索引，避免阻塞 UI
-- [x] 增量索引：修改才重建，删除自动清理
-- [x] watchdog 精准文件更新：普通文件事件只更新对应路径
-- [x] 目录新增/删除/移动时自动回退到根目录校准
-- [x] watcher 单 Timer 防抖，不再为每个文件系统事件创建线程
-- [x] 超大文件默认保护（200 MB，可调整）
-- [x] 已索引文件后来超过大小上限时自动移除旧的过期索引
-- [x] 自动跳过 .git / node_modules / 临时 Office 文件等高噪声内容
-- [x] 文件类型筛选
-- [x] `ext:` / `path:` / `after:` / `before:` / `size:` 高级筛选
-- [x] 筛选条件可单独使用，无关键词时直接按文件元数据浏览
-- [x] Windows 路径反斜杠安全解析
-- [x] 搜索结果元数据：命中位置、类型、大小、修改时间、完整路径
-- [x] 命中上下文预览和关键词高亮
-- [x] 双击打开文件、打开文件所在位置、复制完整路径
-- [x] 索引状态、手动刷新与停止索引
-- [x] 索引问题持久记录：过大、权限不足、文件异常、解析失败等
-- [x] 索引问题查看界面；修复后重新索引会自动清除
-- [x] Windows GitHub Actions 回归测试；连续提交时自动取消已过时的 run
-- [x] CI compileall + 桌面模块 smoke import，避免界面层改动漏测
+### 搜索与结果
 
-## 架构
+- SQLite FTS5 本地全文倒排索引；
+- 中文连续文本 overlapping-bigram 辅助索引；
+- 英文、混合文本和带空格短语使用 unicode61；
+- BM25 + 文件名精确/前缀/包含加权；
+- 文件级精确分页，每批 100 个文件；
+- 180ms debounce 输入即搜；
+- `ext:` / `path:` / `after:` / `before:` / `size:` 元数据筛选；
+- `page:` / `slide:` / `sheet:` 结构定位提示；
+- Excel 工作表名、PPT/Word 标题等轻量结构排序信号；
+- 相关性 / 最近修改 / 文件名排序；
+- 搜索总数和耗时显示；
+- 搜索历史、常用搜索收藏、筛选 Chips、F1 搜索帮助；
+- `QTableView + QAbstractTableModel` 增量结果列表；
+- 命中位置、上下文预览和关键词高亮；
+- 双击打开文件、打开所在位置、复制路径。
 
-```text
-一个或多个工作目录
-        ↓
-Watchdog 文件变化监听
-        ↓（单 Timer 合并 / debounce）
-事件分类
-    ├─ 普通文件创建 / 修改 / 删除 / 移动
-    │       ↓
-    │   精准路径批次
-    │       ↓
-    │   DirectoryIndexer.update_paths
-    │
-    └─ 目录新增 / 删除 / 移动
-            ↓
-        根目录校准扫描
-            ↓
-DirectoryIndexer
-    ├─ mtime + size 增量判断
-    ├─ 临时/噪声目录过滤
-    ├─ 大文件保护
-    ├─ 索引异常记录
-    └─ 删除检测
-        ↓
-Chunk Extractors
-    ├─ 文本：按行范围
-    ├─ Word：按内容块
-    ├─ Excel：read_only，按工作表 / 行范围
-    ├─ PowerPoint：按幻灯片
-    └─ PDF：逐页提取
-        ↓
-SQLite schema v7
-    ├─ files：文件元数据
-    ├─ settings：索引配置
-    ├─ index_issues：索引问题
-    ├─ chunks：单份原始 Chunk；新数据使用版本化 zlib BLOB
-    ├─ chunk_index：contentless unicode61 FTS5
-    └─ chunk_index_cjk2：contentless overlapping-bigram FTS5
-        ↓
-文件级检索与聚合
-    ├─ 每个文件选择最佳命中 Chunk
-    ├─ BM25 正文相关性
-    ├─ 文件名命中加权
-    └─ 文件级 LIMIT / OFFSET
-        ↓
-结果列表 + 精确命中位置 + 上下文预览 + Windows 文件操作
-```
+### 索引与稳定性
 
-### v7 原文存储
+- 多个索引目录；
+- 单目录暂停 / 恢复，暂停时保留已有搜索结果；
+- 排除目录和文件名通配规则；
+- watchdog 精确单文件增量更新；
+- 目录结构变化时回退到根目录校准；
+- watcher 单 Timer 防抖，避免高噪声环境制造大量线程；
+- 修改才重建、删除自动清理；
+- 单文件默认 200 MB 保护阈值，可调整；
+- 跳过 `.git`、`node_modules`、Office `~$` 临时文件等高噪声内容；
+- 索引问题持久记录：权限、损坏文件、超限文件、解析异常等；
+- 问题文件支持精确重试 / 批量重试；
+- 索引概况显示文件数、数据库占用、活动/暂停目录、问题数和最近完整校准时间；
+- Schema Version + 显式迁移；
+- Extractor Revision 渐进式重建，解析器升级只刷新受影响格式。
 
-FTS5 负责召回和排名，但结果预览仍需要原始 Chunk 文本。v7 不再把新的原始 Chunk 以普通 TEXT 形式直接保存，而是使用带版本头的 zlib BLOB：
+### 支持格式
+
+优先使用结构保真度最高的专用解析器：
+
+- 文本：`.txt` `.md` `.log` `.csv`
+- Word：`.docx`
+- Excel：`.xlsx`
+- PowerPoint：`.pptx`
+- PDF：`.pdf`
+
+可选兼容后端：
+
+- Calamine：`.xls` `.xlsb` `.ods`
+- `iscc-tika` 原生兼容：`.xls` `.ods` `.doc` `.dot` `.rtf` `.odt` `.ppt` `.pps` `.odp` `.xlt`
+- Windows 本机 WPS COM 兜底：部分旧 Office / WPS 格式
+
+WPS 不是主解析路径；专有格式是否可解析取决于本机 WPS 能力。
+
+## Windows 使用
+
+DocSeek 已有两种经过 CI 实际启动验证的交付方式。
+
+### Setup.exe
+
+推荐普通用户使用：
 
 ```text
-原始 Chunk 文本
-      ↓
-UTF-8
-      ↓
-DSZ1 + zlib
-      ↓
-chunks.content
+DocSeek-<version>-Setup-x64.exe
 ```
 
-旧 v6 TEXT 行继续可读，启动升级时**不会批量重写整个数据库**。文件以后发生变化并重新建立索引时，再自然迁移成 v7 格式，从而避免大型现有索引升级时产生巨量 WAL 和长时间阻塞。
+特点：
 
-压缩只作用于原文副本；FTS5 仍接收原始 Unicode 文本，因此不会改变搜索语义、Chunk rowid 或相关性排序。
+- 每用户安装；
+- 默认安装到 `%LOCALAPPDATA%\Programs\DocSeek`；
+- 正常安装不要求管理员权限 / UAC 提权；
+- 默认创建开始菜单入口；
+- 桌面快捷方式可选；
+- 用户无需安装 Python；
+- 卸载删除程序文件，但**默认保留** `%USERPROFILE%\.docseek` 中的索引和设置，避免误删用户状态。
 
-## 中文检索策略
+### Portable ZIP
 
-SQLite FTS5 默认 `unicode61` 对中文连续正文并不理想。当前生产方案使用：
+无需安装：
 
-1. **连续中文关键词（主要针对 2 个及以上汉字）**：把文档中文连续文本展开为 overlapping bigram，例如 `客户经理` → `客户 / 户经 / 经理`，并通过相邻 bigram phrase 保证连续子串语义；实际实现由统一的 `_cjk_bigrams` / phrase 构造完成；
-2. **英文、带空格短语和混合查询**：使用 `unicode61`，双引号短语保持真正的 phrase 语义；
-3. 相关性排序在正文 BM25 之外增加文件名权重：**文件名精确命中 > 文件名前缀命中 > 文件名包含 > 纯正文命中**。
+```text
+DocSeek-<version>-Windows-x64.zip
+```
 
-> 注：单个汉字并不是当前产品重点检索场景；中文检索主要面向有实际语义的 2 字及以上关键词。
+解压后直接运行 `DocSeek.exe`。CI 会把最终 ZIP 解压到新的干净目录，再执行 frozen smoke，避免“构建目录能运行、交付 ZIP 缺文件”的问题。
 
-### 已验证但未采用的 CJK 替代方案
+> 当前 Beta 构建尚未完成商业代码签名。正式扩大分发范围前仍需评估代码签名、企业软件分发策略和终端安全策略。
 
-仓库保留 benchmark 用于复现实验，但不会因为单项指标更漂亮就直接更换生产 Schema。
+## 首次使用
 
-**方案 A：去重 bigram 候选索引 + v7 原文二次校验**
+1. 启动 DocSeek；
+2. 添加一个或多个允许检索的目录；
+3. 等待首次索引完成；
+4. 直接输入正文关键词搜索；
+5. 如果需要缩小范围，再使用筛选或高级语法。
 
-在 2000 文件 × 3 Chunk × 4 KiB 的 Windows 实验中：
+索引数据库默认位于：
 
-- 数据库约为基线的 **23.7%**；
-- 建库约快 **1.34×**；
-- 但常见词 `客户经理` 从约 **5 ms** 上升到约 **58 ms**，`信贷` 从约 **2 ms** 上升到约 **63 ms**。
+```text
+%USERPROFILE%\.docseek\docseek.db
+```
 
-原因是常见词候选过多，需要逐个读取、解压并检查原文，不适合 180ms debounce 的输入即搜体验。
+## 搜索示例
 
-**方案 B：SQLite 原生 trigram（3 字以上）+ 去重 bigram 短词索引**
-
-同规模实验中：
-
-- 查询更快，例如 `客户经理` 约 **10 ms → 7 ms**；
-- 建库仅快约 **7%**；
-- 数据库体积反而约为 bigram 基线的 **1.48×**。
-
-综合空间、建库、搜索速度和迁移风险后，当前继续保留 overlapping-bigram 生产方案。
-
-## 搜索语法
-
-普通搜索不需要任何语法：
+普通搜索：
 
 ```text
 客户经理
@@ -155,7 +119,7 @@ SQLite FTS5 默认 `unicode61` 对中文连续正文并不理想。当前生产�
 身份证有效期
 ```
 
-需要缩小范围时可以组合使用：
+组合筛选：
 
 ```text
 信贷 ext:pdf
@@ -167,130 +131,187 @@ SQLite FTS5 默认 `unicode61` 对中文连续正文并不理想。当前生产�
 "customer manager" manual
 ```
 
-也可以**只输入筛选条件**，不输入正文关键词：
+只使用筛选条件也可以直接浏览文件：
 
 ```text
 ext:pdf
 after:2026-01-01
 ext:xlsx size:>10MB
-path:"D:\工作资料\制度" before:2026-09-01
 ```
 
-此时 DocSeek 直接查询 `files` 元数据表，并按修改时间浏览文件，不会执行空的全文检索。
+结构提示：
 
-支持的过滤项：
+```text
+信贷业务 page:12
+年度总结 slide:4
+客户经理 sheet:"客户 数据"
+```
 
-- `ext:pdf`：文件类型
-- `path:制度` 或 `path:"D:\工作资料\业务 制度"`：路径包含
-- `after:YYYY-MM-DD`：修改时间不早于指定日期
-- `before:YYYY-MM-DD`：修改时间早于指定日期
-- `size:>10MB` / `size:<=500KB`：文件大小
-- 双引号：保留带空格的短语
+错误或未知筛选语法不会让搜索失败，而会按普通文本处理。
 
-错误或未知的过滤语法不会让搜索框报错，而是按普通文本处理。
+## 架构
 
-## 性能策略
+```text
+用户选择的一个或多个目录
+            ↓
+       Watchdog 监听
+            ↓
+精确文件事件 / 目录结构事件
+     ↓                 ↓
+update_paths       根目录校准
+     └────────┬────────┘
+              ↓
+       DirectoryIndexer
+              ↓
+       ExtractionBroker
+              ↓
+  文本 / Word / Excel / PPT / PDF
+  Calamine / Tika / WPS fallback
+              ↓
+         Structured DocIR
+              ↓
+         SQLite schema v8
+   ├─ files / settings / index_issues
+   ├─ chunks（原文副本）
+   ├─ chunk_index（unicode61）
+   └─ chunk_index_cjk2（CJK bigram）
+              ↓
+   ExactGroupedSearchEngine
+   ├─ BM25
+   ├─ 文件名加权
+   ├─ 结构意图加权
+   └─ 文件级精确分页
+              ↓
+      结果列表 / 预览 / 打开
+```
 
-DocSeek 不会在用户输入关键词后逐个打开文件。文件读取发生在索引阶段，查询只访问本地 FTS5 索引。
+### 原文存储
 
-目前采用：
+从 schema v7 起，新写入 Chunk 的原文副本使用版本化 zlib BLOB：
 
-- SQLite WAL，降低索引写入与搜索读取互相阻塞的概率；
-- 32 MB SQLite page cache；
-- 文件 `modified_time + size` 判断是否变化；
-- 普通文件变化由 Watchdog 合并后只更新对应路径，不再扫描整个根目录；
-- 文件移动同时处理旧路径删除与新路径更新；
-- 目录结构变化才回退到根目录校准扫描；
-- watcher 使用单个可重置 Timer 防抖，避免高噪声环境创建大量小线程；
-- 监听范围未变化时不重启 Observer，避免丢失尚未 flush 的事件；
-- Excel `read_only=True`，按行范围边解析边写 Chunk，并保留列位置以避免空单元格导致字段错位；
-- PDF 按页解析和索引；
-- Chunk 生成后直接流式写入 SQLite，不先把整份大文档堆进内存；
-- 全量扫描使用 128 文件批次，并增加约 8M 字符文本预算，避免少量超大文档撑大单事务；
-- 扫描结束时多个已删除文件在同一事务内清理，避免逐文件打开 SQLite 连接；
-- 单文件默认 200 MB 保护阈值；
-- 扫描时剪枝 `.git`、`node_modules` 等无关目录；
-- 跳过 `~$` Office 临时文件；
-- 搜索输入 180ms 防抖；
-- 每次加载 100 个**文件级结果**，滚动到底继续加载；
-- Chunk 命中先在 SQL 中按文件聚合，避免 Chunk 数量不同导致分页漏项或重复；
-- 纯筛选浏览直接访问文件元数据，不碰 FTS 正文索引。
+```text
+原始文本 → UTF-8 → DSZ1 + zlib → chunks.content
+```
 
-## 索引问题
+FTS5 仍接收原始 Unicode 文本，因此压缩不会改变搜索语义。旧 TEXT 行继续兼容读取，升级不会为了压缩而一次性重写整库；文件以后自然重建时再迁移。
 
-索引失败不会再只显示一次临时提示。DocSeek 会把问题持久记录到本地数据库，例如：
+schema v8 在此基础上继续完善了当前索引结构和迁移契约。
 
-- 文件超过当前大小上限；
-- 无权限访问文件或目录；
-- Office/PDF 文件损坏或格式异常；
-- 系统访问错误；
-- 解析器异常。
+## 为什么生产搜索不用 Progressive Top-K
 
-在“索引设置 → 索引状态”中可以查看问题、详情和发生时间，也可以打开所在位置或复制路径。问题修复后再次索引成功，对应记录会自动清除。
+仓库保留多种搜索实验。Progressive Top-K 在部分高频查询上更快，但密集结果场景曾出现明显 Recall@100 损失，因此没有进入用户搜索主链路。
+
+DocSeek 当前坚持：**先保证结果语义正确，再优化几十毫秒的延迟。**
+
+生产交互搜索继续使用 `ExactGroupedSearchEngine`。
+
+## 性能与质量门槛
+
+Windows CI 固定包含：
+
+- compileall；
+- 桌面模块 smoke import；
+- 1k 文件快速搜索 benchmark；
+- persistent search benchmark；
+- Recall@K / MRR / nDCG curated 回归集；
+- directory scan smoke；
+- 完整 unittest。
+
+另外保留 10k / 50k / 更大规模压力档以及真实 XLSX 等 one-shot benchmark。CI 合成负载已经达到既定 10k / 50k 查询延迟目标，但这些结果**不能替代真实办公机测试，也不能解释成正式 SLA**。
+
+## 脱敏诊断
+
+Beta 阶段出现问题时，可以在：
+
+```text
+索引设置 → 索引概况 → 导出脱敏诊断…
+```
+
+导出的 JSON 只包含聚合信息，例如：
+
+- DocSeek / schema 版本；
+- Windows、Python、SQLite 环境；
+- 已索引文件数量和数据库占用；
+- 活动 / 暂停目录数量；
+- 索引问题按错误代码的数量；
+- 最近完整校准时间；
+- 排除规则数量、文件大小上限等非内容配置。
+
+明确不包含：
+
+- 索引目录路径；
+- 文件路径或文件名；
+- 文档正文；
+- 索引问题详情；
+- 搜索历史或收藏查询。
+
+测试会专门向数据库写入 `SECRET_*` 路径、文件名和问题详情，再断言它们不能出现在诊断 JSON 中。
 
 ## 安全边界
 
-DocSeek 完全离线，但“离线”不等于“索引无敏感性”。当前 FTS5 数据库会保存从文档中提取的正文/Chunk，因此 `docseek.db` 本身也应当视为可能包含敏感信息的本地数据文件。
+“完全离线”不等于“索引没有敏感性”。`docseek.db` 保存提取后的正文 Chunk，因此需要按本地敏感数据文件处理。
 
-当前建议：
+当前原则：
 
 - 只索引用户明确选择且允许检索的目录；
-- 对涉敏或不应进入索引的目录使用“排除目录”；
-- 数据库放在当前用户目录，依赖 Windows 用户权限保护；
-- 不以管理员权限绕过原文件访问控制；
-- 内网正式落地前应结合终端安全规范评估数据库存储、清理和备份策略。
+- 支持排除目录和排除文件规则；
+- 数据库存放在当前用户目录；
+- 不以管理员权限绕过原文件 ACL；
+- 删除 / 卸载动作优先保守，避免误删用户数据。
 
-后续可研究更严格的安全索引模式，但不会用“只是索引”来弱化正文副本的安全风险。
+正式内网推广前仍需进一步评估：Windows ACL、索引加密或安全索引模式、备份/清理策略、代码签名和企业软件分发。
 
-## 下一阶段
+## Release 流程
 
-### P1：继续打磨长期使用体验
+仓库已经建立 guarded Windows release workflow：
 
-- [ ] 暂停 / 恢复单个索引目录
-- [ ] 排除文件名、后缀或通配规则
-- [ ] 搜索历史与常用筛选保存
-- [ ] 更清晰的首次使用引导与空状态
-- [ ] 搜索结果表改为模型视图，进一步降低超大结果集 UI 开销
-- [ ] 针对几十万文件索引的性能基准与批处理优化
+1. `docseek.__version__` 是版本唯一来源；
+2. 发布 tag 必须严格等于 `v<version>`；
+3. 构建 Portable ZIP 和 Setup.exe；
+4. 安装 Setup → frozen smoke → 卸载 → 验证用户数据保留；
+5. 解压最终 Portable ZIP → frozen smoke；
+6. 生成 `SHA256SUMS.txt`；
+7. PR / 手动 dry-run 只上传临时候选 artifact；
+8. 只有真正的 `v*` tag push 才创建或更新 GitHub Release。
 
-### P2：中文检索继续专项优化
+当前仍处于 Beta 阶段，因此仓库可以具备正式发布能力，但不意味着已经达到 GA / 大范围推广标准。
 
-- [ ] 本地中文分词方案对比
-- [ ] 中文错别字与近似搜索
-- [ ] 搜索建议与查询纠错
-- [ ] 同一文件多 Chunk 命中次数作为轻量相关性信号
+## Beta 验证
 
-所有方案都以 **离线、低资源、可打包部署** 为约束。
+真实 Windows 办公机验证方法见：
 
-### P3：可选智能检索
+- [`docs/BETA_TESTING.md`](docs/BETA_TESTING.md)
+- [`ROADMAP.md`](ROADMAP.md)
 
-后续可加入本地 Hybrid Search：
+重点验证：
 
-```text
-FTS5 / BM25 关键词召回
-          +
-Chunk 级本地 Embedding 语义召回
-          ↓
-       重排序
-```
-
-语义检索只作为可选增强，传统全文检索始终保留，以保证内网环境中的速度、稳定性和可解释性。
+- 真实 10k～50k Office 文件；
+- 首次索引与大 Excel/PDF 长尾；
+- 典型真实查询 Top5；
+- 增删改移后的 watcher 最终一致性；
+- 睡眠 / 唤醒；
+- 4～8 小时及 1～3 天连续运行；
+- 网络盘 / 同步盘（如实际需要）；
+- 异常、锁定、损坏和旧格式文件；
+- CPU / 内存 / WAL 长时间状态。
 
 ## 开发运行
 
 建议 Python 3.11 或 3.12：
 
-```bash
+```powershell
 python -m venv .venv
-.venv\Scripts\activate
-pip install -e .
+.venv\Scripts\Activate.ps1
+pip install -e ".[calamine,tika]"
 docseek
 ```
 
-索引数据库默认存放在：
+安装打包依赖后可构建 Windows 交付物：
 
-```text
-%USERPROFILE%\.docseek\docseek.db
+```powershell
+pip install -e ".[calamine,tika,wps,package]"
+.\packaging\windows\build_portable.ps1
+.\packaging\windows\build_installer.ps1
 ```
 
 ## 技术栈
@@ -303,11 +324,15 @@ docseek
 - python-docx
 - python-pptx
 - openpyxl
+- python-calamine（可选）
+- iscc-tika（可选）
+- pywin32 / WPS COM（可选 fallback）
+- PyInstaller + Inno Setup（Windows 发布）
 
 ## 项目定位
 
-DocSeek 现阶段优先解决：
+DocSeek 当前优先解决：
 
 > 文件很多、文件名记不住，但记得正文中的关键词，希望像 Everything 一样快速找到 Word、Excel、PowerPoint、PDF 等办公资料。
 
-在这个目标稳定实现之后，再逐步增加更高级的检索能力。
+下一阶段的成功标准不是“功能更多”，而是：**真实办公人员愿意每天开着用，而且在长时间运行、文件持续变化和实际敏感数据边界下仍然稳定、可解释、可维护。**
