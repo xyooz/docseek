@@ -10,6 +10,7 @@ class QueryParserTests(unittest.TestCase):
     def test_plain_terms(self) -> None:
         parsed = parse_query("客户经理 信贷")
         self.assertEqual(parsed.terms, ("客户经理", "信贷"))
+        self.assertEqual(parsed.text, "客户经理 信贷")
         self.assertIsNone(parsed.extension)
         self.assertIsNone(parsed.path_contains)
         self.assertFalse(parsed.has_filters)
@@ -36,6 +37,7 @@ class QueryParserTests(unittest.TestCase):
     def test_quoted_phrase_is_kept_as_one_term(self) -> None:
         parsed = parse_query('"customer manager" manual')
         self.assertEqual(parsed.terms, ("customer manager", "manual"))
+        self.assertEqual(parsed.text, '"customer manager" manual')
 
     def test_date_filters(self) -> None:
         parsed = parse_query("制度 after:2026-01-01 before:2026-09-01")
