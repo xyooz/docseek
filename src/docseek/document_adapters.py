@@ -17,6 +17,7 @@ from .document_types import (
     CALAMINE_CANDIDATE_EXTENSIONS,
     DIRECT_SUPPORTED_EXTENSIONS,
     FORMAT_CAPABILITIES,
+    TIKA_NATIVE_CANDIDATE_EXTENSIONS,
     WPS_LOCAL_CANDIDATE_EXTENSIONS,
 )
 from .wps_adapter import can_convert_extension, converted_openxml
@@ -41,6 +42,30 @@ class DocumentAdapter(Protocol):
         spreadsheet_rows_per_chunk: int = 200,
         on_progress: ChunkProgressCallback | None = None,
     ) -> Iterator[DocumentChunk]: ...
+
+
+def _iter_flat_text_chunks(text: str, *, target_chars: int) -> Iterator[DocumentChunk]:
+    """Bound text-only compatibility output without inventing document structure."""
+    ordinal = 0
+    buffer: list[str] = []
+    char_count = 0
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        buffer.append(stripped)
+        char_count += len(stripped)
+        if char_count >= target_chars:
+            content = "\n".join(buffer).strip()
+            if content:
+                yield DocumentChunk(ordinal, f"内容块 {ordinal + 1}", content)
+                ordinal += 1
+            buffer = []
+            char_count = 0
+
+    content = "\n".join(buffer).strip()
+    if content:
+        yield DocumentChunk(ordinal, f"内容块 {ordinal + 1}", content)
 
 
 @dataclass(slots=True, frozen=True)
@@ -72,13 +97,7 @@ class DirectDocumentAdapter:
 
 @dataclass(slots=True, frozen=True)
 class CalamineSpreadsheetAdapter:
-    """Rust-backed spreadsheet reader exposed through python-calamine.
-
-    XLSX deliberately remains on the existing openpyxl path for now. Calamine
-    first adds formats that the direct parser cannot read. The registry can
-    later change priorities for large XLSX files after a real workload A/B,
-    without changing the indexing contract.
-    """
+    """Rust-backed spreadsheet reader exposed through python-calamine."""
 
     name: str = "calamine"
     priority: int = 80
@@ -96,7 +115,7 @@ class CalamineSpreadsheetAdapter:
         spreadsheet_rows_per_chunk: int = 200,
         on_progress: ChunkProgressCallback | None = None,
     ) -> Iterator[DocumentChunk]:
-        del target_chars  # spreadsheets are chunked by rows, not character budget.
+        del target_chars
         if not self.is_available():
             raise AdapterUnavailable(
                 "读取该表格格式需要可选组件 python-calamine；"
@@ -155,14 +174,48 @@ class CalamineSpreadsheetAdapter:
 
 
 @dataclass(slots=True, frozen=True)
-class WpsNativeAdapter:
-    """Thin vendor fallback to the installed WPS client.
+class TikaNativeAdapter:
+    """Broad-format local extraction through Rust-native iscc-tika.
 
-    WPS-native/legacy files are converted to a temporary OOXML copy and then
-    handed to the already-tested direct parsers. This adapter is intentionally
-    lower priority than native/open parsers; the source file is never modified
-    and no online conversion service is used.
+    This backend is intentionally a compatibility layer. It does not fabricate
+    page/slide/table coordinates when Tika only provides flat text; DocIR marks
+    those chunks as generic so structure-aware ranking can distinguish fidelity.
     """
+
+    name: str = "tika-native"
+    priority: int = 70
+    extensions: frozenset[str] = TIKA_NATIVE_CANDIDATE_EXTENSIONS
+
+    def is_available(self) -> bool:
+        return importlib.util.find_spec("iscc_tika") is not None
+
+    def iter_chunks(
+        self,
+        path: Path,
+        *,
+        target_chars: int = 12_000,
+        spreadsheet_rows_per_chunk: int = 200,
+        on_progress: ChunkProgressCallback | None = None,
+    ) -> Iterator[DocumentChunk]:
+        del spreadsheet_rows_per_chunk, on_progress
+        if not self.is_available():
+            raise AdapterUnavailable(
+                "读取该旧版/开放文档格式需要可选组件 iscc-tika；"
+                "该组件使用本地 Rust/Tika 原生库，不需要 Java 服务"
+            )
+
+        from iscc_tika import Extractor
+
+        extractor = Extractor()
+        text, _metadata = extractor.extract_file_to_string(str(path))
+        if not isinstance(text, str):
+            text = str(text)
+        yield from _iter_flat_text_chunks(text, target_chars=max(1, target_chars))
+
+
+@dataclass(slots=True, frozen=True)
+class WpsNativeAdapter:
+    """Thin vendor fallback to the installed WPS client."""
 
     name: str = "wps-local"
     priority: int = 60
@@ -187,8 +240,6 @@ class WpsNativeAdapter:
                 f"{path.suffix.lower()} 需要本机 WPS Office 自动化组件和 DocSeek wps 可选依赖"
             )
         with converted_openxml(path) as converted:
-            # Use the private direct parser here, not the public broker entry,
-            # so a vendor fallback cannot recursively select itself.
             yield from _iter_direct_document_chunks(
                 converted,
                 target_chars=target_chars,
@@ -204,6 +255,7 @@ class DocumentAdapterRegistry:
             or (
                 DirectDocumentAdapter(),
                 CalamineSpreadsheetAdapter(),
+                TikaNativeAdapter(),
                 WpsNativeAdapter(),
             )
         )
@@ -213,9 +265,6 @@ class DocumentAdapterRegistry:
 
     @property
     def known_extensions(self) -> frozenset[str]:
-        # Include every registered product capability, even when its optional
-        # parser is missing. The indexer can then persist a useful issue instead
-        # of silently pretending a known office file does not exist.
         return frozenset(FORMAT_CAPABILITIES)
 
     def is_known_path(self, path: Path) -> bool:
