@@ -106,8 +106,6 @@ class ChunkStore:
             except sqlite3.OperationalError:
                 self._trigram_available = False
 
-            # Schema v2 adds a compact path/ordinal -> chunk_fts rowid map.
-            # Existing indexes can be upgraded without reparsing source files.
             if previous_version < 2:
                 conn.execute("DELETE FROM chunk_lookup")
                 conn.execute(
@@ -383,15 +381,15 @@ class ChunkStore:
             table = "chunk_fts_cjk2"
             fts_query = f'"{compact_cjk}"'
             score_expr = "bm25(chunk_fts_cjk2, 0.0, 0.0, 0.0, 5.0, 1.0)"
-            extra_joins = """
+            snippet_expr = "''"
+            final_join = """
                 JOIN chunk_lookup lookup
-                  ON lookup.path = chunk_fts_cjk2.path
-                 AND lookup.ordinal = CAST(chunk_fts_cjk2.ordinal AS INTEGER)
+                  ON lookup.path = paged.path
+                 AND lookup.ordinal = paged.ordinal
                 JOIN chunk_fts base
                   ON base.rowid = lookup.fts_rowid
             """
-            snippet_expr = "''"
-            raw_content_expr = "base.content"
+            final_content_expr = "base.content"
         else:
             compact = "".join(query.split())
             use_tri = (
@@ -402,9 +400,9 @@ class ChunkStore:
             table = "chunk_fts_tri" if use_tri else "chunk_fts"
             fts_query = self._build_fts_query(query)
             score_expr = f"bm25({table}, 0.0, 0.0, 0.0, 5.0, 1.0)"
-            extra_joins = ""
             snippet_expr = f"snippet({table}, 4, '[[HIT]]', '[[/HIT]]', ' … ', 36)"
-            raw_content_expr = "NULL"
+            final_join = ""
+            final_content_expr = "NULL"
 
         clauses = [f"{table} MATCH :fts_query"]
         params: dict[str, object] = {
@@ -447,12 +445,10 @@ class ChunkStore:
                     CAST({table}.ordinal AS INTEGER) AS ordinal,
                     {table}.location AS location,
                     {snippet_expr} AS snippet,
-                    {raw_content_expr} AS raw_content,
                     {score_expr} AS bm25_score,
                     {filename_boost_expr} AS filename_boost
                 FROM {table}
                 JOIN files f ON f.path = {table}.path
-                {extra_joins}
                 WHERE {' AND '.join(clauses)}
             ),
             ranked AS (
@@ -468,17 +464,27 @@ class ChunkStore:
             file_hits AS (
                 SELECT
                     path, filename, extension, modified_time, size,
-                    location, snippet, raw_content, relevance_score
+                    ordinal, location, snippet, relevance_score
                 FROM ranked
                 WHERE file_rank = 1
+            ),
+            paged AS (
+                SELECT
+                    path, filename, extension, modified_time, size,
+                    ordinal, location, snippet, relevance_score,
+                    COUNT(*) OVER() AS total_count
+                FROM file_hits
+                ORDER BY relevance_score ASC, modified_time DESC, path ASC
+                LIMIT :limit OFFSET :offset
             )
             SELECT
-                path, filename, extension, modified_time, size,
-                location, snippet, raw_content, relevance_score AS score,
-                COUNT(*) OVER() AS total_count
-            FROM file_hits
-            ORDER BY relevance_score ASC, modified_time DESC, path ASC
-            LIMIT :limit OFFSET :offset
+                paged.path, paged.filename, paged.extension,
+                paged.modified_time, paged.size, paged.location,
+                paged.snippet, {final_content_expr} AS raw_content,
+                paged.relevance_score AS score, paged.total_count
+            FROM paged
+            {final_join}
+            ORDER BY paged.relevance_score ASC, paged.modified_time DESC, paged.path ASC
         """
         with self.connect() as conn:
             rows = conn.execute(sql, params).fetchall()
@@ -493,7 +499,6 @@ class ChunkStore:
                             {filename_boost_expr} AS filename_boost
                         FROM {table}
                         JOIN files f ON f.path = {table}.path
-                        {extra_joins}
                         WHERE {' AND '.join(clauses)}
                     ),
                     ranked AS (
