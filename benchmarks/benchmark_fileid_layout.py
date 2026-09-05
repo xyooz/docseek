@@ -143,11 +143,12 @@ def _build(
 
 def _query_sql(*, use_file_id: bool) -> str:
     join_files = "JOIN files f ON f.id = c.file_id" if use_file_id else "JOIN files f ON f.path = c.path"
-    partition = "f.id" if use_file_id else "f.path"
+    file_key = "f.id" if use_file_id else "f.path"
     return f"""
         WITH hits AS (
             SELECT
                 c.id AS chunk_id,
+                {file_key} AS file_key,
                 f.path,
                 f.modified_time,
                 c.ordinal,
@@ -161,7 +162,7 @@ def _query_sql(*, use_file_id: bool) -> str:
             SELECT
                 *,
                 ROW_NUMBER() OVER (
-                    PARTITION BY {partition}
+                    PARTITION BY file_key
                     ORDER BY score ASC, ordinal ASC
                 ) AS file_rank
             FROM hits
