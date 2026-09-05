@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import time
+import weakref
 from dataclasses import dataclass
 
 from PySide6.QtCore import QObject, QRunnable, Signal
@@ -40,19 +41,19 @@ class SearchWorkerSignals(QObject):
 
 _query_lock = threading.Lock()
 _generation_lock = threading.Lock()
-_latest_generation = -1
+_latest_generations: weakref.WeakKeyDictionary[ChunkStore, int] = weakref.WeakKeyDictionary()
 
 
-def _publish_generation(generation: int) -> None:
-    global _latest_generation
+def _publish_generation(store: ChunkStore, generation: int) -> None:
     with _generation_lock:
-        if generation > _latest_generation:
-            _latest_generation = generation
+        current = _latest_generations.get(store, -1)
+        if generation > current:
+            _latest_generations[store] = generation
 
 
-def _is_stale(generation: int) -> bool:
+def _is_stale(store: ChunkStore, generation: int) -> bool:
     with _generation_lock:
-        return generation < _latest_generation
+        return generation < _latest_generations.get(store, generation)
 
 
 class SearchWorker(QRunnable):
@@ -63,10 +64,10 @@ class SearchWorker(QRunnable):
     paying connection/PRAGMA setup on every keystroke.
 
     Interactive searches are serialized. When the user keeps typing, a newer
-    generation is published immediately. Older queued workers check that value
-    again after acquiring the query lock and become no-ops instead of running a
-    stale FTS statement. The one query already executing is allowed to finish;
-    the UI generation check prevents its response from replacing newer text.
+    generation is published for that window's ChunkStore immediately. Older
+    queued workers check the value again after acquiring the query lock and
+    become no-ops instead of running stale FTS statements. Weak store keys keep
+    this state isolated between windows and let it disappear automatically.
     """
 
     def __init__(self, store: ChunkStore, request: SearchRequest) -> None:
@@ -74,7 +75,7 @@ class SearchWorker(QRunnable):
         self.store = store
         self.request = request
         self.signals = SearchWorkerSignals()
-        _publish_generation(request.generation)
+        _publish_generation(store, request.generation)
 
     def _emit_stale(self, started: float) -> None:
         self.signals.finished.emit(
@@ -87,13 +88,14 @@ class SearchWorker(QRunnable):
 
     def run(self) -> None:
         started = time.perf_counter()
-        if _is_stale(self.request.generation):
+        if _is_stale(self.store, self.request.generation):
             self._emit_stale(started)
             return
 
         with _query_lock:
-            # Another request may have been created while this worker waited.
-            if _is_stale(self.request.generation):
+            # Another request for the same window may have been created while
+            # this worker waited for the previous exact query to finish.
+            if _is_stale(self.store, self.request.generation):
                 self._emit_stale(started)
                 return
 
