@@ -3,7 +3,11 @@ from __future__ import annotations
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import QGroupBox, QLabel, QVBoxLayout
 
-from .index_health import capture_index_health, format_index_health
+from .index_health import (
+    capture_index_health,
+    format_index_health,
+    format_reconcile_time,
+)
 from .index_issues_dialog import IndexIssuesDialog
 from .index_retry import build_index_retry_plan, dispatch_index_retry
 from .index_root_state import IndexRootStateStore
@@ -38,6 +42,9 @@ class PausableIndexSettingsDialog(IndexSettingsDialog):
         self.health_summary_label = QLabel()
         self.health_summary_label.setWordWrap(True)
         self.health_summary_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.reconcile_time_label = QLabel()
+        self.reconcile_time_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.reconcile_time_label.setStyleSheet("color: palette(mid);")
         self.health_hint_label = QLabel(
             "占用包含 SQLite 主库及当前 WAL/SHM 文件；暂停目录的现有索引仍计入文件数和空间占用。"
         )
@@ -47,6 +54,7 @@ class PausableIndexSettingsDialog(IndexSettingsDialog):
         health_group = QGroupBox("索引概况")
         health_layout = QVBoxLayout()
         health_layout.addWidget(self.health_summary_label)
+        health_layout.addWidget(self.reconcile_time_label)
         health_layout.addWidget(self.health_hint_label)
         health_group.setLayout(health_layout)
 
@@ -89,6 +97,11 @@ class PausableIndexSettingsDialog(IndexSettingsDialog):
             return
         snapshot = capture_index_health(self.database)
         self.health_summary_label.setText(format_index_health(snapshot))
+        if hasattr(self, "reconcile_time_label"):
+            self.reconcile_time_label.setText(
+                "最近完整校准："
+                + format_reconcile_time(snapshot.last_successful_reconcile_at)
+            )
 
     def _refresh_issue_summary(self) -> None:
         # Base __init__ calls this virtual method before the health widget exists,
