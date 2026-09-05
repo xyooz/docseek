@@ -6,6 +6,7 @@ import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 
+from docseek.chunk_store import ChunkStore
 from docseek.diagnostics import build_diagnostic_report, write_diagnostic_report
 from docseek.file_exclusions import FileExclusionStore
 from docseek.index_issues import IndexIssueStore
@@ -20,6 +21,10 @@ class DiagnosticReportTests(unittest.TestCase):
             base = Path(temp_dir)
             db_path = base / "docseek.db"
             db = SearchDatabase(db_path)
+            # Match the real desktop startup contract: SearchDatabase owns the
+            # compatibility tables, while ChunkStore applies the current chunk
+            # schema/migrations and marks PRAGMA user_version current.
+            ChunkStore(db_path)
 
             root = base / "SECRET_ROOT_CUSTOMER_FILES"
             excluded = root / "SECRET_EXCLUDED_DIRECTORY"
