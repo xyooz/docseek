@@ -9,6 +9,7 @@ from pathlib import Path
 
 from benchmark_search import build_synthetic_index
 from docseek.chunk_store import ChunkStore
+from docseek.exact_search import ExactGroupedSearchEngine
 from docseek.search_session import PersistentSearchStore
 
 
@@ -36,12 +37,17 @@ def _measure(callable_, *, iterations: int) -> tuple[float, float, float, list[s
     return cold, p50, p95, [row.path for row in result.items], result.total_count
 
 
+def _print_measurement(label: str, stats: tuple[float, float, float, list[str], int]) -> None:
+    cold, p50, p95, _paths, _total = stats
+    print(f"  {label}: cold={cold:.2f}ms p50={p50:.2f}ms p95={p95:.2f}ms")
+
+
 def main() -> None:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
     parser = argparse.ArgumentParser(
-        description="Compare cold-per-query vs persistent SQLite search sessions"
+        description="Compare cold-per-query and persistent exact-search strategies"
     )
     parser.add_argument("--files", type=int, default=1000)
     parser.add_argument("--chunks", type=int, default=3)
@@ -63,8 +69,9 @@ def main() -> None:
 
         regular = ChunkStore(db_path)
         persistent = PersistentSearchStore(db_path)
+        grouped = ExactGroupedSearchEngine(persistent)
         try:
-            print("DocSeek persistent search-session benchmark")
+            print("DocSeek persistent exact-search benchmark")
             print(
                 f"files={args.files:,} chunks/file={args.chunks} payload/chunk~={args.payload_kb}KiB "
                 f"page={args.limit}"
@@ -84,26 +91,33 @@ def main() -> None:
                     lambda q=query: regular.search_page(q, limit=args.limit),
                     iterations=args.iterations,
                 )
-                persistent_stats = _measure(
+                persistent_window = _measure(
                     lambda q=query: persistent.search_page(q, limit=args.limit),
                     iterations=args.iterations,
                 )
+                persistent_grouped = _measure(
+                    lambda q=query: grouped.search_page(q, limit=args.limit),
+                    iterations=args.iterations,
+                )
 
-                reg_cold, reg_p50, reg_p95, reg_paths, reg_total = regular_stats
-                per_cold, per_p50, per_p95, per_paths, per_total = persistent_stats
-                speedup = reg_p50 / per_p50 if per_p50 else 0.0
-                exact = reg_paths == per_paths and reg_total == per_total
+                reg_cold, reg_p50, _reg_p95, reg_paths, reg_total = regular_stats
+                _win_cold, win_p50, _win_p95, win_paths, win_total = persistent_window
+                _grp_cold, grp_p50, _grp_p95, grp_paths, grp_total = persistent_grouped
+
+                window_exact = reg_paths == win_paths and reg_total == win_total
+                grouped_exact = reg_paths == grp_paths and reg_total == grp_total
+                session_speedup = reg_p50 / win_p50 if win_p50 else 0.0
+                grouped_speedup = win_p50 / grp_p50 if grp_p50 else 0.0
+
                 print(f"query={query!r} matches={reg_total:,}")
+                _print_measurement("new-connection/window", regular_stats)
+                _print_measurement("persistent/window", persistent_window)
+                _print_measurement("persistent/grouped", persistent_grouped)
                 print(
-                    f"  new-connection: cold={reg_cold:.2f}ms p50={reg_p50:.2f}ms "
-                    f"p95={reg_p95:.2f}ms"
-                )
-                print(
-                    f"  persistent: cold={per_cold:.2f}ms p50={per_p50:.2f}ms "
-                    f"p95={per_p95:.2f}ms"
-                )
-                print(
-                    f"  warm_speedup={speedup:.2f}x exact_match={'yes' if exact else 'NO'}"
+                    f"  session_speedup={session_speedup:.2f}x "
+                    f"grouped_vs_window={grouped_speedup:.2f}x "
+                    f"window_exact={'yes' if window_exact else 'NO'} "
+                    f"grouped_exact={'yes' if grouped_exact else 'NO'}"
                 )
         finally:
             persistent.close()
