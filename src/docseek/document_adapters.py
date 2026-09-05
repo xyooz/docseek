@@ -14,10 +14,10 @@ from .chunks import (
     iter_document_chunks,
 )
 from .document_types import (
+    CALAMINE_CANDIDATE_EXTENSIONS,
     DIRECT_SUPPORTED_EXTENSIONS,
     FORMAT_CAPABILITIES,
     WPS_LOCAL_CANDIDATE_EXTENSIONS,
-    DocumentFamily,
 )
 from .wps_adapter import can_convert_extension, converted_openxml
 
@@ -66,14 +66,14 @@ class CalamineSpreadsheetAdapter:
     """Rust-backed spreadsheet reader exposed through python-calamine.
 
     XLSX deliberately remains on the existing openpyxl path for now. Calamine
-    is first used to add formats that the direct parser cannot read. We can
-    later A/B the same registry priorities for very large XLSX files without
-    changing the indexing contract.
+    first adds formats that the direct parser cannot read. The registry can
+    later change priorities for large XLSX files after a real workload A/B,
+    without changing the indexing contract.
     """
 
     name: str = "calamine"
     priority: int = 80
-    extensions: frozenset[str] = frozenset({".xls", ".xlsb", ".ods"})
+    extensions: frozenset[str] = CALAMINE_CANDIDATE_EXTENSIONS
     rows_per_chunk: int = 200
 
     def is_available(self) -> bool:
@@ -156,8 +156,7 @@ class WpsNativeAdapter:
 
     def is_available(self) -> bool:
         # Availability is format-family specific, so registry selection performs
-        # the final check through supports_path(). This method only indicates
-        # whether at least one WPS family is potentially usable.
+        # the final check through supports_path().
         return any(can_convert_extension(extension) for extension in self.extensions)
 
     def supports_path(self, path: Path) -> bool:
@@ -194,9 +193,7 @@ class DocumentAdapterRegistry:
         # Include every registered product capability, even when its optional
         # parser is missing. This lets the indexer persist a useful issue instead
         # of silently pretending a known WPS/legacy file does not exist.
-        return frozenset(FORMAT_CAPABILITIES) | frozenset(
-            extension for adapter in self._adapters for extension in adapter.extensions
-        )
+        return frozenset(FORMAT_CAPABILITIES)
 
     def is_known_path(self, path: Path) -> bool:
         return path.suffix.lower() in self.known_extensions
