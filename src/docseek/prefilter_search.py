@@ -211,7 +211,7 @@ class MetadataPrefilterSearchEngine:
                     size=int(row["size"]),
                     location=str(row["location"] or ""),
                     snippet=self.store._snippet_from_content(
-                        str(row["raw_content"] or ""), query
+                        self.store.decode_content(row["raw_content"]), query
                     ),
                     score=float(row["score"]),
                 )
