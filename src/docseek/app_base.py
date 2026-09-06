@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
     QFileDialog,
+    QFrame,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -21,6 +22,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QProgressBar,
     QPushButton,
+    QSizePolicy,
     QSplitter,
     QStatusBar,
     QTableView,
@@ -40,6 +42,7 @@ from .search_db import SearchDatabase
 from .search_sort import SORT_FILENAME, SORT_MODIFIED, SORT_RELEVANCE
 from .search_worker import SearchRequest, SearchResponse, SearchWorker
 from .settings_dialog import IndexSettingsDialog
+from .ui_theme import APPLICATION_STYLESHEET
 from .watcher import WatchBatch, WatchManager
 
 
@@ -103,6 +106,17 @@ def empty_result_html(*, filter_only: bool, has_filters: bool = False,
         message += f"<p>{paused_roots} 个目录已暂停更新，现有结果可能不是最新内容。</p>"
     message += '<p><a href="docseek:settings">检查索引范围、暂停目录和问题文件</a></p>'
     return message
+
+
+def idle_preview_html() -> str:
+    """Return useful guidance before the user has entered a search."""
+    return (
+        "<div style='margin: 24px;'>"
+        "<h3>从记得的一句话开始</h3>"
+        "<p>输入文件名或正文中的关键词，DocSeek 会显示命中片段和文档位置。</p>"
+        "<p style='color: #667085;'>也可以只选择文件类型，或按 F1 查看日期、路径、大小等筛选方式。</p>"
+        "</div>"
+    )
 
 
 class IndexSignals(QObject):
@@ -179,6 +193,8 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("DocSeek — 本地文档全文检索")
         self.resize(1300, 800)
+        self.setMinimumSize(1040, 640)
+        self.setStyleSheet(APPLICATION_STYLESHEET)
 
         self.database = SearchDatabase(DB_PATH)
         self.chunk_store = ChunkStore(DB_PATH)
@@ -207,6 +223,7 @@ class MainWindow(QMainWindow):
         self.watch_manager = WatchManager(self.watch_signals.changed.emit)
 
         self.search_input = QLineEdit()
+        self.search_input.setObjectName("searchInput")
         self.search_input.setClearButtonEnabled(True)
         self.search_input.setPlaceholderText(
             '搜索正文或直接筛选，例如：信贷 ext:pdf，或 ext:pdf after:2026-01-01'
@@ -216,18 +233,24 @@ class MainWindow(QMainWindow):
             "size:>10MB 大小 · 引号用于短语；筛选条件可单独使用\n"
             "快捷键：↑/↓ 进入结果 · Enter 搜索/打开 · Esc 清空搜索"
         )
-        self.search_input.setMinimumHeight(38)
+        self.search_input.setMinimumHeight(44)
+
+        self.search_button = QPushButton("搜索")
+        self.search_button.setProperty("primary", True)
+        self.search_button.setMinimumHeight(44)
+        self.search_button.setMinimumWidth(76)
+        self.search_button.setToolTip("立即搜索（也可以按 Enter）")
 
         self.type_filter = QComboBox()
         for label, extension in FILE_FILTERS:
             self.type_filter.addItem(label, extension)
-        self.type_filter.setMinimumHeight(38)
+        self.type_filter.setMinimumHeight(44)
         self.type_filter.setMinimumWidth(105)
 
         self.sort_filter = QComboBox()
         for label, sort_mode in SORT_OPTIONS:
             self.sort_filter.addItem(label, sort_mode)
-        self.sort_filter.setMinimumHeight(38)
+        self.sort_filter.setMinimumHeight(44)
         self.sort_filter.setMinimumWidth(105)
         self.sort_filter.setToolTip(
             "排序方式：有正文关键词时默认按相关性；无关键词纯筛选时“相关性”按最近修改显示"
@@ -249,6 +272,7 @@ class MainWindow(QMainWindow):
         self.refresh_button = QPushButton("刷新索引")
         self.settings_button = QPushButton("索引设置")
         self.cancel_button = QPushButton("停止")
+        self.cancel_button.setProperty("danger", True)
         for button in (
             self.choose_button,
             self.refresh_button,
@@ -259,17 +283,17 @@ class MainWindow(QMainWindow):
         self.cancel_button.setVisible(False)
 
         self.scope_label = QLabel()
+        self.scope_label.setObjectName("scopeLabel")
         self.scope_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.scope_label.setMinimumWidth(0)
+        self.scope_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
 
         self.index_progress_panel = QWidget()
         self.index_progress_panel.setVisible(False)
         self.index_progress_panel.setObjectName("indexProgressPanel")
-        self.index_progress_panel.setStyleSheet(
-            "QWidget#indexProgressPanel { border: 1px solid palette(mid); border-radius: 6px; }"
-        )
         progress_layout = QHBoxLayout(self.index_progress_panel)
-        progress_layout.setContentsMargins(10, 7, 10, 7)
-        progress_layout.setSpacing(10)
+        progress_layout.setContentsMargins(14, 10, 14, 10)
+        progress_layout.setSpacing(12)
 
         self.index_progress_bar = QProgressBar()
         self.index_progress_bar.setRange(0, 0)
@@ -295,6 +319,7 @@ class MainWindow(QMainWindow):
         progress_layout.addWidget(self.index_counts_label)
 
         self.results = QTableView()
+        self.results.setObjectName("resultsTable")
         self.results_model = SearchResultsModel(self.results)
         self.results.setModel(self.results_model)
         self.results.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -313,35 +338,86 @@ class MainWindow(QMainWindow):
         self.results.setAlternatingRowColors(True)
 
         self.preview = QTextBrowser()
+        self.preview.setObjectName("previewPane")
         self.preview.setOpenExternalLinks(False)
         self.preview.setOpenLinks(False)
         self.preview.anchorClicked.connect(self._preview_action)
         self.preview.setPlaceholderText(
             "输入记得的正文关键词开始搜索；选中结果后，这里会显示命中上下文和具体位置。"
         )
+        self.preview.setHtml(idle_preview_html())
+
+        self.results_panel = QFrame()
+        self.results_panel.setObjectName("surfacePanel")
+        results_layout = QVBoxLayout(self.results_panel)
+        results_layout.setContentsMargins(0, 0, 0, 0)
+        results_layout.setSpacing(0)
+        results_heading = QWidget()
+        results_heading_layout = QHBoxLayout(results_heading)
+        results_heading_layout.setContentsMargins(14, 11, 14, 9)
+        self.results_title_label = QLabel("搜索结果")
+        self.results_title_label.setObjectName("sectionTitle")
+        self.results_meta_label = QLabel("输入关键词开始搜索")
+        self.results_meta_label.setObjectName("sectionMeta")
+        self.results_meta_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        results_heading_layout.addWidget(self.results_title_label)
+        results_heading_layout.addStretch(1)
+        results_heading_layout.addWidget(self.results_meta_label)
+        results_layout.addWidget(results_heading)
+        results_layout.addWidget(self.results, 1)
+
+        self.preview_panel = QFrame()
+        self.preview_panel.setObjectName("surfacePanel")
+        preview_layout = QVBoxLayout(self.preview_panel)
+        preview_layout.setContentsMargins(0, 0, 0, 0)
+        preview_layout.setSpacing(0)
+        preview_heading = QWidget()
+        preview_heading_layout = QHBoxLayout(preview_heading)
+        preview_heading_layout.setContentsMargins(14, 11, 14, 9)
+        preview_title = QLabel("内容预览")
+        preview_title.setObjectName("sectionTitle")
+        preview_hint = QLabel("双击结果打开文件")
+        preview_hint.setObjectName("sectionMeta")
+        preview_heading_layout.addWidget(preview_title)
+        preview_heading_layout.addStretch(1)
+        preview_heading_layout.addWidget(preview_hint)
+        preview_layout.addWidget(preview_heading)
+        preview_layout.addWidget(self.preview, 1)
 
         splitter = QSplitter(Qt.Horizontal)
-        splitter.addWidget(self.results)
-        splitter.addWidget(self.preview)
+        splitter.setHandleWidth(8)
+        splitter.addWidget(self.results_panel)
+        splitter.addWidget(self.preview_panel)
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 2)
         splitter.setSizes([820, 480])
 
-        top_bar = QHBoxLayout()
-        top_bar.addWidget(self.search_input, 1)
-        top_bar.addWidget(self.type_filter)
-        top_bar.addWidget(self.sort_filter)
-        top_bar.addWidget(self.choose_button)
-        top_bar.addWidget(self.refresh_button)
-        top_bar.addWidget(self.settings_button)
-        top_bar.addWidget(self.cancel_button)
+        self.search_bar_panel = QWidget()
+        self.search_bar_layout = QHBoxLayout(self.search_bar_panel)
+        self.search_bar_layout.setContentsMargins(0, 0, 0, 0)
+        self.search_bar_layout.setSpacing(8)
+        self.search_bar_layout.addWidget(self.search_input, 1)
+        self.search_bar_layout.addWidget(self.search_button)
+        self.search_bar_layout.addWidget(self.type_filter)
+        self.search_bar_layout.addWidget(self.sort_filter)
+
+        self.workspace_bar_panel = QFrame()
+        self.workspace_bar_panel.setObjectName("workspaceBar")
+        self.workspace_bar_layout = QHBoxLayout(self.workspace_bar_panel)
+        self.workspace_bar_layout.setContentsMargins(12, 7, 8, 7)
+        self.workspace_bar_layout.setSpacing(6)
+        self.workspace_bar_layout.addWidget(self.scope_label, 1)
+        self.workspace_bar_layout.addWidget(self.choose_button)
+        self.workspace_bar_layout.addWidget(self.refresh_button)
+        self.workspace_bar_layout.addWidget(self.settings_button)
+        self.workspace_bar_layout.addWidget(self.cancel_button)
 
         layout = QVBoxLayout()
-        layout.setContentsMargins(14, 14, 14, 10)
-        layout.setSpacing(10)
-        layout.addLayout(top_bar)
+        layout.setContentsMargins(18, 18, 18, 10)
+        layout.setSpacing(12)
+        layout.addWidget(self.search_bar_panel)
         layout.addWidget(self.filter_chip_panel)
-        layout.addWidget(self.scope_label)
+        layout.addWidget(self.workspace_bar_panel)
         layout.addWidget(self.index_progress_panel)
         layout.addWidget(splitter, 1)
 
@@ -358,6 +434,7 @@ class MainWindow(QMainWindow):
         self.search_input.textChanged.connect(self.search_timer.start)
         self.search_input.textChanged.connect(self._refresh_filter_chips)
         self.search_input.returnPressed.connect(self._perform_search)
+        self.search_button.clicked.connect(self._perform_search)
         self.type_filter.currentIndexChanged.connect(self._perform_search)
         self.sort_filter.currentIndexChanged.connect(self._perform_search)
         self.choose_button.clicked.connect(self._choose_directory)
@@ -488,7 +565,7 @@ class MainWindow(QMainWindow):
         self.index_progress_panel.setVisible(True)
         self.index_file_label.setText("准备建立索引…")
         self.index_file_label.setToolTip("")
-        self.index_detail_label.setText("")
+        self.index_detail_label.setText("已写入的内容可以继续搜索")
         self.index_counts_label.setText("已处理 0 · 更新 0")
         self.current_worker = worker
         worker.signals.progress.connect(self._index_progress)
@@ -531,7 +608,7 @@ class MainWindow(QMainWindow):
         self.index_file_label.setText(filename)
         if not detail:
             self.index_file_label.setToolTip(path)
-        self.index_detail_label.setText(detail)
+        self.index_detail_label.setText(detail or "已写入的内容可以继续搜索")
         self.index_counts_label.setText(f"已处理 {scanned:,} · 更新 {indexed:,}")
 
     def _index_finished(self, stats: IndexStats) -> None:
@@ -674,6 +751,7 @@ class MainWindow(QMainWindow):
         self.loading_generation = None
         self.seen_result_paths.clear()
         self.results_model.clear()
+        self.results_meta_label.setText("正在搜索…")
         self.preview.clear()
         self._load_next_page(select_first=True)
 
@@ -685,6 +763,8 @@ class MainWindow(QMainWindow):
         parsed = parse_query(raw_query)
         extension = parsed.extension or self.type_filter.currentData()
         if not parsed.terms and not parsed.has_filters and extension is None:
+            self.results_meta_label.setText("输入关键词开始搜索")
+            self.preview.setHtml(idle_preview_html())
             self._refresh_status()
             return
 
@@ -753,6 +833,7 @@ class MainWindow(QMainWindow):
             else f"{response.elapsed_ms:.0f} ms"
         )
         displayed = self.results_model.rowCount()
+        self.results_meta_label.setText(f"{displayed:,} / {page.total_count:,} 个文件")
         self.statusBar().showMessage(
             f"{mode}：已显示 {displayed:,} / 共 {page.total_count:,} 个文件"
             f" · {latency}{suffix}"
@@ -783,6 +864,7 @@ class MainWindow(QMainWindow):
         if self.loading_generation == generation:
             self.loading_more = False
             self.loading_generation = None
+        self.results_meta_label.setText("搜索失败")
         self.statusBar().showMessage(f"搜索失败：{message}", 8000)
 
     def _on_results_scroll(self, value: int) -> None:

@@ -28,6 +28,8 @@ class FirstRunUiTests(unittest.TestCase):
                     self.assertFalse(window.first_run_panel.isHidden())
                     self.assertTrue(window.content_splitter.isHidden())
                     self.assertFalse(window.search_input.isEnabled())
+                    self.assertTrue(window.search_bar_panel.isHidden())
+                    self.assertTrue(window.workspace_bar_panel.isHidden())
                     self.assertTrue(window.type_filter.isHidden())
                     self.assertTrue(window.sort_filter.isHidden())
                     self.assertTrue(window.history_button.isHidden())
@@ -60,6 +62,8 @@ class FirstRunUiTests(unittest.TestCase):
                     self.assertTrue(window.first_run_panel.isHidden())
                     self.assertFalse(window.content_splitter.isHidden())
                     self.assertTrue(window.search_input.isEnabled())
+                    self.assertFalse(window.search_bar_panel.isHidden())
+                    self.assertFalse(window.workspace_bar_panel.isHidden())
                     self.assertFalse(window.type_filter.isHidden())
                     self.assertFalse(window.settings_button.isHidden())
                 finally:

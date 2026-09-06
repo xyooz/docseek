@@ -8,7 +8,9 @@ from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
+    QFrame,
     QHeaderView,
+    QHBoxLayout,
     QLabel,
     QMenu,
     QMessageBox,
@@ -141,16 +143,13 @@ class MainWindow(app_base.MainWindow):
         self.help_button.setToolTip("查看搜索语法、结构定位和快捷键（F1）")
         self.help_button.clicked.connect(self._show_search_help)
 
-        root_layout = self.centralWidget().layout()
-        top_bar = root_layout.itemAt(0).layout() if root_layout is not None else None
-        if top_bar is None:
-            raise RuntimeError("DocSeek top search bar is unavailable")
+        top_bar = self.workspace_bar_layout
         insert_at = top_bar.indexOf(self.choose_button)
         if insert_at < 0:
             insert_at = top_bar.count()
         top_bar.insertWidget(insert_at, self.history_button)
         top_bar.insertWidget(insert_at + 1, self.favorite_button)
-        top_bar.insertWidget(insert_at + 2, self.help_button)
+        top_bar.insertWidget(top_bar.indexOf(self.cancel_button), self.help_button)
 
         help_action = QAction("搜索帮助", self)
         help_action.setShortcut("F1")
@@ -203,15 +202,27 @@ class MainWindow(app_base.MainWindow):
             raise RuntimeError("DocSeek result area is unavailable")
 
         self.first_run_panel = QWidget(self)
+        self.first_run_panel.setObjectName("welcomeCanvas")
         welcome_layout = QVBoxLayout(self.first_run_panel)
-        welcome_layout.setContentsMargins(80, 40, 80, 40)
-        welcome_layout.setSpacing(14)
+        welcome_layout.setContentsMargins(48, 32, 48, 32)
         welcome_layout.addStretch(1)
+
+        self.first_run_card = QFrame()
+        self.first_run_card.setObjectName("welcomeCard")
+        self.first_run_card.setMaximumWidth(720)
+        card_layout = QVBoxLayout(self.first_run_card)
+        card_layout.setContentsMargins(48, 38, 48, 36)
+        card_layout.setSpacing(14)
+
+        eyebrow = QLabel("DOCSEEK · 本地全文检索")
+        eyebrow.setObjectName("eyebrowLabel")
+        eyebrow.setAlignment(Qt.AlignCenter)
+        card_layout.addWidget(eyebrow)
 
         title = QLabel("开始使用 DocSeek")
         title.setAlignment(Qt.AlignCenter)
-        title.setStyleSheet("font-size: 24px; font-weight: 600;")
-        welcome_layout.addWidget(title)
+        title.setObjectName("welcomeTitle")
+        card_layout.addWidget(title)
 
         description = QLabel(
             "选择你的办公资料目录，DocSeek 会在本机建立全文索引。\n"
@@ -219,14 +230,30 @@ class MainWindow(app_base.MainWindow):
         )
         description.setAlignment(Qt.AlignCenter)
         description.setWordWrap(True)
-        description.setStyleSheet("font-size: 14px;")
-        welcome_layout.addWidget(description)
+        description.setObjectName("welcomeDescription")
+        card_layout.addWidget(description)
+
+        info_panel = QFrame()
+        info_panel.setObjectName("welcomeInfo")
+        info_layout = QHBoxLayout(info_panel)
+        info_layout.setContentsMargins(16, 11, 16, 11)
+        info_layout.setSpacing(18)
+        for text in (
+            "✓ 内容仅保存在本机",
+            "✓ 自动监测文件变化",
+            "✓ 支持常用办公文档",
+        ):
+            item = QLabel(text)
+            item.setAlignment(Qt.AlignCenter)
+            info_layout.addWidget(item, 1)
+        card_layout.addWidget(info_panel)
 
         self.first_run_button = QPushButton("选择资料目录")
         self.first_run_button.setMinimumHeight(42)
         self.first_run_button.setMinimumWidth(180)
+        self.first_run_button.setProperty("primary", True)
         self.first_run_button.clicked.connect(self._choose_directory)
-        welcome_layout.addWidget(self.first_run_button, 0, Qt.AlignHCenter)
+        card_layout.addWidget(self.first_run_button)
 
         self.first_run_storage_button = QPushButton("先设置索引保存位置…")
         self.first_run_storage_button.setToolTip(
@@ -235,18 +262,22 @@ class MainWindow(app_base.MainWindow):
         self.first_run_storage_button.clicked.connect(
             self._choose_first_run_storage_location
         )
-        welcome_layout.addWidget(self.first_run_storage_button, 0, Qt.AlignHCenter)
+        self.first_run_storage_button.setProperty("quiet", True)
+        self.first_run_storage_button.setMinimumHeight(36)
+        card_layout.addWidget(self.first_run_storage_button)
 
         self.first_run_storage_status = QLabel("")
         self.first_run_storage_status.setAlignment(Qt.AlignCenter)
         self.first_run_storage_status.setWordWrap(True)
-        self.first_run_storage_status.setStyleSheet("color: palette(mid);")
-        welcome_layout.addWidget(self.first_run_storage_status)
+        self.first_run_storage_status.setObjectName("mutedLabel")
+        card_layout.addWidget(self.first_run_storage_status)
 
         steps = QLabel("1. 选择目录   →   2. 建立索引   →   3. 输入关键词搜索并打开文件")
         steps.setAlignment(Qt.AlignCenter)
-        steps.setStyleSheet("color: palette(mid);")
-        welcome_layout.addWidget(steps)
+        steps.setObjectName("mutedLabel")
+        card_layout.addWidget(steps)
+
+        welcome_layout.addWidget(self.first_run_card, 0, Qt.AlignHCenter)
         welcome_layout.addStretch(1)
 
         root_layout.insertWidget(root_layout.count() - 1, self.first_run_panel, 1)
@@ -255,11 +286,14 @@ class MainWindow(app_base.MainWindow):
         has_roots = bool(self.database.get_index_roots())
         self.first_run_panel.setVisible(not has_roots)
         self.content_splitter.setVisible(has_roots)
+        self.search_bar_panel.setVisible(has_roots)
+        self.workspace_bar_panel.setVisible(has_roots)
         self.search_input.setEnabled(has_roots)
 
         for widget in (
             self.type_filter,
             self.sort_filter,
+            self.search_button,
             self.history_button,
             self.favorite_button,
             self.help_button,
@@ -674,7 +708,7 @@ class MainWindow(app_base.MainWindow):
         if self._history_ui_ready:
             self.history_record_timer.stop()
             self._history_candidate_generation = None
-            explicit = self.sender() is self.search_input
+            explicit = self.sender() in (self.search_input, self.search_button)
             if explicit:
                 # Avoid the pending 180 ms debounce issuing the same Enter
                 # search a second time.
