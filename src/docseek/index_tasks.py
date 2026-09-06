@@ -61,8 +61,11 @@ class IndexTaskStore:
         return conn
 
     def _init_schema(self) -> None:
+        # The main database bootstrap owns journal-mode configuration. Reissuing
+        # journal_mode=WAL from an ordinary sidecar connection can require an
+        # exclusive lock and would regress the database-is-locked bug fixed in
+        # the 0.2.1 indexing work.
         with self.connect() as conn:
-            conn.execute("PRAGMA journal_mode=WAL")
             conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS index_tasks(
