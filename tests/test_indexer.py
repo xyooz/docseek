@@ -9,7 +9,11 @@ from openpyxl import Workbook
 
 from docseek.chunk_store import ChunkStore
 from docseek.index_issues import IndexIssueStore
-from docseek.indexer import DirectoryIndexer
+from docseek.indexer import (
+    FULL_SCAN_BATCH_SIZE,
+    FULL_SCAN_BATCH_TEXT_CHARS,
+    DirectoryIndexer,
+)
 from docseek.search_db import SearchDatabase
 
 
@@ -24,6 +28,10 @@ class DirectoryIndexerTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
+
+    def test_full_scan_batching_keeps_benchmark_verified_document_and_text_caps(self) -> None:
+        self.assertEqual(FULL_SCAN_BATCH_SIZE, 512)
+        self.assertEqual(FULL_SCAN_BATCH_TEXT_CHARS, 8_000_000)
 
     def test_excluded_directory_is_not_indexed(self) -> None:
         visible = self.root / "visible.txt"
