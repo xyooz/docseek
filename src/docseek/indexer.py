@@ -165,6 +165,25 @@ class DirectoryIndexer:
         except OSError:
             return str(path.absolute())
 
+    def _normalize_discovered_candidate(
+        self,
+        path: Path,
+        *,
+        normalized_directory: str,
+        is_symlink: bool,
+    ) -> str:
+        """Reuse the resolved parent discovered by the full-scan walker.
+
+        A normal DirEntry is already known to live under the directory we just
+        resolved before ``scandir``. Joining that canonical parent with the
+        entry's actual name is equivalent to resolving the child again without
+        paying another filesystem round trip. File symlinks deliberately keep
+        the old full ``resolve`` behavior so aliases still map to their target.
+        """
+        if is_symlink:
+            return self._normalize(path)
+        return os.path.join(normalized_directory, path.name)
+
     def _has_file_record(self, path: str) -> bool:
         with self.chunk_store.connect() as conn:
             row = conn.execute("SELECT 1 FROM files WHERE path = ? LIMIT 1", (path,)).fetchone()
@@ -639,6 +658,7 @@ class DirectoryIndexer:
 
         discovery_issue_clears: set[str] = set()
         discovery_issue_records: list[tuple[str, str, str]] = []
+        normalized_candidates: dict[str, str] = {}
 
         discovery_callback = on_discovery
         if discovery_callback is None and on_progress is not None:
@@ -659,6 +679,7 @@ class DirectoryIndexer:
                     issue_clears=discovery_issue_clears,
                     issue_records=discovery_issue_records,
                     on_discovery=discovery_callback,
+                    normalized_candidates=normalized_candidates,
                 )
             )
         )
@@ -690,7 +711,11 @@ class DirectoryIndexer:
                     raise IndexCancelled()
 
                 stats.scanned += 1
-                normalized = self._normalize(path)
+                normalized = normalized_candidates.get(str(path))
+                if normalized is None:
+                    # Defensive fallback for callers/subclasses that provide a
+                    # candidate outside the normal discovery snapshot.
+                    normalized = self._normalize(path)
                 seen_paths.add(normalized)
 
                 try:
@@ -764,6 +789,7 @@ class DirectoryIndexer:
         issue_clears: set[str] | None = None,
         issue_records: list[tuple[str, str, str]] | None = None,
         on_discovery: Callable[[Path, int], None] | None = None,
+        normalized_candidates: dict[str, str] | None = None,
     ) -> Iterable[Path]:
         def clear_issue(path: str) -> None:
             if issue_clears is None:
@@ -845,6 +871,12 @@ class DirectoryIndexer:
                         clear_issue(self._normalize(path))
                         stats.excluded += 1
                         continue
+                    if normalized_candidates is not None:
+                        normalized_candidates[str(path)] = self._normalize_discovered_candidate(
+                            path,
+                            normalized_directory=normalized_dir,
+                            is_symlink=entry.is_symlink(),
+                        )
                     discovered_candidates += 1
                     report_discovery(directory)
                     yield path
