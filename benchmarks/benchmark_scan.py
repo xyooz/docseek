@@ -76,11 +76,15 @@ def main() -> None:
         update_only_ms = (time.perf_counter() - update_started) * 1000
         total_update_ms = init_ms + update_only_ms
 
+        first_post_discovery = max(0.0, first_seconds - first_discovery_seconds)
+        second_post_discovery = max(0.0, second_seconds - second_discovery_seconds)
+
         print("DocSeek directory scan benchmark")
         print(f"files={args.files:,}")
         print(
             f"first_scan={first_seconds:.3f}s "
             f"discovery={first_discovery_seconds:.3f}s "
+            f"post_discovery={first_post_discovery:.3f}s "
             f"candidates={first_candidates:,} "
             f"discovery_share={first_discovery_seconds / first_seconds:.1%} "
             f"files_per_second={args.files / first_seconds:.1f} "
@@ -89,6 +93,7 @@ def main() -> None:
         print(
             f"unchanged_scan={second_seconds:.3f}s "
             f"discovery={second_discovery_seconds:.3f}s "
+            f"post_discovery={second_post_discovery:.3f}s "
             f"candidates={second_candidates:,} "
             f"discovery_share={second_discovery_seconds / second_seconds:.1%} "
             f"files_per_second={args.files / second_seconds:.1f} "
