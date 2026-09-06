@@ -7,10 +7,12 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from .schema import ensure_schema_compatible
+from .sqlite_runtime import current_schema_objects, ensure_wal_mode
 
 
 _CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
 _CJK_RUN_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]+")
+_READY_OBJECTS = frozenset({"files", "settings", "file_fts", "file_fts_cjk2"})
 
 
 class _ClosingConnection(sqlite3.Connection):
@@ -40,6 +42,15 @@ class SearchDatabase:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._trigram_available = False
         self._preflight_schema_version()
+
+        # Index workers are created repeatedly during watcher updates. Once the
+        # v10 database is fully initialized, reopening it must be a read-only
+        # schema probe rather than another round of WAL/schema initialization.
+        objects = current_schema_objects(self.db_path)
+        if objects is not None and _READY_OBJECTS.issubset(objects):
+            self._trigram_available = "file_fts_tri" in objects
+            return
+
         self._init_schema()
 
     def _preflight_schema_version(self) -> None:
@@ -59,11 +70,6 @@ class SearchDatabase:
             factory=_ClosingConnection,
         )
         conn.row_factory = sqlite3.Row
-        # journal_mode is database-wide state and can require a schema-level
-        # lock even when the database is already in WAL mode. Reissuing it on
-        # every metadata/read connection created avoidable lock contention on
-        # real Windows desktops while the index writer held a transaction.
-        # Configure WAL once during schema initialization instead.
         conn.execute("PRAGMA busy_timeout=10000")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA temp_store=MEMORY")
@@ -72,9 +78,10 @@ class SearchDatabase:
 
     def _init_schema(self) -> None:
         with self.connect() as conn:
-            # Set WAL once per database initialization. Normal SearchDatabase
-            # connections deliberately do not mutate journal mode.
-            conn.execute("PRAGMA journal_mode=WAL")
+            # journal_mode is database-wide state. Only bootstrap/migration is
+            # allowed to change it; current-schema runtime reopens skip this
+            # method entirely.
+            ensure_wal_mode(conn)
             conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS files (
