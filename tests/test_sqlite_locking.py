@@ -6,8 +6,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 from docseek.chunk_store import ChunkStore
-from docseek.schema import CURRENT_SCHEMA_VERSION
 from docseek.index_issues import IndexIssueStore
+from docseek.indexer import DirectoryIndexer
+from docseek.schema import CURRENT_SCHEMA_VERSION
 from docseek.search_db import SearchDatabase
 from docseek.search_session import PersistentSearchStore
 
@@ -93,6 +94,38 @@ class SqliteLockingTests(unittest.TestCase):
                 writer.close()
                 reader._connection.rollback()
                 reader.close()
+
+    def test_nested_full_scan_does_not_self_lock_during_lazy_discovery(self) -> None:
+        """Directory issue cleanup must finish before the batched writer starts.
+
+        The real Windows failure appeared on multi-level office trees: indexing
+        a fast-lane file opened a batch transaction, then lazy discovery entered
+        a child directory and tried to clear an old issue using another SQLite
+        connection. That second writer waited on DocSeek's own first writer and
+        eventually raised ``database is locked``.
+        """
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            root = base / "docs"
+            nested = root / "nested"
+            nested.mkdir(parents=True)
+            (root / "root.txt").write_text("根目录 信贷", encoding="utf-8")
+            (nested / "child.txt").write_text("子目录 客户经理", encoding="utf-8")
+
+            db_path = base / "docseek.db"
+            database = SearchDatabase(db_path)
+            ChunkStore(db_path)
+            issues = IndexIssueStore(db_path)
+            issues.record(str(nested.resolve()), "os_error", "stale directory issue")
+
+            stats = DirectoryIndexer(database).scan(root)
+
+            self.assertEqual(stats.indexed, 2)
+            self.assertEqual(issues.count(), 0)
+            store = ChunkStore(db_path)
+            self.assertEqual([row.filename for row in store.search("信贷")], ["root.txt"])
+            self.assertEqual([row.filename for row in store.search("客户经理")], ["child.txt"])
 
 
 if __name__ == "__main__":
