@@ -9,10 +9,14 @@ from typing import Iterable
 from .chunk_codec import decode_chunk_content, encode_chunk_content
 from .chunks import DocumentChunk
 from .schema import ensure_schema_compatible, mark_schema_current
+from .sqlite_runtime import current_schema_objects, ensure_wal_mode
 
 
 _CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
 _CJK_RUN_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]+")
+_READY_OBJECTS = frozenset(
+    {"files", "chunks", "chunk_index", "chunk_index_cjk2", "extraction_state"}
+)
 
 
 class _ClosingConnection(sqlite3.Connection):
@@ -64,11 +68,15 @@ class ChunkStore:
 
     def __init__(self, db_path: Path) -> None:
         self.db_path = db_path
+        objects = current_schema_objects(self.db_path)
+        if objects is not None and _READY_OBJECTS.issubset(objects):
+            return
         self._init_schema()
 
     def connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=10, factory=_ClosingConnection)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=10000")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA temp_store=MEMORY")
         conn.execute("PRAGMA cache_size=-32768")
@@ -84,7 +92,7 @@ class ChunkStore:
 
     def _init_schema(self) -> None:
         with self.connect() as conn:
-            conn.execute("PRAGMA journal_mode=WAL")
+            ensure_wal_mode(conn)
             previous_version = ensure_schema_compatible(conn)
 
             if previous_version < 3:
