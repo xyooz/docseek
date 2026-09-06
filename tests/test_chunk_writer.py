@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from docseek.chunk_store import ChunkStore
 from docseek.chunk_writer import ChunkBatchWriter
@@ -24,6 +25,59 @@ class ChunkBatchWriterTests(unittest.TestCase):
     def _broken_chunks():
         yield DocumentChunk(0, "块 1", "这部分不应该留下")
         raise ValueError("synthetic parser failure")
+
+    def test_new_document_skips_stale_chunk_delete_path(self) -> None:
+        path = r"C:\docs\new.txt"
+        with patch.object(
+            self.store,
+            "_delete_chunks",
+            side_effect=AssertionError("brand-new document must not query stale chunks"),
+        ):
+            with ChunkBatchWriter(self.store, batch_size=32) as writer:
+                writer.replace_document(
+                    path=path,
+                    filename="new.txt",
+                    extension=".txt",
+                    modified_time=1.0,
+                    size=10,
+                    chunks=[DocumentChunk(0, "行 1", "首次建立索引 信贷")],
+                )
+
+        self.assertEqual(
+            [row.filename for row in self.store.search("首次建立索引")],
+            ["new.txt"],
+        )
+
+    def test_existing_document_keeps_atomic_delete_and_replace_path(self) -> None:
+        path = r"C:\docs\replace.txt"
+        with ChunkBatchWriter(self.store, batch_size=32) as writer:
+            writer.replace_document(
+                path=path,
+                filename="replace.txt",
+                extension=".txt",
+                modified_time=1.0,
+                size=10,
+                chunks=[DocumentChunk(0, "行 1", "旧版正文 信贷")],
+            )
+
+        original_delete = self.store._delete_chunks
+        with patch.object(self.store, "_delete_chunks", wraps=original_delete) as delete_chunks:
+            with ChunkBatchWriter(self.store, batch_size=32) as writer:
+                writer.replace_document(
+                    path=path,
+                    filename="replace.txt",
+                    extension=".txt",
+                    modified_time=2.0,
+                    size=20,
+                    chunks=[DocumentChunk(0, "行 1", "新版正文 客户经理")],
+                )
+            self.assertEqual(delete_chunks.call_count, 1)
+
+        self.assertEqual(self.store.search("旧版正文"), [])
+        self.assertEqual(
+            [row.filename for row in self.store.search("新版正文")],
+            ["replace.txt"],
+        )
 
     def test_failed_document_rolls_back_without_losing_batch_neighbors(self) -> None:
         with ChunkBatchWriter(self.store, batch_size=32) as writer:
