@@ -14,6 +14,7 @@ from docseek.document_adapters import (
     CalamineSpreadsheetAdapter,
     XlsxCalamineFastAdapter,
 )
+from docseek.indexer import IndexCancelled
 
 
 @unittest.skipUnless(
@@ -102,6 +103,23 @@ class CalamineSpreadsheetAdapterTests(unittest.TestCase):
                 actual = list(XlsxCalamineFastAdapter().iter_chunks(path))
 
         self.assertEqual(actual, expected)
+
+    def test_xlsx_fast_path_does_not_swallow_index_cancellation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "取消.xlsx"
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.title = "客户明细"
+            sheet.append(["客户号", "姓名"])
+            sheet.append(["001", "张三"])
+            workbook.save(path)
+            workbook.close()
+
+            def cancel(_label: str, _row: int) -> None:
+                raise IndexCancelled()
+
+            with self.assertRaises(IndexCancelled):
+                list(XlsxCalamineFastAdapter().iter_chunks(path, on_progress=cancel))
 
     def test_default_registry_prefers_xlsx_fast_path(self) -> None:
         self.assertEqual(
