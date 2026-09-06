@@ -71,6 +71,49 @@ class IndexDiscoveryBatchingTests(unittest.TestCase):
             ):
                 self.assertFalse(indexer._is_excluded(candidate))
 
+    def test_regular_candidate_reuses_resolved_discovery_parent(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            root = base / "docs"
+            root.mkdir()
+            document = root / "制度.txt"
+            document.write_text("客户经理管理办法", encoding="utf-8")
+
+            database = SearchDatabase(base / "docseek.db")
+            indexer = DirectoryIndexer(database, excluded_paths=[])
+            original_normalize = indexer._normalize
+            normalized_calls: list[Path] = []
+
+            def track_normalize(path: Path) -> str:
+                normalized_calls.append(Path(path))
+                return original_normalize(path)
+
+            with patch.object(indexer, "_normalize", side_effect=track_normalize):
+                stats = indexer.scan(root)
+
+            self.assertEqual(stats.indexed, 1)
+            self.assertNotIn(document, normalized_calls)
+            self.assertEqual(
+                [row.filename for row in ChunkStore(database.db_path).search("管理办法")],
+                [document.name],
+            )
+
+    def test_discovered_file_symlink_keeps_full_resolve_semantics(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database = SearchDatabase(Path(temp_dir) / "docseek.db")
+            indexer = DirectoryIndexer(database, excluded_paths=[])
+            candidate = Path(temp_dir) / "alias.txt"
+
+            with patch.object(indexer, "_normalize", return_value="resolved-target") as normalize:
+                normalized = indexer._normalize_discovered_candidate(
+                    candidate,
+                    normalized_directory=str(Path(temp_dir).resolve()),
+                    is_symlink=True,
+                )
+
+            self.assertEqual(normalized, "resolved-target")
+            normalize.assert_called_once_with(candidate)
+
 
 if __name__ == "__main__":
     unittest.main()
