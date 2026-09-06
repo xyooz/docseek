@@ -459,10 +459,6 @@ class DirectoryIndexer:
                     retry_after=prefetched_state[7],
                 )
             ):
-                # A full reconciliation should keep the persisted issue visible
-                # but avoid repeatedly invoking an unchanged broken parser.
-                # Watcher updates and explicit issue retries use update_paths(),
-                # which intentionally bypasses this full-scan-only deferral.
                 stats.skipped += 1
                 return False
 
@@ -501,10 +497,6 @@ class DirectoryIndexer:
             if on_detail:
                 on_detail(path, location, current)
             elif on_progress:
-                # The current desktop worker already transports file progress
-                # as a Path plus counters. Preserve that compatibility while
-                # exposing useful row-level XLSX progress immediately; a future
-                # UI can opt into the structured on_detail callback directly.
                 display = Path(f"{path.name} · {location} · 已读取 {current:,} 行")
                 on_progress(display, stats)
 
@@ -538,8 +530,6 @@ class DirectoryIndexer:
                 extraction_revision=extraction_revision,
             )
         else:
-            # Use the same atomic state/content commit and pre-parse spool as
-            # full scans, including for watcher-triggered Office updates.
             with ChunkBatchWriter(self.chunk_store, batch_size=1) as single_writer:
                 chunk_count = single_writer.replace_document(
                     **common_args, extraction_revision=extraction_revision)
@@ -612,7 +602,11 @@ class DirectoryIndexer:
                 raise
             except SourceChangedDuringExtraction as exc:
                 stats.skipped += 1
-                self._record_extraction_state(normalized, current_extraction_revision(path.suffix), ExtractionStatus.PENDING)
+                self._record_extraction_state(
+                    normalized,
+                    current_extraction_revision(path.suffix),
+                    ExtractionStatus.PENDING,
+                )
                 self.issues.record(normalized, "source_changed", str(exc))
             except FileNotFoundError:
                 self._remove_indexed_path(normalized, stats)
@@ -638,12 +632,33 @@ class DirectoryIndexer:
         successful_paths: set[str] = set()
         index_state = self._load_index_state()
 
+        discovery_issue_clears: set[str] = set()
+        discovery_issue_records: list[tuple[str, str, str]] = []
+        candidates = list(
+            prioritize_index_candidates(
+                self._iter_supported_files(
+                    root,
+                    stats,
+                    issue_clears=discovery_issue_clears,
+                    issue_records=discovery_issue_records,
+                )
+            )
+        )
+
+        # Discovery stays outside the batched chunk writer. Healthy directory
+        # traversal therefore performs no SQLite writes, while issue cleanup is
+        # collapsed into at most two short metadata transactions before content
+        # indexing starts. This preserves the single-writer invariant that fixed
+        # the real Windows ``database is locked`` reports without paying one
+        # connection/commit per visited directory.
+        self.issues.clear_many(discovery_issue_clears)
+        self.issues.record_many(discovery_issue_records)
+
         with ChunkBatchWriter(
             self.chunk_store,
             batch_size=FULL_SCAN_BATCH_SIZE,
             max_batch_text_chars=FULL_SCAN_BATCH_TEXT_CHARS,
         ) as writer:
-            candidates = prioritize_index_candidates(self._iter_supported_files(root, stats))
             for path in candidates:
                 if self._cancel.is_set():
                     writer.flush()
@@ -675,7 +690,11 @@ class DirectoryIndexer:
                 except SourceChangedDuringExtraction as exc:
                     writer.flush()
                     stats.skipped += 1
-                    self._record_extraction_state(normalized, current_extraction_revision(path.suffix), ExtractionStatus.PENDING)
+                    self._record_extraction_state(
+                        normalized,
+                        current_extraction_revision(path.suffix),
+                        ExtractionStatus.PENDING,
+                    )
                     self.issues.record(normalized, "source_changed", str(exc))
                 except FileNotFoundError:
                     writer.flush()
@@ -696,6 +715,8 @@ class DirectoryIndexer:
         return stats
 
     def _is_excluded(self, path: Path) -> bool:
+        if not self.excluded_paths:
+            return False
         try:
             resolved = path.resolve()
         except OSError:
@@ -710,7 +731,26 @@ class DirectoryIndexer:
                 continue
         return False
 
-    def _iter_supported_files(self, root: Path, stats: IndexStats) -> Iterable[Path]:
+    def _iter_supported_files(
+        self,
+        root: Path,
+        stats: IndexStats,
+        *,
+        issue_clears: set[str] | None = None,
+        issue_records: list[tuple[str, str, str]] | None = None,
+    ) -> Iterable[Path]:
+        def clear_issue(path: str) -> None:
+            if issue_clears is None:
+                self.issues.clear(path)
+            else:
+                issue_clears.add(path)
+
+        def record_issue(path: str, error_code: str, detail: str) -> None:
+            if issue_records is None:
+                self.issues.record(path, error_code, detail)
+            else:
+                issue_records.append((path, error_code, detail))
+
         stack = [root]
         while stack:
             if self._cancel.is_set():
@@ -719,14 +759,14 @@ class DirectoryIndexer:
             normalized_dir = self._normalize(directory)
             try:
                 if self._is_excluded(directory):
-                    self.issues.clear(normalized_dir)
+                    clear_issue(normalized_dir)
                     stats.excluded += 1
                     continue
                 entries = list(directory.iterdir())
-                self.issues.clear(normalized_dir)
+                clear_issue(normalized_dir)
             except OSError as exc:
                 stats.skipped += 1
-                self.issues.record(normalized_dir, self._error_code(exc), str(exc))
+                record_issue(normalized_dir, self._error_code(exc), str(exc))
                 continue
 
             for path in entries:
@@ -734,7 +774,7 @@ class DirectoryIndexer:
                     raise IndexCancelled()
                 try:
                     if self._is_excluded(path):
-                        self.issues.clear(self._normalize(path))
+                        clear_issue(self._normalize(path))
                         stats.excluded += 1
                         continue
                     if path.is_dir():
@@ -746,12 +786,12 @@ class DirectoryIndexer:
                     if not self._is_supported_candidate(path):
                         continue
                     if self._is_file_pattern_excluded(path):
-                        self.issues.clear(self._normalize(path))
+                        clear_issue(self._normalize(path))
                         stats.excluded += 1
                         continue
                     yield path
                 except OSError as exc:
                     stats.skipped += 1
                     issue_path = self._normalize(path)
-                    self.issues.record(issue_path, self._error_code(exc), str(exc))
+                    record_issue(issue_path, self._error_code(exc), str(exc))
                     continue
