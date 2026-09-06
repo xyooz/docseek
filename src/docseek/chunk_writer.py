@@ -129,7 +129,13 @@ class ChunkBatchWriter:
                 chunks = spool.iter_chunks()
 
             conn = self._require_connection()
-            if validate_source is not None:
+            # Spool-backed formats finish filesystem/parser work before SQLite
+            # mutation begins, so validate that captured payload once before the
+            # write and once again after replay. Cheap text formats are consumed
+            # lazily inside the SAVEPOINT; their final validation already covers
+            # the entire interval from DirectoryIndexer's initial stat through
+            # parsing, making an extra pre-parse stat redundant.
+            if spool_before_write and validate_source is not None:
                 validate_source()
             self._ensure_transaction(conn)
             self._savepoint_id += 1
