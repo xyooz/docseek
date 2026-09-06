@@ -19,6 +19,15 @@ from .extraction_state import status_for_extraction_result
 # that filesystem/parser work while SQLite's single WAL writer slot is held.
 _SPOOL_BEFORE_WRITE_EXTENSIONS = frozenset({".docx", ".xlsx", ".pptx", ".pdf"})
 
+# Document SAVEPOINTs are strictly sequential and never nested. Reuse one fixed
+# name so sqlite3 can reuse the same prepared statements instead of parsing a
+# unique SAVEPOINT/RELEASE pair for every file in a large full scan. The
+# per-document rollback boundary is unchanged.
+_DOCUMENT_SAVEPOINT = "docseek_document"
+_SAVEPOINT_SQL = f"SAVEPOINT {_DOCUMENT_SAVEPOINT}"
+_ROLLBACK_TO_SAVEPOINT_SQL = f"ROLLBACK TO {_DOCUMENT_SAVEPOINT}"
+_RELEASE_SAVEPOINT_SQL = f"RELEASE {_DOCUMENT_SAVEPOINT}"
+
 
 class ChunkBatchWriter:
     """Batch document index writes while preserving per-document rollback.
@@ -56,7 +65,6 @@ class ChunkBatchWriter:
         self.conn: sqlite3.Connection | None = None
         self.pending_documents = 0
         self.pending_text_chars = 0
-        self._savepoint_id = 0
         self._transaction_open = False
 
     def __enter__(self) -> Self:
@@ -138,9 +146,7 @@ class ChunkBatchWriter:
             if spool_before_write and validate_source is not None:
                 validate_source()
             self._ensure_transaction(conn)
-            self._savepoint_id += 1
-            savepoint = f"docseek_document_{self._savepoint_id}"
-            conn.execute(f"SAVEPOINT {savepoint}")
+            conn.execute(_SAVEPOINT_SQL)
 
             count = 0
             document_text_chars = 0
@@ -230,11 +236,11 @@ class ChunkBatchWriter:
                         (path, int(extraction_revision), str(status), time.time()),
                     )
             except Exception:
-                conn.execute(f"ROLLBACK TO {savepoint}")
-                conn.execute(f"RELEASE {savepoint}")
+                conn.execute(_ROLLBACK_TO_SAVEPOINT_SQL)
+                conn.execute(_RELEASE_SAVEPOINT_SQL)
                 raise
             else:
-                conn.execute(f"RELEASE {savepoint}")
+                conn.execute(_RELEASE_SAVEPOINT_SQL)
 
             self.pending_documents += 1
             self.pending_text_chars += document_text_chars
