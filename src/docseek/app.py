@@ -5,7 +5,17 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QAction
-from PySide6.QtWidgets import QApplication, QFileDialog, QHeaderView, QMenu, QToolButton
+from PySide6.QtWidgets import (
+    QApplication,
+    QFileDialog,
+    QHeaderView,
+    QLabel,
+    QMenu,
+    QPushButton,
+    QToolButton,
+    QVBoxLayout,
+    QWidget,
+)
 
 from . import app_base
 from .index_root_state import IndexRootStateStore
@@ -62,12 +72,17 @@ class MainWindow(app_base.MainWindow):
 
         self._install_search_state_controls()
         self._install_results_layout()
+        self._install_first_run_panel()
+        self.search_input.setPlaceholderText(
+            "输入文件名或正文关键词，例如：客户经理管理办法"
+        )
         self.search_input.textChanged.connect(self._refresh_saved_button)
         self.type_filter.currentIndexChanged.connect(self._refresh_saved_button)
         self.sort_filter.currentIndexChanged.connect(self._refresh_saved_button)
 
         self._history_ui_ready = True
         self._refresh_saved_button()
+        self._refresh_first_run_state()
 
         # A watcher only sees changes that happen while DocSeek is running.
         # Snapshot the already-configured active roots at startup and reconcile
@@ -167,6 +182,74 @@ class MainWindow(app_base.MainWindow):
 
         header.setContextMenuPolicy(Qt.CustomContextMenu)
         header.customContextMenuRequested.connect(self._show_results_header_menu)
+
+    def _install_first_run_panel(self) -> None:
+        """Keep the first launch focused on one user action: choose a directory."""
+        root_layout = self.centralWidget().layout()
+        if root_layout is None or root_layout.count() <= 0:
+            raise RuntimeError("DocSeek main layout is unavailable")
+
+        last_item = root_layout.itemAt(root_layout.count() - 1)
+        self.content_splitter = last_item.widget() if last_item is not None else None
+        if self.content_splitter is None:
+            raise RuntimeError("DocSeek result area is unavailable")
+
+        self.first_run_panel = QWidget(self)
+        welcome_layout = QVBoxLayout(self.first_run_panel)
+        welcome_layout.setContentsMargins(80, 40, 80, 40)
+        welcome_layout.setSpacing(14)
+        welcome_layout.addStretch(1)
+
+        title = QLabel("开始使用 DocSeek")
+        title.setAlignment(Qt.AlignCenter)
+        title.setStyleSheet("font-size: 24px; font-weight: 600;")
+        welcome_layout.addWidget(title)
+
+        description = QLabel(
+            "选择你的办公资料目录，DocSeek 会在本机建立全文索引。\n"
+            "文档内容不会上传；索引过程中已完成的内容即可搜索。"
+        )
+        description.setAlignment(Qt.AlignCenter)
+        description.setWordWrap(True)
+        description.setStyleSheet("font-size: 14px;")
+        welcome_layout.addWidget(description)
+
+        self.first_run_button = QPushButton("选择资料目录")
+        self.first_run_button.setMinimumHeight(42)
+        self.first_run_button.setMinimumWidth(180)
+        self.first_run_button.clicked.connect(self._choose_directory)
+        welcome_layout.addWidget(self.first_run_button, 0, Qt.AlignHCenter)
+
+        steps = QLabel("1. 选择目录   →   2. 建立索引   →   3. 输入关键词搜索并打开文件")
+        steps.setAlignment(Qt.AlignCenter)
+        steps.setStyleSheet("color: palette(mid);")
+        welcome_layout.addWidget(steps)
+        welcome_layout.addStretch(1)
+
+        root_layout.insertWidget(root_layout.count() - 1, self.first_run_panel, 1)
+
+    def _refresh_first_run_state(self) -> None:
+        has_roots = bool(self.database.get_index_roots())
+        self.first_run_panel.setVisible(not has_roots)
+        self.content_splitter.setVisible(has_roots)
+        self.search_input.setEnabled(has_roots)
+
+        for widget in (
+            self.type_filter,
+            self.sort_filter,
+            self.history_button,
+            self.favorite_button,
+            self.help_button,
+            self.refresh_button,
+            self.settings_button,
+        ):
+            widget.setVisible(has_roots)
+
+        if not has_roots:
+            self.filter_chip_panel.setVisible(False)
+            self.scope_label.setText("尚未选择资料目录")
+        else:
+            self._refresh_scope()
 
     def _save_results_layout(self) -> None:
         state = encode_header_state(self.results.horizontalHeader().saveState())
@@ -292,6 +375,7 @@ class MainWindow(app_base.MainWindow):
             self._refresh_scope()
             self._restart_watcher()
             self._refresh_status()
+            self._refresh_first_run_state()
             self._start_index([root])
 
     def _open_index_settings(self) -> None:
@@ -311,6 +395,7 @@ class MainWindow(app_base.MainWindow):
         self._refresh_scope()
         self._restart_watcher()
         self._refresh_status()
+        self._refresh_first_run_state()
 
         roots = self.database.get_index_roots()
         active_roots = [Path(root) for root in self._active_index_roots()]
