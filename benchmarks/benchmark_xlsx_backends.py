@@ -9,7 +9,7 @@ from pathlib import Path
 
 from openpyxl import Workbook
 
-from docseek.chunks import DocumentChunk, _iter_xlsx_chunks, _xlsx_chunk_content, _xlsx_row_text
+from docseek.chunks import DocumentChunk, _iter_xlsx_chunks, _xlsx_chunk_content
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,6 +46,31 @@ def build_workbook(path: Path, *, rows: int, sheets: int, columns: int) -> None:
     workbook.save(path)
 
 
+def _calamine_cell_text(value: object) -> str:
+    """Match openpyxl's stable search-text representation for numeric cells.
+
+    python-calamine exposes Excel numbers as floats, including integral values
+    such as ``100.0``. openpyxl returns those same integral cells as ``100`` in
+    our current production path. Preserve the existing DocSeek index text while
+    benchmarking the faster backend instead of treating a Python type detail as
+    a search-semantic change.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value)
+
+
+def _calamine_row_text(row: tuple[object, ...]) -> str:
+    cells = [_calamine_cell_text(value) for value in row]
+    while cells and not cells[-1]:
+        cells.pop()
+    if not cells or not any(cells):
+        return ""
+    return "\t".join(cells)
+
+
 def iter_calamine_chunks(path: Path, *, rows_per_chunk: int = 200):
     from python_calamine import CalamineWorkbook
 
@@ -58,7 +83,7 @@ def iter_calamine_chunks(path: Path, *, rows_per_chunk: int = 200):
             first_row = 1
             last_row = 0
             for row_no, row in enumerate(sheet.iter_rows(), start=1):
-                row_text = _xlsx_row_text(tuple(row))
+                row_text = _calamine_row_text(tuple(row))
                 if row_text:
                     if not buffer:
                         first_row = row_no
