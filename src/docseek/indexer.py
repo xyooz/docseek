@@ -44,6 +44,8 @@ DEFAULT_IGNORED_DIR_NAMES = {
 }
 FULL_SCAN_BATCH_SIZE = 128
 FULL_SCAN_BATCH_TEXT_CHARS = 8_000_000
+DISCOVERY_PROGRESS_INTERVAL_SECONDS = 0.15
+DISCOVERY_PROGRESS_CANDIDATE_STEP = 250
 
 
 @dataclass(slots=True)
@@ -625,6 +627,8 @@ class DirectoryIndexer:
         *,
         on_progress: Callable[[Path, IndexStats], None] | None = None,
         on_detail: Callable[[Path, str, int], None] | None = None,
+        on_discovery: Callable[[Path, int], None] | None = None,
+        on_candidates_ready: Callable[[int], None] | None = None,
     ) -> IndexStats:
         root = root.resolve()
         stats = IndexStats()
@@ -641,9 +645,12 @@ class DirectoryIndexer:
                     stats,
                     issue_clears=discovery_issue_clears,
                     issue_records=discovery_issue_records,
+                    on_discovery=on_discovery,
                 )
             )
         )
+        if on_candidates_ready:
+            on_candidates_ready(len(candidates))
 
         # Discovery stays outside the batched chunk writer. Healthy directory
         # traversal therefore performs no SQLite writes, while issue cleanup is
@@ -738,6 +745,7 @@ class DirectoryIndexer:
         *,
         issue_clears: set[str] | None = None,
         issue_records: list[tuple[str, str, str]] | None = None,
+        on_discovery: Callable[[Path, int], None] | None = None,
     ) -> Iterable[Path]:
         def clear_issue(path: str) -> None:
             if issue_clears is None:
@@ -751,6 +759,27 @@ class DirectoryIndexer:
             else:
                 issue_records.append((path, error_code, detail))
 
+        discovered_candidates = 0
+        last_reported_candidates = 0
+        last_reported_at = 0.0
+
+        def report_discovery(path: Path, *, force: bool = False) -> None:
+            nonlocal last_reported_at, last_reported_candidates
+            if on_discovery is None:
+                return
+            now = time.monotonic()
+            if not force:
+                candidate_delta = discovered_candidates - last_reported_candidates
+                if (
+                    candidate_delta < DISCOVERY_PROGRESS_CANDIDATE_STEP
+                    and now - last_reported_at < DISCOVERY_PROGRESS_INTERVAL_SECONDS
+                ):
+                    return
+            on_discovery(path, discovered_candidates)
+            last_reported_candidates = discovered_candidates
+            last_reported_at = now
+
+        report_discovery(root, force=True)
         stack = [root]
         while stack:
             if self._cancel.is_set():
@@ -764,9 +793,11 @@ class DirectoryIndexer:
                     continue
                 entries = list(directory.iterdir())
                 clear_issue(normalized_dir)
+                report_discovery(directory)
             except OSError as exc:
                 stats.skipped += 1
                 record_issue(normalized_dir, self._error_code(exc), str(exc))
+                report_discovery(directory)
                 continue
 
             for path in entries:
@@ -789,9 +820,13 @@ class DirectoryIndexer:
                         clear_issue(self._normalize(path))
                         stats.excluded += 1
                         continue
+                    discovered_candidates += 1
+                    report_discovery(directory)
                     yield path
                 except OSError as exc:
                     stats.skipped += 1
                     issue_path = self._normalize(path)
                     record_issue(issue_path, self._error_code(exc), str(exc))
                     continue
+
+        report_discovery(root, force=True)
