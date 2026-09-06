@@ -43,7 +43,11 @@ DEFAULT_IGNORED_DIR_NAMES = {
     "$recycle.bin",
     "system volume information",
 }
-FULL_SCAN_BATCH_SIZE = 128
+# Small text files benefit substantially from fewer FTS5 transaction boundaries.
+# The separate text-character cap still bounds writer-lock duration and memory for
+# larger documents, while Office/PDF/compatibility formats continue to spool and
+# flush per document in ChunkBatchWriter.
+FULL_SCAN_BATCH_SIZE = 512
 FULL_SCAN_BATCH_TEXT_CHARS = 8_000_000
 DISCOVERY_PROGRESS_INTERVAL_SECONDS = 0.15
 DISCOVERY_PROGRESS_CANDIDATE_STEP = 250
