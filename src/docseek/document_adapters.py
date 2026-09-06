@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import importlib.util
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Iterator, Protocol
 
+from .chunk_spool import DocumentChunkSpool
 from .chunks import (
     XLSX_PROGRESS_ROW_INTERVAL,
     ChunkProgressCallback,
@@ -68,6 +70,140 @@ def _iter_flat_text_chunks(text: str, *, target_chars: int) -> Iterator[Document
         yield DocumentChunk(ordinal, f"内容块 {ordinal + 1}", content)
 
 
+def _normalize_calamine_cell(value: object) -> object:
+    """Keep Calamine search text compatible with the established openpyxl path.
+
+    python-calamine represents numeric Excel cells as floats, including cells
+    whose stored value is an integer. openpyxl renders those as ``100`` rather
+    than ``100.0``. Normalizing only finite integral floats preserves existing
+    search text without changing genuine decimal values.
+    """
+    if isinstance(value, float) and math.isfinite(value) and value.is_integer():
+        return int(value)
+    return value
+
+
+def _iter_calamine_spreadsheet_chunks(
+    path: Path,
+    *,
+    rows_per_chunk: int,
+    on_progress: ChunkProgressCallback | None = None,
+) -> Iterator[DocumentChunk]:
+    from python_calamine import CalamineWorkbook
+
+    workbook = CalamineWorkbook.from_path(path)
+    ordinal = 0
+    try:
+        for sheet_name in workbook.sheet_names:
+            sheet = workbook.get_sheet_by_name(sheet_name)
+            buffer: list[str] = []
+            first_row = 1
+            last_row = 0
+            processed_row = 0
+            progress_label = f"工作表 {sheet_name}"
+
+            for row_no, row in enumerate(sheet.iter_rows(), start=1):
+                processed_row = row_no
+                normalized_row = tuple(_normalize_calamine_cell(value) for value in row)
+                row_text = _xlsx_row_text(normalized_row)
+                if row_text:
+                    if not buffer:
+                        first_row = row_no
+                    buffer.append(row_text)
+                    last_row = row_no
+                if buffer and len(buffer) >= rows_per_chunk:
+                    yield DocumentChunk(
+                        ordinal,
+                        f"工作表 {sheet_name} · 行 {first_row}-{last_row}",
+                        _xlsx_chunk_content(sheet_name, buffer),
+                    )
+                    ordinal += 1
+                    buffer = []
+                if on_progress and row_no % XLSX_PROGRESS_ROW_INTERVAL == 0:
+                    on_progress(progress_label, row_no)
+
+            if buffer:
+                yield DocumentChunk(
+                    ordinal,
+                    f"工作表 {sheet_name} · 行 {first_row}-{last_row}",
+                    _xlsx_chunk_content(sheet_name, buffer),
+                )
+                ordinal += 1
+
+            if (
+                on_progress
+                and processed_row > 0
+                and processed_row % XLSX_PROGRESS_ROW_INTERVAL != 0
+            ):
+                on_progress(progress_label, processed_row)
+    finally:
+        workbook.close()
+
+
+@dataclass(slots=True, frozen=True)
+class XlsxCalamineFastAdapter:
+    """Rust-backed XLSX fast path with an all-or-nothing openpyxl fallback.
+
+    The Calamine attempt is captured into the same bounded temporary spool used
+    elsewhere by the indexing pipeline. Nothing is yielded until the workbook
+    has been parsed successfully, so a mid-workbook parser failure can fall back
+    to the mature openpyxl implementation without duplicate partial chunks.
+    """
+
+    name: str = "calamine-xlsx-fast"
+    priority: int = 110
+    extensions: frozenset[str] = frozenset({".xlsx"})
+
+    def is_available(self) -> bool:
+        return importlib.util.find_spec("python_calamine") is not None
+
+    def iter_chunks(
+        self,
+        path: Path,
+        *,
+        target_chars: int = 12_000,
+        spreadsheet_rows_per_chunk: int = 200,
+        on_progress: ChunkProgressCallback | None = None,
+    ) -> Iterator[DocumentChunk]:
+        if not self.is_available():
+            yield from _iter_direct_document_chunks(
+                path,
+                target_chars=target_chars,
+                spreadsheet_rows_per_chunk=spreadsheet_rows_per_chunk,
+                on_progress=on_progress,
+            )
+            return
+
+        spool = DocumentChunkSpool()
+        try:
+            try:
+                spool.capture(
+                    _iter_calamine_spreadsheet_chunks(
+                        path,
+                        rows_per_chunk=max(1, spreadsheet_rows_per_chunk),
+                        on_progress=on_progress,
+                    )
+                )
+            except Exception:
+                # Discard every partial Calamine chunk before using the mature
+                # compatibility path. The caller sees exactly one extraction.
+                spool.close()
+                yield from _iter_direct_document_chunks(
+                    path,
+                    target_chars=target_chars,
+                    spreadsheet_rows_per_chunk=spreadsheet_rows_per_chunk,
+                    on_progress=on_progress,
+                )
+                return
+
+            yield from spool.iter_chunks()
+        finally:
+            try:
+                spool.close()
+            except Exception:
+                pass
+
+
 @dataclass(slots=True, frozen=True)
 class DirectDocumentAdapter:
     """Existing mature parsers for OOXML/PDF/plain text."""
@@ -122,8 +258,6 @@ class CalamineSpreadsheetAdapter:
                 "安装 DocSeek 的 calamine 可选依赖后可直接本地解析"
             )
 
-        from python_calamine import CalamineWorkbook
-
         # Calamine loads legacy BIFF .xls workbooks eagerly before sheet rows
         # become iterable. Surface that otherwise silent phase so a large or
         # unusual workbook does not look like a frozen desktop application.
@@ -131,52 +265,11 @@ class CalamineSpreadsheetAdapter:
             on_progress("正在打开旧版 Excel（.xls 工作簿会先整体加载）", 0)
 
         rows_per_chunk = spreadsheet_rows_per_chunk or self.rows_per_chunk
-        workbook = CalamineWorkbook.from_path(path)
-        ordinal = 0
-        try:
-            for sheet_name in workbook.sheet_names:
-                sheet = workbook.get_sheet_by_name(sheet_name)
-                buffer: list[str] = []
-                first_row = 1
-                last_row = 0
-                processed_row = 0
-                progress_label = f"工作表 {sheet_name}"
-
-                for row_no, row in enumerate(sheet.iter_rows(), start=1):
-                    processed_row = row_no
-                    row_text = _xlsx_row_text(tuple(row))
-                    if row_text:
-                        if not buffer:
-                            first_row = row_no
-                        buffer.append(row_text)
-                        last_row = row_no
-                    if buffer and len(buffer) >= rows_per_chunk:
-                        yield DocumentChunk(
-                            ordinal,
-                            f"工作表 {sheet_name} · 行 {first_row}-{last_row}",
-                            _xlsx_chunk_content(sheet_name, buffer),
-                        )
-                        ordinal += 1
-                        buffer = []
-                    if on_progress and row_no % XLSX_PROGRESS_ROW_INTERVAL == 0:
-                        on_progress(progress_label, row_no)
-
-                if buffer:
-                    yield DocumentChunk(
-                        ordinal,
-                        f"工作表 {sheet_name} · 行 {first_row}-{last_row}",
-                        _xlsx_chunk_content(sheet_name, buffer),
-                    )
-                    ordinal += 1
-
-                if (
-                    on_progress
-                    and processed_row > 0
-                    and processed_row % XLSX_PROGRESS_ROW_INTERVAL != 0
-                ):
-                    on_progress(progress_label, processed_row)
-        finally:
-            workbook.close()
+        yield from _iter_calamine_spreadsheet_chunks(
+            path,
+            rows_per_chunk=max(1, rows_per_chunk),
+            on_progress=on_progress,
+        )
 
 
 @dataclass(slots=True, frozen=True)
@@ -259,6 +352,7 @@ class DocumentAdapterRegistry:
         registered = list(
             adapters
             or (
+                XlsxCalamineFastAdapter(),
                 DirectDocumentAdapter(),
                 CalamineSpreadsheetAdapter(),
                 TikaNativeAdapter(),
