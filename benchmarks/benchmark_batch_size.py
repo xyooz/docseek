@@ -63,7 +63,8 @@ def build_text_lane_index(
             )
 
     elapsed = time.perf_counter() - started
-    indexed = store.count_files()
+    with store.connect() as conn:
+        indexed = int(conn.execute("SELECT COUNT(*) FROM files").fetchone()[0])
     if indexed != files:
         raise RuntimeError(f"batch benchmark indexed {indexed} files, expected {files}")
     return elapsed, _database_bytes(db_path), logical_bytes
