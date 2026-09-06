@@ -45,6 +45,28 @@ class IndexDiscoveryProgressTests(unittest.TestCase):
             self.assertEqual(stats.scanned, 2)
             self.assertEqual(stats.indexed, 2)
 
+    def test_existing_progress_channel_sees_discovery_and_final_candidate_total(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            root = base / "docs"
+            root.mkdir()
+            (root / "制度.txt").write_text("客户经理管理办法", encoding="utf-8")
+            (root / "图片.bin").write_bytes(b"not indexed")
+
+            labels: list[str] = []
+            stats = DirectoryIndexer(SearchDatabase(base / "docseek.db")).scan(
+                root,
+                on_progress=lambda path, _current: labels.append(path.name),
+            )
+
+            self.assertEqual(stats.scanned, 1)
+            self.assertEqual(stats.indexed, 1)
+            self.assertTrue(
+                any(label.startswith("正在扫描目录 · 已发现 0 个候选文件") for label in labels)
+            )
+            self.assertIn("扫描完成 · 共发现 1 个候选文件", labels)
+            self.assertIn("制度.txt", labels)
+
 
 if __name__ == "__main__":
     unittest.main()
