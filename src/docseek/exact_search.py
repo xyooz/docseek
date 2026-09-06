@@ -31,6 +31,12 @@ class ExactGroupedSearchEngine:
     explicit hints optional and lets structure improve ranking without changing
     the persisted database schema.
 
+    File-level relevance also gets a deliberately small, capped evidence boost
+    when the same query matches multiple distinct chunks in one file. This helps
+    stable multi-section matches outrank accidental one-off hits without letting
+    long documents dominate merely because they contain many repeated matches.
+    The best chunk/snippet is still chosen only from chunk-level relevance.
+
     File ordering is selected from a closed allow-list. Relevance remains the
     default; modified-time and filename modes only change file order, while the
     best matching chunk/snippet inside each file is still chosen by relevance.
@@ -70,13 +76,7 @@ class ExactGroupedSearchEngine:
 
     @staticmethod
     def _structure_query_terms(plain_query: str, *, limit: int = 8) -> list[str]:
-        """Return bounded, de-duplicated compact terms for semantic locators.
-
-        The exact compact-query match remains the strongest automatic structure
-        signal. These terms only support a weaker fallback for queries such as
-        ``risk audit`` matching ``Risk quarterly audit``. Bounding the term list
-        keeps generated SQL predictable for interactive searches.
-        """
+        """Return bounded, de-duplicated compact terms for semantic locators."""
         terms: list[str] = []
         seen: set[str] = set()
         for raw_term in plain_query.split():
@@ -92,14 +92,7 @@ class ExactGroupedSearchEngine:
 
     @staticmethod
     def _automatic_structure_boost_expr(term_count: int) -> str:
-        """Small intent boost for semantic structure already stored in location.
-
-        Generic page/block coordinates are ignored. Exact compact phrase matches
-        receive the established boost; a multi-term fallback receives a smaller
-        boost only when every bounded query term occurs in the same semantic
-        locator. This avoids rewarding a title for matching just one generic
-        word from a longer query.
-        """
+        """Small intent boost for semantic structure already stored in location."""
         semantic_guard = """
             (
                 LOWER(REPLACE(c.location, ' ', '')) LIKE '工作表%'
@@ -128,6 +121,22 @@ class ExactGroupedSearchEngine:
                  ) > 0
                     THEN -1.25
                 {term_fallback}
+                ELSE 0.0
+            END
+        """
+
+    @staticmethod
+    def _multi_chunk_evidence_expr() -> str:
+        """Return a small capped bonus for repeated evidence across a file.
+
+        BM25 already rewards term frequency inside each chunk. This signal only
+        asks whether multiple distinct chunks match at all, and caps at three
+        chunks so document length cannot produce an unbounded ranking advantage.
+        """
+        return """
+            CASE
+                WHEN hit_count >= 3 THEN -0.24
+                WHEN hit_count = 2 THEN -0.12
                 ELSE 0.0
             END
         """
@@ -239,6 +248,7 @@ class ExactGroupedSearchEngine:
         automatic_structure_boost_expr = self._automatic_structure_boost_expr(
             len(structure_terms)
         )
+        evidence_boost_expr = self._multi_chunk_evidence_expr()
         order_clause = search_order_clause(sort_mode)
         params: dict[str, object] = {
             "fts_query": fts_query,
@@ -296,7 +306,10 @@ class ExactGroupedSearchEngine:
                 WHERE {table} MATCH :fts_query
             ),
             best_scores AS (
-                SELECT file_id, MIN(chunk_score) AS chunk_score
+                SELECT
+                    file_id,
+                    MIN(chunk_score) AS chunk_score,
+                    COUNT(*) AS hit_count
                 FROM hits
                 GROUP BY file_id
             ),
@@ -304,15 +317,20 @@ class ExactGroupedSearchEngine:
                 SELECT
                     h.file_id,
                     b.chunk_score,
+                    b.hit_count,
                     MIN(h.ordinal) AS ordinal
                 FROM hits h
                 JOIN best_scores b
                   ON b.file_id = h.file_id
                  AND b.chunk_score = h.chunk_score
-                GROUP BY h.file_id, b.chunk_score
+                GROUP BY h.file_id, b.chunk_score, b.hit_count
             ),
             winners AS (
-                SELECT h.chunk_id, h.file_id, h.chunk_score
+                SELECT
+                    h.chunk_id,
+                    h.file_id,
+                    h.chunk_score,
+                    b.hit_count
                 FROM hits h
                 JOIN best_ordinals b
                   ON b.file_id = h.file_id
@@ -328,7 +346,9 @@ class ExactGroupedSearchEngine:
                     f.extension,
                     f.modified_time,
                     f.size,
-                    w.chunk_score + ({filename_boost_expr}) AS relevance_score
+                    w.chunk_score
+                    + ({filename_boost_expr})
+                    + ({evidence_boost_expr}) AS relevance_score
                 FROM winners w
                 JOIN files f ON f.id = w.file_id
                 {metadata_where}
