@@ -24,7 +24,7 @@ class IndexPriorityTests(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertFalse(is_fast_lane_path(Path(name)))
 
-    def test_fast_lane_streams_before_discovery_finishes(self) -> None:
+    def test_discovery_finishes_before_index_lane_replay(self) -> None:
         discovered: list[str] = []
 
         def candidates():
@@ -34,16 +34,16 @@ class IndexPriorityTests(unittest.TestCase):
 
         ordered = prioritize_index_candidates(candidates())
         self.assertEqual(next(ordered).name, "one.docx")
-        self.assertEqual(discovered, ["first.xls", "one.docx"])
-
-        self.assertEqual(next(ordered).name, "two.pdf")
+        # The complete filesystem discovery snapshot is collected before any
+        # candidate is handed to the batched SQLite writer. This prevents the
+        # lazy directory walker from performing issue-metadata writes while an
+        # index transaction is already open.
         self.assertEqual(
             discovered,
-            ["first.xls", "one.docx", "second.doc", "two.pdf"],
+            ["first.xls", "one.docx", "second.doc", "two.pdf", "third.ppt"],
         )
 
-        # Once discovery is exhausted, compatibility files replay in stable
-        # encounter order rather than being lost or arbitrarily reordered.
+        self.assertEqual(next(ordered).name, "two.pdf")
         self.assertEqual(
             [path.name for path in ordered],
             ["first.xls", "second.doc", "third.ppt"],
