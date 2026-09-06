@@ -23,10 +23,13 @@ class ExactGroupedSearchEngine:
     they are removed from the FTS text and add a strong boost to matching
     ``chunks.location`` values while the best chunk is selected.
 
-    Ordinary queries also get a smaller automatic boost when their compact text
-    appears in a semantic locator such as an Excel sheet name or an enriched
-    document/slide title. This keeps explicit hints optional and lets structure
-    improve ranking without changing the persisted database schema.
+    Ordinary queries also get a smaller automatic boost when their text appears
+    in a semantic locator such as an Excel sheet name or an enriched
+    document/slide title. Besides exact compact phrase matches, multi-term
+    queries can receive a weaker boost when every query term is present in the
+    semantic locator even if extra words appear between those terms. This keeps
+    explicit hints optional and lets structure improve ranking without changing
+    the persisted database schema.
 
     File ordering is selected from a closed allow-list. Relevance remains the
     default; modified-time and filename modes only change file order, while the
@@ -66,26 +69,65 @@ class ExactGroupedSearchEngine:
         """
 
     @staticmethod
-    def _automatic_structure_boost_expr() -> str:
+    def _structure_query_terms(plain_query: str, *, limit: int = 8) -> list[str]:
+        """Return bounded, de-duplicated compact terms for semantic locators.
+
+        The exact compact-query match remains the strongest automatic structure
+        signal. These terms only support a weaker fallback for queries such as
+        ``risk audit`` matching ``Risk quarterly audit``. Bounding the term list
+        keeps generated SQL predictable for interactive searches.
+        """
+        terms: list[str] = []
+        seen: set[str] = set()
+        for raw_term in plain_query.split():
+            term = "".join(raw_term.split()).strip()
+            folded = term.casefold()
+            if not term or folded in seen:
+                continue
+            seen.add(folded)
+            terms.append(term)
+            if len(terms) >= limit:
+                break
+        return terms
+
+    @staticmethod
+    def _automatic_structure_boost_expr(term_count: int) -> str:
         """Small intent boost for semantic structure already stored in location.
 
-        The check is intentionally conservative: generic page/block coordinates
-        are ignored, while sheet names and explicit title-enriched locators can
-        participate. This avoids changing normal PDF/page ranking just because a
-        query happens to contain a number or generic location word.
+        Generic page/block coordinates are ignored. Exact compact phrase matches
+        receive the established boost; a multi-term fallback receives a smaller
+        boost only when every bounded query term occurs in the same semantic
+        locator. This avoids rewarding a title for matching just one generic
+        word from a longer query.
         """
-        return """
+        semantic_guard = """
+            (
+                LOWER(REPLACE(c.location, ' ', '')) LIKE '工作表%'
+                OR INSTR(c.location, ' · 标题 ') > 0
+            )
+        """
+        term_fallback = ""
+        if term_count >= 2:
+            all_terms = " AND ".join(
+                "INSTR(LOWER(REPLACE(c.location, ' ', '')), "
+                f"LOWER(:location_term_{index})) > 0"
+                for index in range(term_count)
+            )
+            term_fallback = f"""
+                WHEN {semantic_guard}
+                 AND ({all_terms})
+                    THEN -0.9
+            """
+        return f"""
             CASE
                 WHEN :location_query <> ''
-                 AND (
-                     LOWER(REPLACE(c.location, ' ', '')) LIKE '工作表%'
-                     OR INSTR(c.location, ' · 标题 ') > 0
-                 )
+                 AND {semantic_guard}
                  AND INSTR(
                      LOWER(REPLACE(c.location, ' ', '')),
                      LOWER(:location_query)
                  ) > 0
                     THEN -1.25
+                {term_fallback}
                 ELSE 0.0
             END
         """
@@ -192,8 +234,11 @@ class ExactGroupedSearchEngine:
         table, fts_query = self.store._select_index(content_query)
         score_expr = f"bm25({table}, 5.0, 1.0)"
         structure_boost_expr = self._structure_boost_expr()
-        automatic_structure_boost_expr = self._automatic_structure_boost_expr()
         plain_query = self.store._plain_query_text(content_query)
+        structure_terms = self._structure_query_terms(plain_query)
+        automatic_structure_boost_expr = self._automatic_structure_boost_expr(
+            len(structure_terms)
+        )
         order_clause = search_order_clause(sort_mode)
         params: dict[str, object] = {
             "fts_query": fts_query,
@@ -205,6 +250,8 @@ class ExactGroupedSearchEngine:
             "limit": max(1, int(limit)),
             "offset": max(0, int(offset)),
         }
+        for index, term in enumerate(structure_terms):
+            params[f"location_term_{index}"] = term
 
         metadata_clauses: list[str] = []
         self.store._append_metadata_filters(
