@@ -5,8 +5,9 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
+import docseek.chunk_writer as chunk_writer_module
 import docseek.indexer as indexer_module
 from docseek.indexer import DirectoryIndexer
 from docseek.search_db import SearchDatabase
@@ -61,9 +62,7 @@ def timed_scan(
                 )
 
         indexer._normalize = timed_normalize  # type: ignore[method-assign]
-        restorers.append(
-            lambda: setattr(indexer, "_normalize", original_normalize)
-        )
+        restorers.append(lambda: setattr(indexer, "_normalize", original_normalize))
 
         original_index_existing = indexer._index_existing_file
         indexer._index_existing_file = timed_call(  # type: ignore[method-assign]
@@ -113,6 +112,90 @@ def timed_scan(
             )
         )
 
+        # First-index detail profile. ``iter_document_chunks`` is lazy, so time
+        # each ``next`` call rather than only the cheap generator construction.
+        # The resulting extraction timer excludes downstream SQLite/FTS work.
+        original_iter_document_chunks = indexer_module.iter_document_chunks
+
+        def timed_iter_document_chunks(*args: Any, **kwargs: Any) -> Iterator[Any]:
+            setup_started = time.perf_counter()
+            iterator = iter(original_iter_document_chunks(*args, **kwargs))
+            add_timing("extract_chunks", time.perf_counter() - setup_started)
+            while True:
+                next_started = time.perf_counter()
+                try:
+                    item = next(iterator)
+                except StopIteration:
+                    add_timing("extract_chunks", time.perf_counter() - next_started)
+                    return
+                except BaseException:
+                    add_timing("extract_chunks", time.perf_counter() - next_started)
+                    raise
+                add_timing("extract_chunks", time.perf_counter() - next_started)
+                yield item
+
+        indexer_module.iter_document_chunks = timed_iter_document_chunks
+        restorers.append(
+            lambda: setattr(
+                indexer_module,
+                "iter_document_chunks",
+                original_iter_document_chunks,
+            )
+        )
+
+        original_cjk_bigrams = indexer.chunk_store._cjk_bigrams
+        indexer.chunk_store._cjk_bigrams = timed_call(  # type: ignore[method-assign]
+            "cjk_tokens", original_cjk_bigrams
+        )
+        restorers.append(
+            lambda: setattr(indexer.chunk_store, "_cjk_bigrams", original_cjk_bigrams)
+        )
+
+        original_encode = chunk_writer_module.encode_chunk_content
+        chunk_writer_module.encode_chunk_content = timed_call("raw_encode", original_encode)
+        restorers.append(
+            lambda: setattr(chunk_writer_module, "encode_chunk_content", original_encode)
+        )
+
+        writer_cls = chunk_writer_module.ChunkBatchWriter
+        original_replace_document = writer_cls.replace_document
+
+        def timed_replace_document(writer: Any, *args: Any, **kwargs: Any) -> Any:
+            call_started = time.perf_counter()
+            try:
+                return original_replace_document(writer, *args, **kwargs)
+            finally:
+                add_timing("writer_replace", time.perf_counter() - call_started)
+
+        writer_cls.replace_document = timed_replace_document  # type: ignore[method-assign]
+        restorers.append(
+            lambda: setattr(writer_cls, "replace_document", original_replace_document)
+        )
+
+        original_flush = writer_cls.flush
+
+        def timed_flush(writer: Any, *args: Any, **kwargs: Any) -> Any:
+            call_started = time.perf_counter()
+            try:
+                return original_flush(writer, *args, **kwargs)
+            finally:
+                add_timing("writer_flush", time.perf_counter() - call_started)
+
+        writer_cls.flush = timed_flush  # type: ignore[method-assign]
+        restorers.append(lambda: setattr(writer_cls, "flush", original_flush))
+
+        original_exit = writer_cls.__exit__
+
+        def timed_exit(writer: Any, *args: Any, **kwargs: Any) -> Any:
+            call_started = time.perf_counter()
+            try:
+                return original_exit(writer, *args, **kwargs)
+            finally:
+                add_timing("writer_exit", time.perf_counter() - call_started)
+
+        writer_cls.__exit__ = timed_exit  # type: ignore[method-assign]
+        restorers.append(lambda: setattr(writer_cls, "__exit__", original_exit))
+
     def candidates_ready(count: int) -> None:
         nonlocal discovery_seconds, candidate_count, phase
         if discovery_seconds is None:
@@ -149,6 +232,23 @@ def format_phase_timings(timings: dict[str, float]) -> str:
     )
 
 
+def format_first_index_breakdown(timings: dict[str, float]) -> str:
+    writer_replace = timings.get("writer_replace", 0.0)
+    extraction = timings.get("extract_chunks", 0.0)
+    cjk = timings.get("cjk_tokens", 0.0)
+    raw_encode = timings.get("raw_encode", 0.0)
+    flush = timings.get("writer_flush", 0.0)
+    writer_exit = timings.get("writer_exit", 0.0)
+    candidate = timings.get("candidate_check", 0.0)
+    writer_residual = max(0.0, writer_replace - extraction - cjk - raw_encode - flush)
+    candidate_overhead = max(0.0, candidate - writer_replace)
+    return (
+        f"extract={extraction:.3f}s cjk={cjk:.3f}s raw_encode={raw_encode:.3f}s "
+        f"writer_flush={flush:.3f}s writer_exit={writer_exit:.3f}s "
+        f"writer_residual={writer_residual:.3f}s candidate_overhead={candidate_overhead:.3f}s"
+    )
+
+
 def main() -> None:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -170,8 +270,8 @@ def main() -> None:
             first_discovery_seconds,
             first_candidates,
             first_stats,
-            _first_timings,
-        ) = timed_scan(DirectoryIndexer(db), root)
+            first_timings,
+        ) = timed_scan(DirectoryIndexer(db), root, profile_phases=True)
         (
             second_seconds,
             second_discovery_seconds,
@@ -206,6 +306,9 @@ def main() -> None:
             f"files_per_second={args.files / first_seconds:.1f} "
             f"indexed={first_stats.indexed}"
         )
+        if first_timings:
+            print("first_phases " + format_phase_timings(first_timings))
+            print("first_writer_breakdown " + format_first_index_breakdown(first_timings))
         print(
             f"unchanged_scan={second_seconds:.3f}s "
             f"discovery={second_discovery_seconds:.3f}s "
@@ -219,7 +322,15 @@ def main() -> None:
             measured = sum(
                 value
                 for name, value in second_timings.items()
-                if name not in {"normalize_discovery"}
+                if name not in {
+                    "normalize_discovery",
+                    "writer_replace",
+                    "extract_chunks",
+                    "cjk_tokens",
+                    "raw_encode",
+                    "writer_flush",
+                    "writer_exit",
+                }
             )
             residual = max(0.0, second_post_discovery - measured)
             normalize_post = second_timings.get("normalize_post", 0.0)
