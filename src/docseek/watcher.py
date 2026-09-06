@@ -95,7 +95,10 @@ class WatchManager:
 
     The normal debounce window collapses noisy Office/WPS save sequences. A
     maximum batch delay prevents continuous file activity from postponing the
-    flush forever.
+    flush forever. A lightweight health timer also verifies the watchdog
+    observer remains alive and detects long scheduling gaps characteristic of
+    suspend/resume. Both cases trigger reconciliation rather than trusting that
+    no filesystem notifications were missed.
     """
 
     def __init__(
@@ -105,6 +108,8 @@ class WatchManager:
         debounce_seconds: float = 1.2,
         max_batch_delay_seconds: float = 10.0,
         reconcile_seconds: float = 3600.0,
+        health_check_seconds: float = 60.0,
+        resume_gap_seconds: float | None = None,
     ) -> None:
         self.on_change = on_change
         self.debounce_seconds = max(0.0, float(debounce_seconds))
@@ -113,10 +118,18 @@ class WatchManager:
             float(max_batch_delay_seconds),
         )
         self.reconcile_seconds = max(0.0, float(reconcile_seconds))
+        self.health_check_seconds = max(0.0, float(health_check_seconds))
+        default_resume_gap = max(120.0, self.health_check_seconds * 3.0)
+        self.resume_gap_seconds = max(
+            self.health_check_seconds,
+            float(default_resume_gap if resume_gap_seconds is None else resume_gap_seconds),
+        )
         self._observer: Observer | None = None
         self._lock = threading.Lock()
         self._timer: threading.Timer | None = None
         self._reconcile_timer: threading.Timer | None = None
+        self._health_timer: threading.Timer | None = None
+        self._last_health_check: float | None = None
         self._pending_since: float | None = None
         self._pending_paths: set[str] = set()
         self._full_rescan = False
@@ -129,7 +142,11 @@ class WatchManager:
         )
         config = (resolved_roots, resolved_excluded)
 
-        if self._observer is not None and self._config == config:
+        if (
+            self._observer is not None
+            and self._config == config
+            and self._observer.is_alive()
+        ):
             return
 
         self.stop()
@@ -152,7 +169,9 @@ class WatchManager:
             self._observer = observer
             self._config = config
             with self._lock:
+                self._last_health_check = time.monotonic()
                 self._schedule_reconcile_locked()
+                self._schedule_health_check_locked()
 
     def stop(self) -> None:
         observer = self._observer
@@ -165,8 +184,11 @@ class WatchManager:
         with self._lock:
             timer = self._timer
             reconcile_timer = self._reconcile_timer
+            health_timer = self._health_timer
             self._timer = None
             self._reconcile_timer = None
+            self._health_timer = None
+            self._last_health_check = None
             self._pending_since = None
             self._pending_paths.clear()
             self._full_rescan = False
@@ -174,6 +196,8 @@ class WatchManager:
             timer.cancel()
         if reconcile_timer is not None:
             reconcile_timer.cancel()
+        if health_timer is not None:
+            health_timer.cancel()
 
     def _queue_path(self, path: Path) -> None:
         with self._lock:
@@ -210,6 +234,16 @@ class WatchManager:
         self._reconcile_timer = timer
         timer.start()
 
+    def _schedule_health_check_locked(self) -> None:
+        if self.health_check_seconds <= 0 or self._observer is None or self._config is None:
+            return
+        if self._health_timer is not None:
+            self._health_timer.cancel()
+        timer = threading.Timer(self.health_check_seconds, self._health_check)
+        timer.daemon = True
+        self._health_timer = timer
+        timer.start()
+
     def _periodic_reconcile(self) -> None:
         with self._lock:
             self._reconcile_timer = None
@@ -218,6 +252,43 @@ class WatchManager:
             self._full_rescan = True
             self._restart_timer_locked()
             self._schedule_reconcile_locked()
+
+    def _health_check(self) -> None:
+        now = time.monotonic()
+        with self._lock:
+            self._health_timer = None
+            observer = self._observer
+            config = self._config
+            previous_check = self._last_health_check
+            self._last_health_check = now
+
+        if observer is None or config is None:
+            return
+
+        try:
+            observer_alive = observer.is_alive()
+        except Exception:
+            observer_alive = False
+
+        if not observer_alive:
+            roots, excluded = config
+            # ``start`` deliberately does not trust a same-config observer once
+            # its thread has died. Recreate the native subscription and then
+            # reconcile because notifications may have been lost before death.
+            self.start(list(roots), list(excluded))
+            self._queue_rescan()
+            return
+
+        if previous_check is not None and now - previous_check >= self.resume_gap_seconds:
+            # Timers normally wake roughly on schedule. A much larger monotonic
+            # gap strongly suggests suspend/resume or prolonged process stall.
+            # Keep the live observer, but distrust the event history across the
+            # gap and reconcile the indexed roots once.
+            self._queue_rescan()
+
+        with self._lock:
+            if self._observer is observer and self._config == config:
+                self._schedule_health_check_locked()
 
     def _flush(self) -> None:
         with self._lock:
