@@ -108,17 +108,7 @@ class ChunkBatchWriter:
         chunks: Iterable[DocumentChunk],
         extraction_revision: int | None = None,
         validate_source: Callable[[], None] | None = None,
-        delete_existing_chunks: bool = True,
     ) -> int:
-        """Write one document atomically.
-
-        ``delete_existing_chunks`` may be disabled only when the caller already
-        knows from a consistent metadata snapshot that ``path`` has no committed
-        file row. Full reconciliation has exactly that information, so first-time
-        documents can avoid an otherwise pointless SELECT + DELETE on ``chunks``.
-        Precise watcher updates and normal replacement keep the conservative
-        default because they do not carry that snapshot guarantee.
-        """
         normalized_extension = extension.lower()
         compatibility_format = normalized_extension not in DIRECT_SUPPORTED_EXTENSIONS
         spool_before_write = (
@@ -149,25 +139,37 @@ class ChunkBatchWriter:
             count = 0
             document_text_chars = 0
             try:
-                conn.execute(
+                # Most first-index work is genuinely new. Insert it without an
+                # update branch so SQLite tells us through rowcount whether the
+                # path already existed. New rows can use lastrowid immediately
+                # and skip both the file-id SELECT and the otherwise pointless
+                # stale-chunk SELECT/DELETE. Existing rows keep the established
+                # atomic replacement path below.
+                insert_cursor = conn.execute(
                     """
                     INSERT INTO files(path, filename, extension, modified_time, size, last_error)
                     VALUES (?, ?, ?, ?, ?, NULL)
-                    ON CONFLICT(path) DO UPDATE SET
-                        filename=excluded.filename,
-                        extension=excluded.extension,
-                        modified_time=excluded.modified_time,
-                        size=excluded.size,
-                        last_error=NULL
+                    ON CONFLICT(path) DO NOTHING
                     """,
                     (path, filename, extension, modified_time, size),
                 )
-                file_id = self.store._file_id_for_path(conn, path)
-                if file_id is None:
-                    raise RuntimeError(f"无法为索引文件分配 file_id：{path}")
-
-                if delete_existing_chunks:
+                if insert_cursor.rowcount == 1:
+                    file_id = int(insert_cursor.lastrowid)
+                else:
+                    conn.execute(
+                        """
+                        UPDATE files
+                        SET filename = ?, extension = ?, modified_time = ?,
+                            size = ?, last_error = NULL
+                        WHERE path = ?
+                        """,
+                        (filename, extension, modified_time, size, path),
+                    )
+                    file_id = self.store._file_id_for_path(conn, path)
+                    if file_id is None:
+                        raise RuntimeError(f"无法为索引文件分配 file_id：{path}")
                     self.store._delete_chunks(conn, path, file_id=file_id)
+
                 # The filename is identical for every chunk in this document.
                 # Tokenize it once instead of once per PDF page / Excel chunk.
                 filename_tokens = self.store._cjk_bigrams(filename)
