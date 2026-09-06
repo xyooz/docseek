@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from docseek.chunk_store import ChunkStore
+from docseek.schema import CURRENT_SCHEMA_VERSION
 from docseek.index_issues import IndexIssueStore
 from docseek.search_db import SearchDatabase
 from docseek.search_session import PersistentSearchStore
@@ -84,7 +85,7 @@ class SqliteLockingTests(unittest.TestCase):
                 with reopened_store.connect() as conn:
                     self.assertEqual(
                         conn.execute("PRAGMA user_version").fetchone()[0],
-                        10,
+                        CURRENT_SCHEMA_VERSION,
                     )
                 self.assertEqual(reopened_issues.count(), 1)
             finally:

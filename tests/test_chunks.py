@@ -12,6 +12,24 @@ from docseek.chunks import iter_document_chunks
 
 
 class DocumentChunkExtractionTests(unittest.TestCase):
+    def test_docx_tables_keep_body_order_and_heading_ownership(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "ordered.docx"
+            document = Document()
+            document.add_heading("第一节", level=1)
+            document.add_paragraph("前文")
+            document.add_table(rows=1, cols=1).cell(0, 0).text = "中间表格"
+            document.add_paragraph("后文")
+            document.add_heading("第二节", level=1)
+            document.add_paragraph("另一节")
+            document.save(path)
+            chunks = list(iter_document_chunks(path))
+        self.assertEqual(len(chunks), 2)
+        self.assertEqual(chunks[0].content, "第一节\n前文\n中间表格\n后文")
+        self.assertIn("第一节", chunks[0].location)
+        self.assertIn("第二节", chunks[1].location)
+        self.assertNotIn("中间表格", chunks[1].content)
+
     def test_docx_heading_is_preserved_in_chunk_location(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "制度.docx"

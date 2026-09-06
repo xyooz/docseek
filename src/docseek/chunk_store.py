@@ -15,7 +15,7 @@ from .sqlite_runtime import current_schema_objects, ensure_wal_mode
 _CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
 _CJK_RUN_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]+")
 _READY_OBJECTS = frozenset(
-    {"files", "chunks", "chunk_index", "chunk_index_cjk2", "extraction_state"}
+    {"files", "chunks", "chunk_index", "chunk_index_cjk2", "extraction_state", "chunk_structure", "chunk_structure_cleanup"}
 )
 
 
@@ -37,6 +37,8 @@ class ChunkSearchResult:
     location: str
     snippet: str
     score: float
+    chunk_id: int | None = None
+    structure: dict | None = None
 
 
 @dataclass(slots=True)
@@ -421,6 +423,8 @@ class ChunkStore:
                     ),
                 )
                 chunk_id = int(cursor.lastrowid)
+                from .structure_store import write_structure
+                write_structure(conn, chunk_id, path, extension, chunk)
                 self._insert_fts_rows(conn, chunk_id, filename, chunk.content)
                 count += 1
         return count

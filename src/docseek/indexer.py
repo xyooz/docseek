@@ -74,6 +74,10 @@ class IndexCancelled(Exception):
     pass
 
 
+class SourceChangedDuringExtraction(Exception):
+    pass
+
+
 class DirectoryIndexer:
     """Incremental local indexer using bounded, location-aware chunks."""
 
@@ -505,12 +509,22 @@ class DirectoryIndexer:
                 on_progress(display, stats)
 
         extension = path.suffix.lower()
+        expected_source = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+
+        def validate_source() -> None:
+            if self._cancel.is_set():
+                raise IndexCancelled()
+            current = path.stat()
+            if (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns) != expected_source:
+                raise SourceChangedDuringExtraction("文件在解析期间发生变化，已放弃本次结果，等待重新索引。")
+
         common_args = {
             "path": normalized,
             "filename": path.name,
             "extension": extension,
             "modified_time": stat.st_mtime,
             "size": stat.st_size,
+            "validate_source": validate_source,
             "chunks": iter_document_chunks(
                 path,
                 on_progress=report_detail
@@ -524,12 +538,11 @@ class DirectoryIndexer:
                 extraction_revision=extraction_revision,
             )
         else:
-            chunk_count = self.chunk_store.replace_document(**common_args)
-            self._record_extraction_state(
-                normalized,
-                extraction_revision,
-                status_for_extraction_result(extension, chunk_count),
-            )
+            # Use the same atomic state/content commit and pre-parse spool as
+            # full scans, including for watcher-triggered Office updates.
+            with ChunkBatchWriter(self.chunk_store, batch_size=1) as single_writer:
+                chunk_count = single_writer.replace_document(
+                    **common_args, extraction_revision=extraction_revision)
 
         status = status_for_extraction_result(extension, chunk_count)
         if clear_issue:
@@ -597,6 +610,10 @@ class DirectoryIndexer:
                 )
             except IndexCancelled:
                 raise
+            except SourceChangedDuringExtraction as exc:
+                stats.skipped += 1
+                self._record_extraction_state(normalized, current_extraction_revision(path.suffix), ExtractionStatus.PENDING)
+                self.issues.record(normalized, "source_changed", str(exc))
             except FileNotFoundError:
                 self._remove_indexed_path(normalized, stats)
                 self.issues.clear(normalized)
@@ -655,6 +672,15 @@ class DirectoryIndexer:
                 except IndexCancelled:
                     writer.flush()
                     raise
+                except SourceChangedDuringExtraction as exc:
+                    writer.flush()
+                    stats.skipped += 1
+                    self._record_extraction_state(normalized, current_extraction_revision(path.suffix), ExtractionStatus.PENDING)
+                    self.issues.record(normalized, "source_changed", str(exc))
+                except FileNotFoundError:
+                    writer.flush()
+                    self._remove_indexed_path(normalized, stats)
+                    self.issues.clear(normalized)
                 except Exception as exc:
                     writer.flush()
                     stats.skipped += 1

@@ -5,6 +5,11 @@ import sys
 
 
 def main() -> int:
+    if len(sys.argv) >= 2 and sys.argv[1] == "--docseek-preview-worker":
+        from docseek.location_preview import main as run_preview_worker
+
+        return run_preview_worker(sys.argv[2:])
+
     # Hidden subprocess entrypoint used by Index Pipeline V2. It must run before
     # the normal bootstrap/single-instance lock because parser workers are child
     # processes of the already-running DocSeek desktop instance.

@@ -371,9 +371,13 @@ class ExactGroupedSearchEngine:
                 chunks.location AS location,
                 chunks.content AS raw_content,
                 paged.relevance_score AS score,
-                paged.total_count
+                paged.total_count,
+                chunks.id AS chunk_id,
+                s.kind, s.title, s.page, s.slide, s.sheet, s.row_start, s.row_end,
+                s.line_start, s.line_end, s.block_start, s.block_end
             FROM paged
             JOIN chunks ON chunks.id = paged.chunk_id
+            LEFT JOIN chunk_structure s ON s.chunk_id = chunks.id
             ORDER BY {order_clause}
         """
 
@@ -403,6 +407,10 @@ class ExactGroupedSearchEngine:
                     self.store.decode_content(row["raw_content"]), content_query
                 ),
                 score=float(row["score"]),
+                chunk_id=int(row["chunk_id"]),
+                structure={name: row[name] for name in (
+                    "kind", "title", "page", "slide", "sheet", "row_start", "row_end",
+                    "line_start", "line_end", "block_start", "block_end")},
             )
             for row in rows
         ]

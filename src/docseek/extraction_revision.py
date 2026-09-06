@@ -7,7 +7,7 @@ BASE_EXTRACTION_REVISION = 1
 # reconciliation scan selective instead of turning every extractor improvement
 # into a full-index rebuild.
 _FORMAT_REVISIONS = {
-    ".docx": 2,  # preserve heading titles in writer block locations
+    ".docx": 3,  # preserve body/table order and split at heading boundaries
     ".pptx": 2,  # preserve slide titles in slide locations
 }
 

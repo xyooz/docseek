@@ -6,6 +6,16 @@ from docseek.app import empty_result_html
 
 
 class EmptyStateTests(unittest.TestCase):
+    def test_index_health_is_conditional_and_actionable(self) -> None:
+        message = empty_result_html(filter_only=False, has_filters=True,
+                                    indexing=True, issue_count=3, paused_roots=2)
+        self.assertIn("docseek:relax", message)
+        self.assertIn("docseek:settings", message)
+        self.assertIn("3 个问题文件", message)
+        self.assertIn("2 个目录", message)
+        self.assertIn("正在运行", message)
+        self.assertNotIn("docseek:relax", empty_result_html(filter_only=False))
+
     def test_keyword_no_match_guidance_is_actionable(self) -> None:
         message = empty_result_html(filter_only=False)
         self.assertIn("没有找到匹配文档", message)

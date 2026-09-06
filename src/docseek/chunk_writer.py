@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Callable
 from types import TracebackType
 from typing import Self
 
@@ -107,6 +107,7 @@ class ChunkBatchWriter:
         size: int,
         chunks: Iterable[DocumentChunk],
         extraction_revision: int | None = None,
+        validate_source: Callable[[], None] | None = None,
     ) -> int:
         normalized_extension = extension.lower()
         compatibility_format = normalized_extension not in DIRECT_SUPPORTED_EXTENSIONS
@@ -128,6 +129,8 @@ class ChunkBatchWriter:
                 chunks = spool.iter_chunks()
 
             conn = self._require_connection()
+            if validate_source is not None:
+                validate_source()
             self._ensure_transaction(conn)
             self._savepoint_id += 1
             savepoint = f"docseek_document_{self._savepoint_id}"
@@ -172,6 +175,8 @@ class ChunkBatchWriter:
                         ),
                     )
                     chunk_id = int(cursor.lastrowid)
+                    from .structure_store import write_structure
+                    write_structure(conn, chunk_id, path, extension, chunk)
                     conn.execute(
                         "INSERT INTO chunk_index(rowid, filename, content) VALUES (?, ?, ?)",
                         (chunk_id, filename, chunk.content),
@@ -190,6 +195,8 @@ class ChunkBatchWriter:
                     )
                     count += 1
 
+                if validate_source is not None:
+                    validate_source()
                 if extraction_revision is not None:
                     status = status_for_extraction_result(extension, count)
                     conn.execute(

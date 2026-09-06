@@ -3,7 +3,7 @@ from __future__ import annotations
 import sqlite3
 
 
-CURRENT_SCHEMA_VERSION = 10
+CURRENT_SCHEMA_VERSION = 11
 LEGACY_EXTRACTION_REVISION = 1
 
 
@@ -96,4 +96,19 @@ def _ensure_extraction_state(conn: sqlite3.Connection) -> None:
 
 def mark_schema_current(conn: sqlite3.Connection) -> None:
     _ensure_extraction_state(conn)
+    # Additive sidecar: old chunks remain readable without a full index rewrite.
+    conn.execute("""CREATE TABLE IF NOT EXISTS chunk_structure(
+        chunk_id INTEGER PRIMARY KEY,
+        locator_version INTEGER NOT NULL DEFAULT 1,
+        kind TEXT NOT NULL,
+        title TEXT,
+        page INTEGER, slide INTEGER, sheet TEXT,
+        row_start INTEGER, row_end INTEGER,
+        line_start INTEGER, line_end INTEGER,
+        block_start INTEGER, block_end INTEGER
+    )""")
+    conn.execute("""CREATE TRIGGER IF NOT EXISTS chunk_structure_cleanup
+        AFTER DELETE ON chunks BEGIN
+            DELETE FROM chunk_structure WHERE chunk_id = OLD.id;
+        END""")
     conn.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")

@@ -31,6 +31,8 @@ from PySide6.QtWidgets import (
 )
 
 from .chunk_store import ChunkStore
+from .location_preview import preview_kind
+from .structure_store import preview_location
 from .indexer import DirectoryIndexer, IndexCancelled, IndexStats
 from .query_parser import parse_query, query_filter_chips, remove_query_filter
 from .results_model import SearchResultsModel
@@ -77,17 +79,30 @@ def result_entry_row(row_count: int, *, move_down: bool) -> int | None:
     return 0 if move_down else row_count - 1
 
 
-def empty_result_html(*, filter_only: bool) -> str:
+def empty_result_html(*, filter_only: bool, has_filters: bool = False,
+                      indexing: bool = False, issue_count: int = 0,
+                      paused_roots: int = 0) -> str:
     """Return actionable empty-result guidance for the preview pane."""
     if filter_only:
-        return (
+        message = (
             "<h3>当前筛选没有匹配文件</h3>"
             "<p>可以移除上方筛选条件，或调整文件类型、日期、路径和大小范围后再试。</p>"
         )
-    return (
-        "<h3>没有找到匹配文档</h3>"
-        "<p>可以减少关键词、取消过严的引号短语，或移除部分筛选条件后再试。</p>"
-    )
+    else:
+        message = (
+            "<h3>没有找到匹配文档</h3>"
+            "<p>可以减少关键词、取消过严的引号短语，或移除部分筛选条件后再试。</p>"
+        )
+    if has_filters:
+        message += '<p><a href="docseek:relax">保留关键词，移除元数据筛选</a></p>'
+    if indexing:
+        message += "<p>索引任务正在运行，部分新内容可能尚不可搜索。</p>"
+    if issue_count:
+        message += f"<p>索引中有 {issue_count} 个问题文件，可能影响搜索覆盖。</p>"
+    if paused_roots:
+        message += f"<p>{paused_roots} 个目录已暂停更新，现有结果可能不是最新内容。</p>"
+    message += '<p><a href="docseek:settings">检查索引范围、暂停目录和问题文件</a></p>'
+    return message
 
 
 class IndexSignals(QObject):
@@ -294,6 +309,8 @@ class MainWindow(QMainWindow):
 
         self.preview = QTextBrowser()
         self.preview.setOpenExternalLinks(False)
+        self.preview.setOpenLinks(False)
+        self.preview.anchorClicked.connect(self._preview_action)
         self.preview.setPlaceholderText(
             "输入记得的正文关键词开始搜索；选中结果后，这里会显示命中上下文和具体位置。"
         )
@@ -686,6 +703,7 @@ class MainWindow(QMainWindow):
             return
 
         page = response.page
+        self._displayed_query = request.query
         rows = page.items
         unique_rows = [row for row in rows if row.path not in self.seen_result_paths]
         for row in unique_rows:
@@ -707,7 +725,19 @@ class MainWindow(QMainWindow):
             f" · {latency}{suffix}"
         )
         if page.total_count == 0:
-            self.preview.setHtml(empty_result_html(filter_only=request.is_filter_only))
+            from .index_issues import IndexIssueStore
+            from .index_root_state import IndexRootStateStore
+            try:
+                issues = IndexIssueStore(self.database.db_path).count()
+                paused = len(IndexRootStateStore(self.database).paused_roots())
+            except Exception:
+                issues = paused = 0
+            self.preview.setHtml(empty_result_html(
+                filter_only=request.is_filter_only,
+                has_filters=parse_query(self.search_input.text()).has_filters or self.type_filter.currentData() is not None,
+                indexing=self.current_worker is not None,
+                issue_count=issues, paused_roots=paused,
+            ))
         elif request.select_first and displayed:
             index = self.results_model.index(0, 0)
             self.results.setCurrentIndex(index)
@@ -757,7 +787,47 @@ class MainWindow(QMainWindow):
             metadata
             + f"<p><b>命中位置：</b>{safe_location}</p><hr>"
             + f"<p style='line-height:1.7'>{safe_snippet}</p>"
+            + '<p><a href="docseek:hits">查看此文件的全部命中位置</a></p>'
+            + ('<p><a href="docseek:location">查看原文件命中页 / 行</a></p>'
+               if preview_kind(row.extension, preview_location(row)) else "")
         )
+
+    def _preview_action(self, url) -> None:
+        action = url.toString()
+        if action == "docseek:settings":
+            self._open_index_settings()
+        elif action == "docseek:relax":
+            text = parse_query(self.search_input.text()).text
+            self.search_timer.stop()
+            old_text = self.search_input.blockSignals(True)
+            old_type = self.type_filter.blockSignals(True)
+            try:
+                self.search_input.setText(text)
+                self.type_filter.setCurrentIndex(0)
+            finally:
+                self.search_input.blockSignals(old_text)
+                self.type_filter.blockSignals(old_type)
+            self._refresh_filter_chips()
+            self._perform_search()
+            self.search_input.setFocus()
+        elif action == "docseek:hits":
+            row = self.results_model.result_at(self.results.currentIndex().row())
+            if row and row.snippet:
+                from .document_hits_dialog import DocumentHitsDialog
+                dialog = DocumentHitsDialog(self.chunk_store, row, getattr(self, "_displayed_query", ""), self)
+                try:
+                    dialog.exec()
+                finally:
+                    dialog.deleteLater()
+        elif action == "docseek:location":
+            row = self.results_model.result_at(self.results.currentIndex().row())
+            if row and preview_kind(row.extension, preview_location(row)):
+                from .preview_dialog import LocationPreviewDialog
+                dialog = LocationPreviewDialog(row, self)
+                try:
+                    dialog.exec()
+                finally:
+                    dialog.deleteLater()
 
     def _selected_path(self) -> str | None:
         row = self.results_model.result_at(self.results.currentIndex().row())

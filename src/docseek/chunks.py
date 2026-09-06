@@ -6,6 +6,8 @@ from typing import Callable, Iterator
 
 import pymupdf
 from docx import Document
+from docx.table import Table
+from docx.text.paragraph import Paragraph
 from openpyxl import load_workbook
 from pptx import Presentation
 
@@ -107,7 +109,8 @@ def _iter_text_chunks(path: Path, *, target_chars: int) -> Iterator[DocumentChun
 
 
 def _detect_text_encoding(path: Path) -> str:
-    sample = path.read_bytes()[:65536]
+    with path.open("rb") as handle:
+        sample = handle.read(65536)
     for encoding in ("utf-8", "utf-8-sig", "gb18030"):
         try:
             sample.decode(encoding, errors="strict")
@@ -166,27 +169,26 @@ def _iter_docx_chunks(path: Path, *, target_chars: int) -> Iterator[DocumentChun
         section_start = block_no + 1
         return chunk
 
-    for paragraph in document.paragraphs:
-        text = paragraph.text.strip()
-        if not text:
+    for element in document.element.body.iterchildren():
+        heading = False
+        if element.tag.endswith("}p"):
+            paragraph = Paragraph(element, document)
+            texts = [paragraph.text.strip()]
+            style_name = str(getattr(getattr(paragraph, "style", None), "name", "") or "")
+            heading = _is_docx_heading_style(style_name)
+        elif element.tag.endswith("}tbl"):
+            texts = ("\t".join(cell.text for cell in row.cells).strip()
+                     for row in Table(element, document).rows)
+        else:
             continue
-        block_no += 1
-        style_name = str(getattr(getattr(paragraph, "style", None), "name", "") or "")
-        if _is_docx_heading_style(style_name):
-            current_heading = _clean_location_title(text)
-        if not buffer:
-            buffer_heading = current_heading
-        buffer.append(text)
-        char_count += len(text)
-        chunk = maybe_emit()
-        if chunk:
-            yield chunk
-
-    for table in document.tables:
-        for row in table.rows:
-            text = "\t".join(cell.text for cell in row.cells).strip()
+        for text in texts:
             if not text:
                 continue
+            if heading:
+                chunk = maybe_emit(force=True)
+                if chunk:
+                    yield chunk
+                current_heading = _clean_location_title(text)
             block_no += 1
             if not buffer:
                 buffer_heading = current_heading
