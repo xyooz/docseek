@@ -22,6 +22,7 @@ class DocumentChunk:
 
 TEXT_EXTENSIONS = {".txt", ".md", ".log", ".csv"}
 TEXT_ENCODING_SAMPLE_BYTES = 65_536
+TEXT_ENCODING_CANDIDATES = ("utf-8", "gb18030")
 XLSX_PROGRESS_ROW_INTERVAL = 1_000
 ChunkProgressCallback = Callable[[str, int], None]
 
@@ -116,23 +117,23 @@ def _iter_text_lines(path: Path) -> Iterator[str]:
     normal text iteration. Small office-side text files therefore paid two file
     opens and read their whole payload twice.
 
-    Read one extra byte with the probe so a complete small file can be decoded
-    directly without a second read. Large files keep the established streaming
+    Read one extra byte with the probe so a complete small file can reuse the
+    successful strict decode itself. Large files keep the established streaming
     TextIOWrapper path and bounded memory usage; they merely rewind the same
     handle instead of opening a second one.
     """
     with path.open("rb") as raw:
         probe = raw.read(TEXT_ENCODING_SAMPLE_BYTES + 1)
         has_more = len(probe) > TEXT_ENCODING_SAMPLE_BYTES
-        sample = probe[:TEXT_ENCODING_SAMPLE_BYTES]
-        encoding = _detect_text_encoding_sample(sample)
 
         if not has_more:
-            decoded = probe.decode(encoding, errors="ignore")
+            _encoding, decoded = _decode_text_bytes(probe)
             with io.StringIO(decoded, newline=None) as text:
                 yield from text
             return
 
+        sample = probe[:TEXT_ENCODING_SAMPLE_BYTES]
+        encoding = _detect_text_encoding_sample(sample)
         raw.seek(0)
         with io.TextIOWrapper(
             raw,
@@ -143,14 +144,18 @@ def _iter_text_lines(path: Path) -> Iterator[str]:
             yield from text
 
 
-def _detect_text_encoding_sample(sample: bytes) -> str:
-    for encoding in ("utf-8", "utf-8-sig", "gb18030"):
+def _decode_text_bytes(data: bytes) -> tuple[str, str]:
+    for encoding in TEXT_ENCODING_CANDIDATES:
         try:
-            sample.decode(encoding, errors="strict")
-            return encoding
+            return encoding, data.decode(encoding, errors="strict")
         except UnicodeDecodeError:
             continue
-    return "utf-8"
+    return "utf-8", data.decode("utf-8", errors="ignore")
+
+
+def _detect_text_encoding_sample(sample: bytes) -> str:
+    encoding, _decoded = _decode_text_bytes(sample)
+    return encoding
 
 
 def _clean_location_title(text: str, *, max_chars: int = 80) -> str:
