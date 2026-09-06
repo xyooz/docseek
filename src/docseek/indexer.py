@@ -27,7 +27,8 @@ from .file_exclusions import (
 from .index_cleanup import remove_missing_under_root
 from .index_health import record_successful_reconcile
 from .index_issues import IndexIssueStore
-from .index_priority import prioritize_index_candidates
+from .index_priority import is_fast_lane_path, prioritize_index_candidates
+from .index_tasks import LANE_COMPAT, LANE_FAST, IndexTaskStore
 from .search_db import SearchDatabase
 
 
@@ -72,6 +73,9 @@ class IndexCancelled(Exception):
     pass
 
 
+IndexState = tuple[float, int, bool, int, str | None]
+
+
 class DirectoryIndexer:
     """Incremental local indexer using bounded, location-aware chunks."""
 
@@ -87,6 +91,7 @@ class DirectoryIndexer:
         self.database = database
         self.chunk_store = ChunkStore(database.db_path)
         self.issues = IndexIssueStore(database.db_path)
+        self.tasks = IndexTaskStore(database.db_path)
 
         (
             configured_max_mb,
@@ -110,14 +115,7 @@ class DirectoryIndexer:
         self._cancel = threading.Event()
 
     def _load_runtime_settings(self) -> tuple[int, list[str], list[str]]:
-        """Read indexer settings with one lightweight metadata connection.
-
-        The legacy SearchDatabase connection still owns compatibility FTS
-        tables and historically executed journal-mode setup on every connect.
-        Indexing is latency-sensitive, so runtime settings are read directly
-        from the shared metadata table instead of paying those legacy costs for
-        every watcher batch.
-        """
+        """Read indexer settings with one lightweight metadata connection."""
         with self.chunk_store.connect() as conn:
             rows = conn.execute(
                 "SELECT key, value FROM settings "
@@ -161,6 +159,22 @@ class DirectoryIndexer:
             row = conn.execute("SELECT 1 FROM files WHERE path = ? LIMIT 1", (path,)).fetchone()
         return row is not None
 
+    @staticmethod
+    def _prefetched_state_is_complete(
+        state: IndexState | None,
+        *,
+        modified_time: float,
+        size: int,
+        extraction_revision: int,
+    ) -> bool:
+        return (
+            state is not None
+            and float(state[0]) == float(modified_time)
+            and int(state[1]) == int(size)
+            and int(state[3]) >= int(extraction_revision)
+            and unchanged_state_is_complete(state[4], has_chunk=bool(state[2]))
+        )
+
     def _is_unchanged(
         self,
         path: str,
@@ -189,17 +203,21 @@ class DirectoryIndexer:
             ).fetchone()
         if row is None:
             return False
-        return (
-            float(row["modified_time"]) == float(modified_time)
-            and int(row["size"]) == int(size)
-            and int(row["extraction_revision"]) >= int(extraction_revision)
-            and unchanged_state_is_complete(
-                row["extraction_status"],
-                has_chunk=bool(row["has_chunk"]),
-            )
+        state: IndexState = (
+            float(row["modified_time"]),
+            int(row["size"]),
+            bool(row["has_chunk"]),
+            int(row["extraction_revision"]),
+            str(row["extraction_status"]) if row["extraction_status"] is not None else None,
+        )
+        return self._prefetched_state_is_complete(
+            state,
+            modified_time=modified_time,
+            size=size,
+            extraction_revision=extraction_revision,
         )
 
-    def _load_index_state(self) -> dict[str, tuple[float, int, bool, int, str | None]]:
+    def _load_index_state(self) -> dict[str, IndexState]:
         """Load metadata/chunk presence/revision/status once for reconciliation."""
         with self.chunk_store.connect() as conn:
             rows = conn.execute(
@@ -262,6 +280,7 @@ class DirectoryIndexer:
             stats.removed += 1
         with self.chunk_store.connect() as conn:
             conn.execute("DELETE FROM extraction_state WHERE path = ?", (path,))
+        self.tasks.complete(path)
 
     @staticmethod
     def _error_code(exc: Exception) -> str:
@@ -290,6 +309,57 @@ class DirectoryIndexer:
     def _is_file_pattern_excluded(self, path: Path) -> bool:
         return matches_file_exclusion(path, self.excluded_file_patterns)
 
+    @staticmethod
+    def _lane_for_path(path: Path) -> str:
+        return LANE_FAST if is_fast_lane_path(path) else LANE_COMPAT
+
+    def _enqueue_task(
+        self,
+        path: Path,
+        normalized: str,
+        *,
+        modified_time: float,
+        size: int,
+        extraction_revision: int,
+    ) -> None:
+        self.tasks.enqueue(
+            normalized,
+            lane=self._lane_for_path(path),
+            revision=extraction_revision,
+            modified_time=modified_time,
+            size=size,
+        )
+
+    def _queue_deferred_candidate(
+        self,
+        path: Path,
+        index_state: dict[str, IndexState],
+    ) -> None:
+        """Persist compatibility backlog as soon as lazy discovery sees it."""
+        normalized = self._normalize(path)
+        try:
+            stat = path.stat()
+        except OSError:
+            return
+        if stat.st_size > self.max_file_size:
+            return
+        extraction_revision = current_extraction_revision(path.suffix)
+        if self._prefetched_state_is_complete(
+            index_state.get(normalized),
+            modified_time=stat.st_mtime,
+            size=stat.st_size,
+            extraction_revision=extraction_revision,
+        ):
+            self.tasks.complete(normalized)
+            return
+        self._enqueue_task(
+            path,
+            normalized,
+            modified_time=stat.st_mtime,
+            size=stat.st_size,
+            extraction_revision=extraction_revision,
+        )
+
     def _index_existing_file(
         self,
         path: Path,
@@ -298,7 +368,7 @@ class DirectoryIndexer:
         *,
         on_progress: Callable[[Path, IndexStats], None] | None = None,
         on_detail: Callable[[Path, str, int], None] | None = None,
-        prefetched_state: tuple[float, int, bool, int, str | None] | None = None,
+        prefetched_state: IndexState | None = None,
         state_prefetched: bool = False,
         writer: ChunkBatchWriter | None = None,
         clear_issue: bool = True,
@@ -320,15 +390,11 @@ class DirectoryIndexer:
 
         extraction_revision = current_extraction_revision(path.suffix)
         if state_prefetched:
-            unchanged = (
-                prefetched_state is not None
-                and float(prefetched_state[0]) == float(stat.st_mtime)
-                and int(prefetched_state[1]) == int(stat.st_size)
-                and int(prefetched_state[3]) >= extraction_revision
-                and unchanged_state_is_complete(
-                    prefetched_state[4],
-                    has_chunk=bool(prefetched_state[2]),
-                )
+            unchanged = self._prefetched_state_is_complete(
+                prefetched_state,
+                modified_time=stat.st_mtime,
+                size=stat.st_size,
+                extraction_revision=extraction_revision,
             )
         else:
             unchanged = self._is_unchanged(
@@ -339,10 +405,23 @@ class DirectoryIndexer:
             )
 
         if unchanged:
+            # A process may have committed the final SQLite document transaction
+            # and died before deleting its task row. Treat the durable index as
+            # authoritative and make task completion idempotent.
+            self.tasks.complete(normalized)
             if clear_issue:
                 self.issues.clear(normalized)
             stats.unchanged += 1
             return True
+
+        self._enqueue_task(
+            path,
+            normalized,
+            modified_time=stat.st_mtime,
+            size=stat.st_size,
+            extraction_revision=extraction_revision,
+        )
+        self.tasks.mark_extracting(normalized)
 
         if on_progress:
             on_progress(path, stats)
@@ -353,10 +432,6 @@ class DirectoryIndexer:
             if on_detail:
                 on_detail(path, location, current)
             elif on_progress:
-                # The current desktop worker already transports file progress
-                # as a Path plus counters. Preserve that compatibility while
-                # exposing useful row-level XLSX progress immediately; a future
-                # UI can opt into the structured on_detail callback directly.
                 display = Path(f"{path.name} · {location} · 已读取 {current:,} 行")
                 on_progress(display, stats)
 
@@ -388,6 +463,7 @@ class DirectoryIndexer:
             )
 
         status = status_for_extraction_result(extension, chunk_count)
+        self.tasks.complete(normalized)
         if clear_issue:
             self.issues.clear(normalized)
         stats.indexed += 1
@@ -452,6 +528,9 @@ class DirectoryIndexer:
                     on_detail=on_detail,
                 )
             except IndexCancelled:
+                # Explicit user cancellation is not a crash. Do not surprise
+                # the user by resurrecting the task on the next launch.
+                self.tasks.complete(normalized)
                 raise
             except FileNotFoundError:
                 self._remove_indexed_path(normalized, stats)
@@ -461,6 +540,7 @@ class DirectoryIndexer:
                 error_code = self._error_code(exc)
                 self._record_failure_state(normalized, error_code)
                 self.issues.record(normalized, error_code, str(exc))
+                self.tasks.complete(normalized)
 
         return stats
 
@@ -482,7 +562,10 @@ class DirectoryIndexer:
             batch_size=FULL_SCAN_BATCH_SIZE,
             max_batch_text_chars=FULL_SCAN_BATCH_TEXT_CHARS,
         ) as writer:
-            candidates = prioritize_index_candidates(self._iter_supported_files(root, stats))
+            candidates = prioritize_index_candidates(
+                self._iter_supported_files(root, stats),
+                on_deferred=lambda path: self._queue_deferred_candidate(path, index_state),
+            )
             for path in candidates:
                 if self._cancel.is_set():
                     writer.flush()
@@ -510,6 +593,7 @@ class DirectoryIndexer:
                         on_progress(path, stats)
                 except IndexCancelled:
                     writer.flush()
+                    self.tasks.complete(normalized)
                     raise
                 except Exception as exc:
                     writer.flush()
@@ -517,6 +601,7 @@ class DirectoryIndexer:
                     error_code = self._error_code(exc)
                     self._record_failure_state(normalized, error_code)
                     self.issues.record(normalized, error_code, str(exc))
+                    self.tasks.complete(normalized)
 
         self.issues.clear_many(successful_paths)
         stats.removed += remove_missing_under_root(self.chunk_store, str(root), seen_paths)
