@@ -14,27 +14,29 @@ from .document_types import DIRECT_SUPPORTED_EXTENSIONS
 from .extraction_state import status_for_extraction_result
 
 
+# Specialized parsers for modern Office/PDF formats are normally reliable, but
+# they can still spend seconds decoding a large workbook or document. Never do
+# that filesystem/parser work while SQLite's single WAL writer slot is held.
+_SPOOL_BEFORE_WRITE_EXTENSIONS = frozenset({".docx", ".xlsx", ".pptx", ".pdf"})
+
+
 class ChunkBatchWriter:
     """Batch document index writes while preserving per-document rollback.
 
     FTS5 creates index segments at transaction boundaries. During a full scan,
-    committing every file causes many small segments and many fsyncs. This
-    writer keeps one explicit write transaction open across a bounded number
-    of changed documents, but wraps each document in a SAVEPOINT so a broken
-    parser or file cannot corrupt or roll back the rest of the batch.
+    committing every small text file causes many small segments and many fsyncs.
+    This writer therefore batches cheap text-document writes, but slow Office,
+    PDF and compatibility parsing is first captured into a bounded spool before
+    SQLite acquires its writer transaction.
 
-    Batches are bounded by both document count and extracted-text characters.
-    The latter matters for compressed Office files whose on-disk size can be
-    much smaller than the text written into the two FTS indexes. A single large
-    document remains atomic, but it is committed before another document is
-    added once the text budget has been crossed.
+    Each database mutation is wrapped in a SAVEPOINT so a broken file cannot
+    corrupt or roll back already committed neighbors. Batches are bounded by
+    both document count and extracted-text characters.
 
-    The write transaction is acquired lazily. An unchanged-only reconciliation
-    scan therefore does not hold SQLite's writer lock for the duration of the
-    filesystem walk. Compatibility/legacy formats are additionally extracted
-    into a bounded spool before a write transaction is acquired: old XLS/DOC/
-    PPT parsers can spend significant time opening a file, and that parsing
-    must not freeze unrelated SQLite metadata writes on a real desktop.
+    A single large document remains atomic. Modern Office/PDF and compatibility
+    documents are committed immediately after replay so the writer lock is not
+    left open while the next document is decoded. Small spool payloads stay in
+    memory; larger ones automatically roll to a temporary file.
     """
 
     def __init__(
@@ -106,13 +108,20 @@ class ChunkBatchWriter:
         chunks: Iterable[DocumentChunk],
         extraction_revision: int | None = None,
     ) -> int:
-        compatibility_format = extension.lower() not in DIRECT_SUPPORTED_EXTENSIONS
+        normalized_extension = extension.lower()
+        compatibility_format = normalized_extension not in DIRECT_SUPPORTED_EXTENSIONS
+        spool_before_write = (
+            compatibility_format
+            or normalized_extension in _SPOOL_BEFORE_WRITE_EXTENSIONS
+        )
         spool: DocumentChunkSpool | None = None
 
         try:
-            if compatibility_format:
-                # A previous document may still own the batch writer lock.
-                # Release it before a potentially slow legacy parser starts.
+            if spool_before_write:
+                # The preceding small-text batch may still own SQLite's writer
+                # slot. Commit it *before* consuming an Office/PDF/legacy parser
+                # so slow filesystem/decoder work cannot block unrelated UI
+                # metadata writes such as search history or saved settings.
                 self.flush()
                 spool = DocumentChunkSpool()
                 spool.capture(chunks)
@@ -208,10 +217,9 @@ class ChunkBatchWriter:
                 self.max_batch_text_chars is not None
                 and self.pending_text_chars >= self.max_batch_text_chars
             )
-            if compatibility_format or hit_document_limit or hit_text_limit:
-                # Legacy documents are intentionally committed immediately so
-                # their compatibility parser cannot leave a writer lock behind
-                # while the next file is being decoded.
+            if spool_before_write or hit_document_limit or hit_text_limit:
+                # Spool-backed documents are committed immediately so they do
+                # not leave a writer lock behind while the next file is parsed.
                 self.flush()
             return count
         finally:
