@@ -6,9 +6,9 @@ from pathlib import Path
 
 from docseek.beta_snapshot import write_beta_snapshot
 from docseek.search_db import SearchDatabase
+from docseek.storage_location import StorageLocationError, configured_database_path
 
 
-DEFAULT_DB_PATH = Path.home() / ".docseek" / "docseek.db"
 DEFAULT_OUTPUT_DIR = Path.home() / ".docseek" / "beta-reports"
 
 
@@ -23,8 +23,8 @@ def main() -> int:
     parser.add_argument(
         "--db",
         type=Path,
-        default=DEFAULT_DB_PATH,
-        help="DocSeek database path (default: ~/.docseek/docseek.db)",
+        default=None,
+        help="DocSeek database path (default: current configured index location)",
     )
     parser.add_argument(
         "--output-dir",
@@ -34,7 +34,15 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    db_path = args.db.expanduser()
+    if args.db is not None:
+        db_path = args.db.expanduser()
+    else:
+        try:
+            db_path = configured_database_path()
+        except StorageLocationError as exc:
+            print(f"Cannot resolve DocSeek index location: {exc}", file=sys.stderr)
+            return 2
+
     if not db_path.exists() or not db_path.is_file():
         print(
             "DocSeek index database not found. Start DocSeek and build an index first, "
