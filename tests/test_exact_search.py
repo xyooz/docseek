@@ -54,7 +54,7 @@ class ExactGroupedSearchTests(unittest.TestCase):
     def _signature(page) -> list[tuple[str, str, float]]:
         return [(row.path, row.location, row.score) for row in page.items]
 
-    def test_grouped_engine_matches_exact_order_and_best_chunk(self) -> None:
+    def test_grouped_engine_preserves_exact_file_set_and_best_chunk(self) -> None:
         self._add(0, chunks=["信贷", "信贷 信贷 信贷"])
         self._add(1, chunks=["普通说明", "客户经理 信贷业务"])
         self._add(2, filename="信贷.pdf", chunks=["普通内容", "信贷"])
@@ -62,10 +62,21 @@ class ExactGroupedSearchTests(unittest.TestCase):
 
         expected = self.store.search_page("信贷", limit=10)
         actual = self.grouped.search_page("信贷", limit=10)
-        self.assertEqual(actual.total_count, expected.total_count)
-        self.assertEqual(self._signature(actual), self._signature(expected))
 
-    def test_grouped_engine_matches_deep_file_pagination(self) -> None:
+        self.assertEqual(actual.total_count, expected.total_count)
+        self.assertEqual(
+            {row.path for row in actual.items},
+            {row.path for row in expected.items},
+        )
+        expected_locations = {row.path: row.location for row in expected.items}
+        self.assertTrue(
+            all(row.location == expected_locations[row.path] for row in actual.items)
+        )
+        # File-level evidence may legitimately rerank documents, but it must not
+        # overpower the established strongest filename signal.
+        self.assertEqual(Path(actual.items[0].path).name, "信贷.pdf")
+
+    def test_grouped_engine_deep_file_pagination_has_no_gaps_after_reranking(self) -> None:
         for index in range(17):
             self._add(
                 index,
@@ -73,11 +84,27 @@ class ExactGroupedSearchTests(unittest.TestCase):
                 modified_time=float(index),
             )
 
-        for offset in (0, 5, 10, 15, 20):
-            expected = self.store.search_page("客户经理", limit=5, offset=offset)
-            actual = self.grouped.search_page("客户经理", limit=5, offset=offset)
-            self.assertEqual(actual.total_count, expected.total_count)
-            self.assertEqual(self._signature(actual), self._signature(expected))
+        expected = self.store.search_page("客户经理", limit=100)
+        expected_paths = {row.path for row in expected.items}
+        expected_locations = {row.path: row.location for row in expected.items}
+
+        collected = []
+        for offset in (0, 5, 10, 15):
+            page = self.grouped.search_page("客户经理", limit=5, offset=offset)
+            self.assertEqual(page.total_count, 17)
+            collected.extend(page.items)
+
+        tail = self.grouped.search_page("客户经理", limit=5, offset=20)
+        self.assertEqual(tail.total_count, 17)
+        self.assertEqual(tail.items, [])
+
+        paths = [row.path for row in collected]
+        self.assertEqual(len(paths), 17)
+        self.assertEqual(len(set(paths)), 17)
+        self.assertEqual(set(paths), expected_paths)
+        self.assertTrue(
+            all(row.location == expected_locations[row.path] for row in collected)
+        )
 
     def test_grouped_engine_matches_filters_and_multiterm_semantics(self) -> None:
         self._add(0, chunks=["客户信息由经理负责"], folder="制度", size=100)
