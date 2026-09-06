@@ -3,7 +3,7 @@ from __future__ import annotations
 import sqlite3
 
 
-CURRENT_SCHEMA_VERSION = 9
+CURRENT_SCHEMA_VERSION = 10
 LEGACY_EXTRACTION_REVISION = 1
 
 
@@ -31,11 +31,14 @@ def ensure_schema_compatible(conn: sqlite3.Connection) -> int:
 def _ensure_extraction_state(conn: sqlite3.Connection) -> None:
     """Create/upgrade the lightweight per-file extraction-state sidecar.
 
-    v8 introduced only ``revision``. v9 adds a durable status and timestamp
-    without rewriting ``files``/``chunks`` or rebuilding FTS. Existing v8 rows
-    intentionally default to INDEXED. The indexer still requires an actual
-    chunk for INDEXED, so historical zero-chunk rows are repaired once and then
-    recorded as NO_TEXT/OCR_REQUIRED instead of being parsed forever.
+    v8 introduced ``revision``. v9 added durable lifecycle status and a
+    timestamp. v10 adds only failure retry metadata so repeatedly broken files
+    can be deferred without touching the files/chunks/FTS tables.
+
+    Existing v8 rows intentionally default to INDEXED. The indexer still
+    requires an actual chunk for INDEXED, so historical zero-chunk rows are
+    repaired once and then recorded as NO_TEXT/OCR_REQUIRED instead of being
+    parsed forever.
     """
     previous_version = get_schema_version(conn)
     conn.execute(
@@ -44,7 +47,11 @@ def _ensure_extraction_state(conn: sqlite3.Connection) -> None:
             path TEXT PRIMARY KEY,
             revision INTEGER NOT NULL,
             status TEXT NOT NULL DEFAULT 'INDEXED',
-            updated_at REAL NOT NULL DEFAULT 0
+            updated_at REAL NOT NULL DEFAULT 0,
+            source_modified_time REAL,
+            source_size INTEGER,
+            failure_count INTEGER NOT NULL DEFAULT 0,
+            retry_after REAL NOT NULL DEFAULT 0
         )
         """
     )
@@ -61,6 +68,20 @@ def _ensure_extraction_state(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE extraction_state "
             "ADD COLUMN updated_at REAL NOT NULL DEFAULT 0"
+        )
+    if "source_modified_time" not in columns:
+        conn.execute("ALTER TABLE extraction_state ADD COLUMN source_modified_time REAL")
+    if "source_size" not in columns:
+        conn.execute("ALTER TABLE extraction_state ADD COLUMN source_size INTEGER")
+    if "failure_count" not in columns:
+        conn.execute(
+            "ALTER TABLE extraction_state "
+            "ADD COLUMN failure_count INTEGER NOT NULL DEFAULT 0"
+        )
+    if "retry_after" not in columns:
+        conn.execute(
+            "ALTER TABLE extraction_state "
+            "ADD COLUMN retry_after REAL NOT NULL DEFAULT 0"
         )
 
     if previous_version < 8:
