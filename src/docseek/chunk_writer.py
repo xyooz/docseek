@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import time
 from collections.abc import Iterable
 from types import TracebackType
 from typing import Self
@@ -10,6 +11,7 @@ from .chunk_spool import DocumentChunkSpool
 from .chunk_store import ChunkStore
 from .chunks import DocumentChunk
 from .document_types import DIRECT_SUPPORTED_EXTENSIONS
+from .extraction_state import status_for_extraction_result
 
 
 class ChunkBatchWriter:
@@ -180,13 +182,17 @@ class ChunkBatchWriter:
                     count += 1
 
                 if extraction_revision is not None:
+                    status = status_for_extraction_result(extension, count)
                     conn.execute(
                         """
-                        INSERT INTO extraction_state(path, revision)
-                        VALUES (?, ?)
-                        ON CONFLICT(path) DO UPDATE SET revision=excluded.revision
+                        INSERT INTO extraction_state(path, revision, status, updated_at)
+                        VALUES (?, ?, ?, ?)
+                        ON CONFLICT(path) DO UPDATE SET
+                            revision=excluded.revision,
+                            status=excluded.status,
+                            updated_at=excluded.updated_at
                         """,
-                        (path, int(extraction_revision)),
+                        (path, int(extraction_revision), str(status), time.time()),
                     )
             except Exception:
                 conn.execute(f"ROLLBACK TO {savepoint}")

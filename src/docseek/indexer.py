@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
@@ -10,6 +11,12 @@ from .chunk_store import ChunkStore
 from .chunk_writer import ChunkBatchWriter
 from .chunks import iter_document_chunks
 from .extraction_revision import current_extraction_revision
+from .extraction_state import (
+    ExtractionStatus,
+    status_for_error_code,
+    status_for_extraction_result,
+    unchanged_state_is_complete,
+)
 from .extractors import SUPPORTED_EXTENSIONS
 from .file_exclusions import (
     FILE_EXCLUSION_PATTERNS_KEY,
@@ -46,6 +53,8 @@ class IndexStats:
     skipped: int = 0
     removed: int = 0
     excluded: int = 0
+    no_text: int = 0
+    ocr_required: int = 0
 
     def merge(self, other: "IndexStats") -> None:
         self.scanned += other.scanned
@@ -55,6 +64,8 @@ class IndexStats:
         self.skipped += other.skipped
         self.removed += other.removed
         self.excluded += other.excluded
+        self.no_text += other.no_text
+        self.ocr_required += other.ocr_required
 
 
 class IndexCancelled(Exception):
@@ -145,20 +156,6 @@ class DirectoryIndexer:
         except OSError:
             return str(path.absolute())
 
-    def _has_chunk_index(self, path: str) -> bool:
-        with self.chunk_store.connect() as conn:
-            row = conn.execute(
-                """
-                SELECT 1
-                FROM files f
-                JOIN chunks c ON c.file_id = f.id
-                WHERE f.path = ?
-                LIMIT 1
-                """,
-                (path,),
-            ).fetchone()
-        return row is not None
-
     def _has_file_record(self, path: str) -> bool:
         with self.chunk_store.connect() as conn:
             row = conn.execute("SELECT 1 FROM files WHERE path = ? LIMIT 1", (path,)).fetchone()
@@ -178,7 +175,12 @@ class DirectoryIndexer:
                 SELECT
                     f.modified_time,
                     f.size,
-                    COALESCE(s.revision, 0) AS extraction_revision
+                    EXISTS(
+                        SELECT 1 FROM chunks c
+                        WHERE c.file_id = f.id
+                    ) AS has_chunk,
+                    COALESCE(s.revision, 0) AS extraction_revision,
+                    s.status AS extraction_status
                 FROM files f
                 LEFT JOIN extraction_state s ON s.path = f.path
                 WHERE f.path = ?
@@ -191,10 +193,14 @@ class DirectoryIndexer:
             float(row["modified_time"]) == float(modified_time)
             and int(row["size"]) == int(size)
             and int(row["extraction_revision"]) >= int(extraction_revision)
+            and unchanged_state_is_complete(
+                row["extraction_status"],
+                has_chunk=bool(row["has_chunk"]),
+            )
         )
 
-    def _load_index_state(self) -> dict[str, tuple[float, int, bool, int]]:
-        """Load metadata/chunk presence/revision once for a reconciliation scan."""
+    def _load_index_state(self) -> dict[str, tuple[float, int, bool, int, str | None]]:
+        """Load metadata/chunk presence/revision/status once for reconciliation."""
         with self.chunk_store.connect() as conn:
             rows = conn.execute(
                 """
@@ -206,7 +212,8 @@ class DirectoryIndexer:
                         SELECT 1 FROM chunks c
                         WHERE c.file_id = f.id
                     ) AS has_chunk,
-                    COALESCE(s.revision, 0) AS extraction_revision
+                    COALESCE(s.revision, 0) AS extraction_revision,
+                    s.status AS extraction_status
                 FROM files f
                 LEFT JOIN extraction_state s ON s.path = f.path
                 """
@@ -218,28 +225,51 @@ class DirectoryIndexer:
                 int(row["size"]),
                 bool(row["has_chunk"]),
                 int(row["extraction_revision"]),
+                str(row["extraction_status"]) if row["extraction_status"] is not None else None,
             )
             for row in rows
         }
 
-    def _record_extraction_revision(self, path: str, revision: int) -> None:
+    def _record_extraction_state(
+        self,
+        path: str,
+        revision: int,
+        status: ExtractionStatus,
+    ) -> None:
         with self.chunk_store.connect() as conn:
             conn.execute(
                 """
-                INSERT INTO extraction_state(path, revision)
-                VALUES (?, ?)
-                ON CONFLICT(path) DO UPDATE SET revision=excluded.revision
+                INSERT INTO extraction_state(path, revision, status, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(path) DO UPDATE SET
+                    revision=excluded.revision,
+                    status=excluded.status,
+                    updated_at=excluded.updated_at
                 """,
-                (path, int(revision)),
+                (path, int(revision), str(status), time.time()),
             )
+
+    def _record_failure_state(self, path: str, error_code: str) -> None:
+        self._record_extraction_state(
+            path,
+            current_extraction_revision(Path(path).suffix),
+            status_for_error_code(error_code),
+        )
 
     def _remove_indexed_path(self, path: str, stats: IndexStats) -> None:
         if self._has_file_record(path):
             self.chunk_store.remove_document(path)
             stats.removed += 1
+        with self.chunk_store.connect() as conn:
+            conn.execute("DELETE FROM extraction_state WHERE path = ?", (path,))
 
     @staticmethod
     def _error_code(exc: Exception) -> str:
+        # TimeoutError is an OSError subclass on Python/Windows. Preserve the
+        # parser-specific type before the broad OS mapping so the lifecycle can
+        # distinguish a killable parser timeout from a filesystem failure.
+        if type(exc).__name__ == "LegacyExtractionTimeout":
+            return "LegacyExtractionTimeout"
         if isinstance(exc, PermissionError):
             return "permission_denied"
         if isinstance(exc, FileNotFoundError):
@@ -268,7 +298,7 @@ class DirectoryIndexer:
         *,
         on_progress: Callable[[Path, IndexStats], None] | None = None,
         on_detail: Callable[[Path, str, int], None] | None = None,
-        prefetched_state: tuple[float, int, bool, int] | None = None,
+        prefetched_state: tuple[float, int, bool, int, str | None] | None = None,
         state_prefetched: bool = False,
         writer: ChunkBatchWriter | None = None,
         clear_issue: bool = True,
@@ -295,8 +325,11 @@ class DirectoryIndexer:
                 and float(prefetched_state[0]) == float(stat.st_mtime)
                 and int(prefetched_state[1]) == int(stat.st_size)
                 and int(prefetched_state[3]) >= extraction_revision
+                and unchanged_state_is_complete(
+                    prefetched_state[4],
+                    has_chunk=bool(prefetched_state[2]),
+                )
             )
-            has_chunk = bool(prefetched_state[2]) if prefetched_state is not None else False
         else:
             unchanged = self._is_unchanged(
                 normalized,
@@ -304,9 +337,8 @@ class DirectoryIndexer:
                 size=stat.st_size,
                 extraction_revision=extraction_revision,
             )
-            has_chunk = self._has_chunk_index(normalized) if unchanged else False
 
-        if unchanged and has_chunk:
+        if unchanged:
             if clear_issue:
                 self.issues.clear(normalized)
             stats.unchanged += 1
@@ -328,16 +360,17 @@ class DirectoryIndexer:
                 display = Path(f"{path.name} · {location} · 已读取 {current:,} 行")
                 on_progress(display, stats)
 
+        extension = path.suffix.lower()
         common_args = {
             "path": normalized,
             "filename": path.name,
-            "extension": path.suffix.lower(),
+            "extension": extension,
             "modified_time": stat.st_mtime,
             "size": stat.st_size,
             "chunks": iter_document_chunks(
                 path,
                 on_progress=report_detail
-                if on_detail or on_progress or path.suffix.lower() == ".xlsx"
+                if on_detail or on_progress or extension == ".xlsx"
                 else None,
             ),
         }
@@ -348,12 +381,21 @@ class DirectoryIndexer:
             )
         else:
             chunk_count = self.chunk_store.replace_document(**common_args)
-            self._record_extraction_revision(normalized, extraction_revision)
+            self._record_extraction_state(
+                normalized,
+                extraction_revision,
+                status_for_extraction_result(extension, chunk_count),
+            )
 
+        status = status_for_extraction_result(extension, chunk_count)
         if clear_issue:
             self.issues.clear(normalized)
         stats.indexed += 1
         stats.chunks += chunk_count
+        if status is ExtractionStatus.NO_TEXT:
+            stats.no_text += 1
+        elif status is ExtractionStatus.OCR_REQUIRED:
+            stats.ocr_required += 1
         return True
 
     def update_paths(
@@ -416,7 +458,9 @@ class DirectoryIndexer:
                 self.issues.clear(normalized)
             except Exception as exc:
                 stats.skipped += 1
-                self.issues.record(normalized, self._error_code(exc), str(exc))
+                error_code = self._error_code(exc)
+                self._record_failure_state(normalized, error_code)
+                self.issues.record(normalized, error_code, str(exc))
 
         return stats
 
@@ -470,7 +514,9 @@ class DirectoryIndexer:
                 except Exception as exc:
                     writer.flush()
                     stats.skipped += 1
-                    self.issues.record(normalized, self._error_code(exc), str(exc))
+                    error_code = self._error_code(exc)
+                    self._record_failure_state(normalized, error_code)
+                    self.issues.record(normalized, error_code, str(exc))
 
         self.issues.clear_many(successful_paths)
         stats.removed += remove_missing_under_root(self.chunk_store, str(root), seen_paths)

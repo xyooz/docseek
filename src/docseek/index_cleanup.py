@@ -36,6 +36,9 @@ def remove_missing_under_root(
     exact filename/content values it was indexed with, while avoiding one
     connection and commit per missing file.
 
+    Extraction state is removed in the same transaction. This prevents stale
+    NO_TEXT/FAILED state from surviving after a source file is deleted.
+
     Path membership uses resolved, ``normcase`` comparison so Windows drive/
     case normalization does not make a valid child path look unrelated to its
     configured root.
@@ -57,6 +60,7 @@ def remove_missing_under_root(
 
         for file_id, path in missing:
             store._delete_chunks(conn, path, file_id=file_id)
+            conn.execute("DELETE FROM extraction_state WHERE path = ?", (path,))
             conn.execute("DELETE FROM files WHERE id = ?", (file_id,))
 
     return len(missing)
