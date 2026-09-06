@@ -260,12 +260,16 @@ class DirectoryIndexer:
         if self._has_file_record(path):
             self.chunk_store.remove_document(path)
             stats.removed += 1
-        else:
-            with self.chunk_store.connect() as conn:
-                conn.execute("DELETE FROM extraction_state WHERE path = ?", (path,))
+        with self.chunk_store.connect() as conn:
+            conn.execute("DELETE FROM extraction_state WHERE path = ?", (path,))
 
     @staticmethod
     def _error_code(exc: Exception) -> str:
+        # TimeoutError is an OSError subclass on Python/Windows. Preserve the
+        # parser-specific type before the broad OS mapping so the lifecycle can
+        # distinguish a killable parser timeout from a filesystem failure.
+        if type(exc).__name__ == "LegacyExtractionTimeout":
+            return "LegacyExtractionTimeout"
         if isinstance(exc, PermissionError):
             return "permission_denied"
         if isinstance(exc, FileNotFoundError):
