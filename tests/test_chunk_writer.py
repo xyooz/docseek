@@ -95,7 +95,7 @@ class ChunkBatchWriterTests(unittest.TestCase):
         parser_transaction_states: list[bool] = []
 
         with ChunkBatchWriter(self.store, batch_size=128) as writer:
-            # Keep a normal modern-format batch open first. The legacy path must
+            # Keep a cheap text batch open first. The legacy path must
             # commit/release this lock before it starts consuming the parser.
             writer.replace_document(
                 path=r"C:\docs\before.txt",
@@ -121,13 +121,48 @@ class ChunkBatchWriterTests(unittest.TestCase):
             )
 
             self.assertEqual(parser_transaction_states, [False])
-            # Compatibility documents are committed immediately so they do not
-            # leave a writer lock behind while the next file is parsed.
             self.assertFalse(writer._transaction_open)
 
         self.assertEqual(
             [row.filename for row in self.store.search("旧版 Excel")],
             ["legacy.xls"],
+        )
+
+    def test_modern_office_parser_runs_without_sqlite_writer_transaction(self) -> None:
+        parser_transaction_states: list[bool] = []
+
+        with ChunkBatchWriter(self.store, batch_size=128) as writer:
+            writer.replace_document(
+                path=r"C:\docs\before.txt",
+                filename="before.txt",
+                extension=".txt",
+                modified_time=1.0,
+                size=10,
+                chunks=[DocumentChunk(0, "行 1", "普通文件")],
+            )
+            self.assertTrue(writer._transaction_open)
+
+            def xlsx_chunks():
+                parser_transaction_states.append(writer._transaction_open)
+                yield DocumentChunk(0, "工作表 Sheet1 · 行 1-1", "现代 Excel 内容")
+
+            writer.replace_document(
+                path=r"C:\docs\modern.xlsx",
+                filename="modern.xlsx",
+                extension=".xlsx",
+                modified_time=2.0,
+                size=20,
+                chunks=xlsx_chunks(),
+            )
+
+            self.assertEqual(parser_transaction_states, [False])
+            # Office/PDF documents are replayed from the spool and committed
+            # immediately, so the next parser starts without a held writer.
+            self.assertFalse(writer._transaction_open)
+
+        self.assertEqual(
+            [row.filename for row in self.store.search("现代 Excel")],
+            ["modern.xlsx"],
         )
 
     def test_legacy_parser_failure_happens_before_new_write_transaction(self) -> None:
@@ -160,6 +195,39 @@ class ChunkBatchWriterTests(unittest.TestCase):
             bad = conn.execute(
                 "SELECT 1 FROM files WHERE path = ? LIMIT 1",
                 (r"C:\docs\bad.xls",),
+            ).fetchone()
+        self.assertIsNone(bad)
+
+    def test_modern_office_parser_failure_happens_before_new_write_transaction(self) -> None:
+        with ChunkBatchWriter(self.store, batch_size=128) as writer:
+            writer.replace_document(
+                path=r"C:\docs\safe.txt",
+                filename="safe.txt",
+                extension=".txt",
+                modified_time=1.0,
+                size=10,
+                chunks=[DocumentChunk(0, "行 1", "已经完成的文件")],
+            )
+
+            with self.assertRaises(ValueError):
+                writer.replace_document(
+                    path=r"C:\docs\bad.xlsx",
+                    filename="bad.xlsx",
+                    extension=".xlsx",
+                    modified_time=2.0,
+                    size=20,
+                    chunks=self._broken_chunks(),
+                )
+            self.assertFalse(writer._transaction_open)
+
+        self.assertEqual(
+            [row.filename for row in self.store.search("已经完成")],
+            ["safe.txt"],
+        )
+        with self.store.connect() as conn:
+            bad = conn.execute(
+                "SELECT 1 FROM files WHERE path = ? LIMIT 1",
+                (r"C:\docs\bad.xlsx",),
             ).fetchone()
         self.assertIsNone(bad)
 
