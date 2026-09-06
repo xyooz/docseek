@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
+from .sqlite_runtime import current_schema_objects, ensure_wal_mode
+
 
 class _ClosingConnection(sqlite3.Connection):
     def __exit__(self, exc_type, exc_value, traceback) -> bool:
@@ -42,6 +44,9 @@ class IndexIssueStore:
     def __init__(self, db_path: Path) -> None:
         self.db_path = db_path
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        objects = current_schema_objects(self.db_path)
+        if objects is not None and "index_issues" in objects:
+            return
         self._init_schema()
 
     def connect(self) -> sqlite3.Connection:
@@ -53,9 +58,7 @@ class IndexIssueStore:
 
     def _init_schema(self) -> None:
         with self.connect() as conn:
-            # journal_mode changes are relatively expensive on Windows; set it
-            # once instead of on every clear/record connection.
-            conn.execute("PRAGMA journal_mode=WAL")
+            ensure_wal_mode(conn)
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS index_issues (
