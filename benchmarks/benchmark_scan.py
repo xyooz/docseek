@@ -222,10 +222,18 @@ def main() -> None:
                 if name not in {"normalize_discovery"}
             )
             residual = max(0.0, second_post_discovery - measured)
+            normalize_post = second_timings.get("normalize_post", 0.0)
+            missing_cleanup = second_timings.get("missing_cleanup", 0.0)
+            hot_share = (
+                (normalize_post + missing_cleanup) / second_post_discovery
+                if second_post_discovery > 0
+                else 0.0
+            )
             print(
                 "unchanged_phases "
                 + format_phase_timings(second_timings)
                 + f" residual_post={residual:.3f}s"
+                + f" path_hot_share={hot_share:.1%}"
             )
         print(
             f"single_file_total={total_update_ms:.2f}ms "
