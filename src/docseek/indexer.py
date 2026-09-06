@@ -13,6 +13,8 @@ from .chunks import iter_document_chunks
 from .extraction_revision import current_extraction_revision
 from .extraction_state import (
     ExtractionStatus,
+    failed_state_is_deferred,
+    retry_delay_seconds,
     status_for_error_code,
     status_for_extraction_result,
     unchanged_state_is_complete,
@@ -199,10 +201,24 @@ class DirectoryIndexer:
             )
         )
 
-    def _load_index_state(self) -> dict[str, tuple[float, int, bool, int, str | None]]:
-        """Load metadata/chunk presence/revision/status once for reconciliation."""
+    def _load_index_state(
+        self,
+    ) -> dict[
+        str,
+        tuple[
+            float | None,
+            int | None,
+            bool,
+            int,
+            str | None,
+            float | None,
+            int | None,
+            float,
+        ],
+    ]:
+        """Load committed and failure-only state once for reconciliation."""
         with self.chunk_store.connect() as conn:
-            rows = conn.execute(
+            file_rows = conn.execute(
                 """
                 SELECT
                     f.path,
@@ -213,22 +229,58 @@ class DirectoryIndexer:
                         WHERE c.file_id = f.id
                     ) AS has_chunk,
                     COALESCE(s.revision, 0) AS extraction_revision,
-                    s.status AS extraction_status
+                    s.status AS extraction_status,
+                    s.source_modified_time,
+                    s.source_size,
+                    COALESCE(s.retry_after, 0) AS retry_after
                 FROM files f
                 LEFT JOIN extraction_state s ON s.path = f.path
                 """
             ).fetchall()
+            failure_only_rows = conn.execute(
+                """
+                SELECT
+                    s.path,
+                    s.revision AS extraction_revision,
+                    s.status AS extraction_status,
+                    s.source_modified_time,
+                    s.source_size,
+                    COALESCE(s.retry_after, 0) AS retry_after
+                FROM extraction_state s
+                LEFT JOIN files f ON f.path = s.path
+                WHERE f.path IS NULL
+                """
+            ).fetchall()
 
-        return {
+        state = {
             str(row["path"]): (
                 float(row["modified_time"]),
                 int(row["size"]),
                 bool(row["has_chunk"]),
                 int(row["extraction_revision"]),
                 str(row["extraction_status"]) if row["extraction_status"] is not None else None,
+                float(row["source_modified_time"])
+                if row["source_modified_time"] is not None
+                else None,
+                int(row["source_size"]) if row["source_size"] is not None else None,
+                float(row["retry_after"]),
             )
-            for row in rows
+            for row in file_rows
         }
+        for row in failure_only_rows:
+            state[str(row["path"])] = (
+                None,
+                None,
+                False,
+                int(row["extraction_revision"]),
+                str(row["extraction_status"]) if row["extraction_status"] is not None else None,
+                float(row["source_modified_time"])
+                if row["source_modified_time"] is not None
+                else None,
+                int(row["source_size"]) if row["source_size"] is not None else None,
+                float(row["retry_after"]),
+            )
+        return state
 
     def _record_extraction_state(
         self,
@@ -250,11 +302,71 @@ class DirectoryIndexer:
             )
 
     def _record_failure_state(self, path: str, error_code: str) -> None:
-        self._record_extraction_state(
-            path,
-            current_extraction_revision(Path(path).suffix),
-            status_for_error_code(error_code),
-        )
+        revision = current_extraction_revision(Path(path).suffix)
+        status = status_for_error_code(error_code)
+        now = time.time()
+        try:
+            stat = Path(path).stat()
+            source_modified_time: float | None = float(stat.st_mtime)
+            source_size: int | None = int(stat.st_size)
+        except OSError:
+            source_modified_time = None
+            source_size = None
+
+        with self.chunk_store.connect() as conn:
+            previous = conn.execute(
+                """
+                SELECT revision, status, source_modified_time, source_size, failure_count
+                FROM extraction_state
+                WHERE path = ?
+                """,
+                (path,),
+            ).fetchone()
+            same_failed_source = (
+                previous is not None
+                and str(previous["status"]) in {
+                    str(ExtractionStatus.FAILED),
+                    str(ExtractionStatus.TIMEOUT),
+                }
+                and int(previous["revision"]) == int(revision)
+                and previous["source_modified_time"] is not None
+                and source_modified_time is not None
+                and float(previous["source_modified_time"]) == source_modified_time
+                and previous["source_size"] is not None
+                and source_size is not None
+                and int(previous["source_size"]) == source_size
+            )
+            failure_count = (
+                int(previous["failure_count"]) + 1 if same_failed_source else 1
+            )
+            retry_after = now + retry_delay_seconds(status, failure_count)
+            conn.execute(
+                """
+                INSERT INTO extraction_state(
+                    path, revision, status, updated_at,
+                    source_modified_time, source_size, failure_count, retry_after
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(path) DO UPDATE SET
+                    revision=excluded.revision,
+                    status=excluded.status,
+                    updated_at=excluded.updated_at,
+                    source_modified_time=excluded.source_modified_time,
+                    source_size=excluded.source_size,
+                    failure_count=excluded.failure_count,
+                    retry_after=excluded.retry_after
+                """,
+                (
+                    path,
+                    int(revision),
+                    str(status),
+                    now,
+                    source_modified_time,
+                    source_size,
+                    failure_count,
+                    retry_after,
+                ),
+            )
 
     def _remove_indexed_path(self, path: str, stats: IndexStats) -> None:
         if self._has_file_record(path):
@@ -298,7 +410,17 @@ class DirectoryIndexer:
         *,
         on_progress: Callable[[Path, IndexStats], None] | None = None,
         on_detail: Callable[[Path, str, int], None] | None = None,
-        prefetched_state: tuple[float, int, bool, int, str | None] | None = None,
+        prefetched_state: tuple[
+            float | None,
+            int | None,
+            bool,
+            int,
+            str | None,
+            float | None,
+            int | None,
+            float,
+        ]
+        | None = None,
         state_prefetched: bool = False,
         writer: ChunkBatchWriter | None = None,
         clear_issue: bool = True,
@@ -320,8 +442,30 @@ class DirectoryIndexer:
 
         extraction_revision = current_extraction_revision(path.suffix)
         if state_prefetched:
+            if (
+                prefetched_state is not None
+                and failed_state_is_deferred(
+                    prefetched_state[4],
+                    stored_revision=prefetched_state[3],
+                    current_revision=extraction_revision,
+                    source_modified_time=prefetched_state[5],
+                    source_size=prefetched_state[6],
+                    current_modified_time=stat.st_mtime,
+                    current_size=stat.st_size,
+                    retry_after=prefetched_state[7],
+                )
+            ):
+                # A full reconciliation should keep the persisted issue visible
+                # but avoid repeatedly invoking an unchanged broken parser.
+                # Watcher updates and explicit issue retries use update_paths(),
+                # which intentionally bypasses this full-scan-only deferral.
+                stats.skipped += 1
+                return False
+
             unchanged = (
                 prefetched_state is not None
+                and prefetched_state[0] is not None
+                and prefetched_state[1] is not None
                 and float(prefetched_state[0]) == float(stat.st_mtime)
                 and int(prefetched_state[1]) == int(stat.st_size)
                 and int(prefetched_state[3]) >= extraction_revision
