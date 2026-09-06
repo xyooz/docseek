@@ -19,10 +19,20 @@ def create_files(root: Path, count: int) -> None:
         )
 
 
-def timed_scan(indexer: DirectoryIndexer, root: Path) -> tuple[float, object]:
+def timed_scan(indexer: DirectoryIndexer, root: Path) -> tuple[float, float, int, object]:
     started = time.perf_counter()
-    stats = indexer.scan(root)
-    return time.perf_counter() - started, stats
+    discovery_seconds: float | None = None
+    candidate_count = 0
+
+    def candidates_ready(count: int) -> None:
+        nonlocal discovery_seconds, candidate_count
+        if discovery_seconds is None:
+            discovery_seconds = time.perf_counter() - started
+        candidate_count = count
+
+    stats = indexer.scan(root, on_candidates_ready=candidates_ready)
+    total_seconds = time.perf_counter() - started
+    return total_seconds, discovery_seconds or 0.0, candidate_count, stats
 
 
 def main() -> None:
@@ -41,8 +51,18 @@ def main() -> None:
         db = SearchDatabase(base / "docseek.db")
         create_files(root, args.files)
 
-        first_seconds, first_stats = timed_scan(DirectoryIndexer(db), root)
-        second_seconds, second_stats = timed_scan(DirectoryIndexer(db), root)
+        (
+            first_seconds,
+            first_discovery_seconds,
+            first_candidates,
+            first_stats,
+        ) = timed_scan(DirectoryIndexer(db), root)
+        (
+            second_seconds,
+            second_discovery_seconds,
+            second_candidates,
+            second_stats,
+        ) = timed_scan(DirectoryIndexer(db), root)
 
         changed = root / "document_000000.txt"
         changed.write_text("客户经理 信贷 精准增量更新后的内容", encoding="utf-8")
@@ -60,11 +80,17 @@ def main() -> None:
         print(f"files={args.files:,}")
         print(
             f"first_scan={first_seconds:.3f}s "
+            f"discovery={first_discovery_seconds:.3f}s "
+            f"candidates={first_candidates:,} "
+            f"discovery_share={first_discovery_seconds / first_seconds:.1%} "
             f"files_per_second={args.files / first_seconds:.1f} "
             f"indexed={first_stats.indexed}"
         )
         print(
             f"unchanged_scan={second_seconds:.3f}s "
+            f"discovery={second_discovery_seconds:.3f}s "
+            f"candidates={second_candidates:,} "
+            f"discovery_share={second_discovery_seconds / second_seconds:.1%} "
             f"files_per_second={args.files / second_seconds:.1f} "
             f"unchanged={second_stats.unchanged}"
         )
