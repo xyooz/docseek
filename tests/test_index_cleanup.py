@@ -3,7 +3,9 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
+import docseek.index_cleanup as index_cleanup
 from docseek.chunk_store import ChunkStore
 from docseek.chunks import DocumentChunk
 from docseek.index_cleanup import remove_missing_under_root
@@ -60,6 +62,45 @@ class StaleIndexCleanupTests(unittest.TestCase):
             with store.connect() as conn:
                 remaining = int(conn.execute("SELECT COUNT(*) FROM files").fetchone()[0])
             self.assertEqual(remaining, 1)
+
+    def test_exact_unchanged_paths_skip_per_file_resolve_work(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "docs"
+            root.mkdir()
+            db_path = Path(temp_dir) / "docseek.db"
+            SearchDatabase(db_path)
+            store = ChunkStore(db_path)
+
+            existing: set[str] = set()
+            for index in range(8):
+                path = root / f"keep-{index}.txt"
+                text = f"稳定文件 {index}"
+                normalized = str(path.resolve())
+                existing.add(normalized)
+                store.replace_document(
+                    path=normalized,
+                    filename=path.name,
+                    extension=".txt",
+                    modified_time=float(index + 1),
+                    size=len(text.encode("utf-8")),
+                    chunks=[DocumentChunk(0, "行 1", text)],
+                )
+
+            original_path_key = index_cleanup._path_key
+            with mock.patch(
+                "docseek.index_cleanup._path_key",
+                wraps=original_path_key,
+            ) as path_key:
+                removed = remove_missing_under_root(
+                    store,
+                    str(root.resolve()),
+                    existing,
+                )
+
+            self.assertEqual(removed, 0)
+            # Only the root boundary needs a comparison key. Every exact current
+            # file path should be accepted directly from the discovery snapshot.
+            self.assertEqual(path_key.call_count, 1)
 
 
 if __name__ == "__main__":
