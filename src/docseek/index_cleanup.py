@@ -39,12 +39,16 @@ def remove_missing_under_root(
     Extraction state is removed in the same transaction. This prevents stale
     NO_TEXT/FAILED state from surviving after a source file is deleted.
 
-    Path membership uses resolved, ``normcase`` comparison so Windows drive/
-    case normalization does not make a valid child path look unrelated to its
-    configured root.
+    The hot path first compares the canonical path strings already produced by
+    ``DirectoryIndexer``. Healthy reconciliations therefore avoid resolving the
+    same thousands of paths a second time. If an exact string mismatch appears
+    (legacy data, case differences, symlink aliases or a genuinely missing
+    file), comparison keys are built lazily and the previous resolved/normcase
+    semantics are preserved for that reconciliation.
     """
     root_key = _path_key(root)
-    existing_keys = {_path_key(path) for path in existing_paths}
+    existing_exact = set(existing_paths)
+    existing_keys: set[str] | None = None
     missing: list[tuple[int, str]] = []
 
     with store.connect() as conn:
@@ -52,9 +56,23 @@ def remove_missing_under_root(
         for row in rows:
             file_id = int(row["id"])
             path = str(row["path"])
+
+            # Files indexed by current DocSeek builds are stored using the same
+            # canonical string that full discovery puts in ``seen_paths``. This
+            # is the overwhelmingly common unchanged-scan case and needs no
+            # filesystem work at all.
+            if path in existing_exact:
+                continue
+
             path_key = _path_key(path)
             if not _is_under_root(path_key, root_key):
                 continue
+
+            # A mismatch may simply be a Windows case/normalization difference
+            # or a legacy/symlink path. Build the expensive resolved-key set only
+            # after such a mismatch is actually observed.
+            if existing_keys is None:
+                existing_keys = {_path_key(existing) for existing in existing_exact}
             if path_key not in existing_keys:
                 missing.append((file_id, path))
 
