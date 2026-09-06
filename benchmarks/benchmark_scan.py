@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import sqlite3
 import sys
 import tempfile
 import time
@@ -9,6 +10,7 @@ from typing import Any, Callable, Iterator
 
 import docseek.chunk_writer as chunk_writer_module
 import docseek.indexer as indexer_module
+import docseek.structure_store as structure_store_module
 from docseek.indexer import DirectoryIndexer
 from docseek.search_db import SearchDatabase
 
@@ -33,6 +35,7 @@ def timed_scan(
     candidate_count = 0
     phase = "discovery"
     timings: dict[str, float] = {}
+    writer_scope_depth = 0
 
     def add_timing(name: str, elapsed: float) -> None:
         timings[name] = timings.get(name, 0.0) + elapsed
@@ -46,6 +49,32 @@ def timed_scan(
                 add_timing(name, time.perf_counter() - call_started)
 
         return wrapped
+
+    def classify_writer_sql(sql: str) -> str | None:
+        normalized = " ".join(sql.split()).upper()
+        if normalized == "BEGIN IMMEDIATE":
+            return "sql_begin"
+        if normalized.startswith(("SAVEPOINT ", "RELEASE ", "ROLLBACK TO ")):
+            return "sql_savepoint"
+        if normalized.startswith("INSERT INTO FILES") or normalized.startswith("UPDATE FILES"):
+            return "sql_files"
+        if normalized.startswith("SELECT ID FROM FILES WHERE PATH"):
+            return "sql_file_id"
+        if normalized.startswith("SELECT C.ID, C.CONTENT, F.FILENAME"):
+            return "sql_delete_lookup"
+        if normalized.startswith("DELETE FROM CHUNKS"):
+            return "sql_delete_chunks"
+        if normalized.startswith("INSERT INTO CHUNKS"):
+            return "sql_chunks"
+        if normalized.startswith("INSERT INTO CHUNK_STRUCTURE"):
+            return "sql_structure"
+        if normalized.startswith("INSERT INTO CHUNK_INDEX_CJK2"):
+            return "sql_fts_cjk"
+        if normalized.startswith("INSERT INTO CHUNK_INDEX"):
+            return "sql_fts_normal"
+        if normalized.startswith("INSERT INTO EXTRACTION_STATE"):
+            return "sql_extraction_state"
+        return None
 
     restorers: list[Callable[[], None]] = []
     if profile_phases:
@@ -157,14 +186,88 @@ def timed_scan(
             lambda: setattr(chunk_writer_module, "encode_chunk_content", original_encode)
         )
 
+        # ``writer_residual`` used to lump all SQLite work, source validation and
+        # the structure sidecar into one opaque bucket. A benchmark-only
+        # Connection subclass times the actual execute/commit calls while the
+        # ChunkBatchWriter is active. Production connection behavior is not
+        # changed, and the same WAL/runtime pragmas are reproduced here.
+        original_connect = indexer.chunk_store.connect
+
+        class ProfilingConnection(sqlite3.Connection):
+            def execute(self, sql: str, parameters: Any = ()) -> sqlite3.Cursor:
+                call_started = time.perf_counter()
+                try:
+                    return super().execute(sql, parameters)
+                finally:
+                    if writer_scope_depth > 0:
+                        category = classify_writer_sql(sql)
+                        if category is not None:
+                            add_timing(category, time.perf_counter() - call_started)
+
+            def commit(self) -> None:
+                call_started = time.perf_counter()
+                try:
+                    return super().commit()
+                finally:
+                    if writer_scope_depth > 0:
+                        add_timing("sql_commit", time.perf_counter() - call_started)
+
+            def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> bool:
+                try:
+                    return super().__exit__(exc_type, exc_value, traceback)
+                finally:
+                    self.close()
+
+        def profiled_connect() -> sqlite3.Connection:
+            conn = sqlite3.connect(
+                indexer.chunk_store.db_path,
+                timeout=10,
+                factory=ProfilingConnection,
+            )
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA busy_timeout=10000")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA temp_store=MEMORY")
+            conn.execute("PRAGMA cache_size=-32768")
+            return conn
+
+        indexer.chunk_store.connect = profiled_connect  # type: ignore[method-assign]
+        restorers.append(lambda: setattr(indexer.chunk_store, "connect", original_connect))
+
+        original_write_structure = structure_store_module.write_structure
+        structure_store_module.write_structure = timed_call(  # type: ignore[assignment]
+            "structure_total", original_write_structure
+        )
+        restorers.append(
+            lambda: setattr(
+                structure_store_module,
+                "write_structure",
+                original_write_structure,
+            )
+        )
+
         writer_cls = chunk_writer_module.ChunkBatchWriter
         original_replace_document = writer_cls.replace_document
 
         def timed_replace_document(writer: Any, *args: Any, **kwargs: Any) -> Any:
+            nonlocal writer_scope_depth
+            validate_source = kwargs.get("validate_source")
+            if validate_source is not None:
+                def timed_validate_source() -> Any:
+                    call_started = time.perf_counter()
+                    try:
+                        return validate_source()
+                    finally:
+                        add_timing("source_validate", time.perf_counter() - call_started)
+
+                kwargs["validate_source"] = timed_validate_source
+
             call_started = time.perf_counter()
+            writer_scope_depth += 1
             try:
                 return original_replace_document(writer, *args, **kwargs)
             finally:
+                writer_scope_depth -= 1
                 add_timing("writer_replace", time.perf_counter() - call_started)
 
         writer_cls.replace_document = timed_replace_document  # type: ignore[method-assign]
@@ -175,10 +278,16 @@ def timed_scan(
         original_flush = writer_cls.flush
 
         def timed_flush(writer: Any, *args: Any, **kwargs: Any) -> Any:
+            nonlocal writer_scope_depth
             call_started = time.perf_counter()
+            outermost = writer_scope_depth == 0
+            if outermost:
+                writer_scope_depth += 1
             try:
                 return original_flush(writer, *args, **kwargs)
             finally:
+                if outermost:
+                    writer_scope_depth -= 1
                 add_timing("writer_flush", time.perf_counter() - call_started)
 
         writer_cls.flush = timed_flush  # type: ignore[method-assign]
@@ -187,10 +296,16 @@ def timed_scan(
         original_exit = writer_cls.__exit__
 
         def timed_exit(writer: Any, *args: Any, **kwargs: Any) -> Any:
+            nonlocal writer_scope_depth
             call_started = time.perf_counter()
+            outermost = writer_scope_depth == 0
+            if outermost:
+                writer_scope_depth += 1
             try:
                 return original_exit(writer, *args, **kwargs)
             finally:
+                if outermost:
+                    writer_scope_depth -= 1
                 add_timing("writer_exit", time.perf_counter() - call_started)
 
         writer_cls.__exit__ = timed_exit  # type: ignore[method-assign]
@@ -246,6 +361,28 @@ def format_first_index_breakdown(timings: dict[str, float]) -> str:
         f"extract={extraction:.3f}s cjk={cjk:.3f}s raw_encode={raw_encode:.3f}s "
         f"writer_flush={flush:.3f}s writer_exit={writer_exit:.3f}s "
         f"writer_residual={writer_residual:.3f}s candidate_overhead={candidate_overhead:.3f}s"
+    )
+
+
+def format_writer_detail(timings: dict[str, float]) -> str:
+    structure_total = timings.get("structure_total", 0.0)
+    structure_sql = timings.get("sql_structure", 0.0)
+    structure_cpu = max(0.0, structure_total - structure_sql)
+    return (
+        f"files_sql={timings.get('sql_files', 0.0):.3f}s "
+        f"chunks_sql={timings.get('sql_chunks', 0.0):.3f}s "
+        f"structure_total={structure_total:.3f}s "
+        f"structure_sql={structure_sql:.3f}s structure_cpu={structure_cpu:.3f}s "
+        f"fts_normal={timings.get('sql_fts_normal', 0.0):.3f}s "
+        f"fts_cjk={timings.get('sql_fts_cjk', 0.0):.3f}s "
+        f"state_sql={timings.get('sql_extraction_state', 0.0):.3f}s "
+        f"savepoint_sql={timings.get('sql_savepoint', 0.0):.3f}s "
+        f"begin_sql={timings.get('sql_begin', 0.0):.3f}s "
+        f"commit_sql={timings.get('sql_commit', 0.0):.3f}s "
+        f"source_validate={timings.get('source_validate', 0.0):.3f}s "
+        f"file_id_sql={timings.get('sql_file_id', 0.0):.3f}s "
+        f"delete_lookup={timings.get('sql_delete_lookup', 0.0):.3f}s "
+        f"delete_chunks={timings.get('sql_delete_chunks', 0.0):.3f}s"
     )
 
 
@@ -309,6 +446,7 @@ def main() -> None:
         if first_timings:
             print("first_phases " + format_phase_timings(first_timings))
             print("first_writer_breakdown " + format_first_index_breakdown(first_timings))
+            print("first_writer_detail " + format_writer_detail(first_timings))
         print(
             f"unchanged_scan={second_seconds:.3f}s "
             f"discovery={second_discovery_seconds:.3f}s "
@@ -330,7 +468,10 @@ def main() -> None:
                     "raw_encode",
                     "writer_flush",
                     "writer_exit",
+                    "structure_total",
+                    "source_validate",
                 }
+                and not name.startswith("sql_")
             )
             residual = max(0.0, second_post_discovery - measured)
             normalize_post = second_timings.get("normalize_post", 0.0)
