@@ -3,7 +3,7 @@ from __future__ import annotations
 import io
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterator
+from typing import Callable, Iterable, Iterator
 
 import pymupdf
 from docx import Document
@@ -85,13 +85,63 @@ def _iter_direct_document_chunks(
 
 
 def _iter_text_chunks(path: Path, *, target_chars: int) -> Iterator[DocumentChunk]:
+    """Decode and chunk plain text while keeping the large-file path streaming.
+
+    The first bounded read is already enough to decode a small file. When that
+    normalized text also fits in one target chunk, construct the chunk directly
+    instead of routing it through StringIO, a line generator, a temporary list
+    and a final join. Larger small files still use the exact line-based chunking
+    contract, while files above the probe limit rewind the same handle and
+    stream through TextIOWrapper as before.
+    """
+    with path.open("rb") as raw:
+        probe = raw.read(TEXT_ENCODING_SAMPLE_BYTES + 1)
+        has_more = len(probe) > TEXT_ENCODING_SAMPLE_BYTES
+
+        if not has_more:
+            _encoding, decoded = _decode_text_bytes(probe)
+            # Match TextIOWrapper/StringIO universal-newline behavior used by
+            # the previous implementation before applying chunk boundaries.
+            normalized = decoded.replace("\r\n", "\n").replace("\r", "\n")
+            if len(normalized) < target_chars:
+                content = normalized.strip()
+                if content:
+                    line_count = normalized.count("\n")
+                    if not normalized.endswith("\n"):
+                        line_count += 1
+                    yield DocumentChunk(0, f"行 1-{max(1, line_count)}", content)
+                return
+
+            yield from _iter_text_chunks_from_lines(
+                normalized.splitlines(keepends=True),
+                target_chars=target_chars,
+            )
+            return
+
+        sample = probe[:TEXT_ENCODING_SAMPLE_BYTES]
+        encoding = _detect_text_encoding_sample(sample)
+        raw.seek(0)
+        with io.TextIOWrapper(
+            raw,
+            encoding=encoding,
+            errors="ignore",
+            newline=None,
+        ) as text:
+            yield from _iter_text_chunks_from_lines(text, target_chars=target_chars)
+
+
+def _iter_text_chunks_from_lines(
+    lines: Iterable[str],
+    *,
+    target_chars: int,
+) -> Iterator[DocumentChunk]:
     ordinal = 0
     start_line = 1
     line_no = 0
     buffer: list[str] = []
     char_count = 0
 
-    for line_no, line in enumerate(_iter_text_lines(path), start=1):
+    for line_no, line in enumerate(lines, start=1):
         buffer.append(line.rstrip("\n"))
         char_count += len(line)
         if char_count >= target_chars:
@@ -107,41 +157,6 @@ def _iter_text_chunks(path: Path, *, target_chars: int) -> Iterator[DocumentChun
     if content:
         end_line = max(start_line, line_no)
         yield DocumentChunk(ordinal, f"行 {start_line}-{end_line}", content)
-
-
-def _iter_text_lines(path: Path) -> Iterator[str]:
-    """Decode plain text with one file open and one probe read for small files.
-
-    Encoding detection needs a bounded prefix. Historically DocSeek opened the
-    file once for that 64 KiB probe and then opened it again from byte zero for
-    normal text iteration. Small office-side text files therefore paid two file
-    opens and read their whole payload twice.
-
-    Read one extra byte with the probe so a complete small file can reuse the
-    successful strict decode itself. Large files keep the established streaming
-    TextIOWrapper path and bounded memory usage; they merely rewind the same
-    handle instead of opening a second one.
-    """
-    with path.open("rb") as raw:
-        probe = raw.read(TEXT_ENCODING_SAMPLE_BYTES + 1)
-        has_more = len(probe) > TEXT_ENCODING_SAMPLE_BYTES
-
-        if not has_more:
-            _encoding, decoded = _decode_text_bytes(probe)
-            with io.StringIO(decoded, newline=None) as text:
-                yield from text
-            return
-
-        sample = probe[:TEXT_ENCODING_SAMPLE_BYTES]
-        encoding = _detect_text_encoding_sample(sample)
-        raw.seek(0)
-        with io.TextIOWrapper(
-            raw,
-            encoding=encoding,
-            errors="ignore",
-            newline=None,
-        ) as text:
-            yield from text
 
 
 def _decode_text_bytes(data: bytes) -> tuple[str, str]:
