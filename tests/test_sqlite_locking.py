@@ -6,7 +6,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 from docseek.chunk_store import ChunkStore
+from docseek.index_issues import IndexIssueStore
 from docseek.search_db import SearchDatabase
+from docseek.search_session import PersistentSearchStore
 
 
 class _FakeConnection:
@@ -47,6 +49,49 @@ class SqliteLockingTests(unittest.TestCase):
             finally:
                 writer.rollback()
                 writer.close()
+
+    def test_runtime_reopens_do_not_reinitialize_schema_with_active_reader_and_writer(self) -> None:
+        """Regression for real Windows portable ``database is locked`` reports.
+
+        Interactive search intentionally keeps a read connection alive, while
+        indexing owns SQLite's single WAL writer slot in bounded transactions.
+        Reconstructing runtime stores in that state must only inspect the
+        already-current schema; it must not reissue journal-mode or DDL setup.
+        """
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "docseek.db"
+            database = SearchDatabase(db_path)
+            store = ChunkStore(db_path)
+            issues = IndexIssueStore(db_path)
+            database.add_index_root(str(Path(temp_dir) / "docs"))
+            issues.record("seed", "os_error", "seed")
+
+            reader = PersistentSearchStore(db_path)
+            writer = store.connect()
+            try:
+                # Hold a real WAL read snapshot instead of merely keeping an
+                # idle handle open, then acquire the independent writer slot.
+                reader._connection.execute("BEGIN")
+                reader._connection.execute("SELECT COUNT(*) FROM files").fetchone()
+                writer.execute("BEGIN IMMEDIATE")
+
+                reopened_database = SearchDatabase(db_path)
+                reopened_store = ChunkStore(db_path)
+                reopened_issues = IndexIssueStore(db_path)
+
+                self.assertEqual(reopened_database.get_index_roots(), database.get_index_roots())
+                with reopened_store.connect() as conn:
+                    self.assertEqual(
+                        conn.execute("PRAGMA user_version").fetchone()[0],
+                        10,
+                    )
+                self.assertEqual(reopened_issues.count(), 1)
+            finally:
+                writer.rollback()
+                writer.close()
+                reader._connection.rollback()
+                reader.close()
 
 
 if __name__ == "__main__":
