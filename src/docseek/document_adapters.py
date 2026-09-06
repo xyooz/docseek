@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import math
 from dataclasses import dataclass
+from datetime import date, datetime
 from pathlib import Path
 from typing import Iterable, Iterator, Protocol
 
@@ -74,10 +75,13 @@ def _normalize_calamine_cell(value: object) -> object:
     """Keep Calamine search text compatible with the established openpyxl path.
 
     python-calamine represents numeric Excel cells as floats, including cells
-    whose stored value is an integer. openpyxl renders those as ``100`` rather
-    than ``100.0``. Normalizing only finite integral floats preserves existing
-    search text without changing genuine decimal values.
+    whose stored value is an integer. It also exposes a date-only cell as
+    ``date`` while openpyxl's data-only reader yields midnight ``datetime`` for
+    the same XLSX cell. Normalize only those representation differences so the
+    indexed text remains byte-for-byte compatible with the established path.
     """
+    if isinstance(value, date) and not isinstance(value, datetime):
+        return datetime.combine(value, datetime.min.time())
     if isinstance(value, float) and math.isfinite(value) and value.is_integer():
         return int(value)
     return value
@@ -184,7 +188,13 @@ class XlsxCalamineFastAdapter:
                         on_progress=on_progress,
                     )
                 )
-            except Exception:
+            except Exception as exc:
+                # Cancellation is control flow from DirectoryIndexer, not a
+                # parser compatibility failure. Importing that type here would
+                # create an indexer<->adapter cycle, so preserve the contract by
+                # its stable exception name and let it propagate immediately.
+                if type(exc).__name__ == "IndexCancelled":
+                    raise
                 # Discard every partial Calamine chunk before using the mature
                 # compatibility path. The caller sees exactly one extraction.
                 spool.close()
