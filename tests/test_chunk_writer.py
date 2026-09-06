@@ -79,6 +79,52 @@ class ChunkBatchWriterTests(unittest.TestCase):
             ["replace.txt"],
         )
 
+    def test_small_text_validates_source_only_after_lazy_parse(self) -> None:
+        events: list[str] = []
+
+        def chunks():
+            events.append("parse")
+            yield DocumentChunk(0, "行 1", "普通文本")
+
+        def validate_source() -> None:
+            events.append("validate")
+
+        with ChunkBatchWriter(self.store, batch_size=32) as writer:
+            writer.replace_document(
+                path=r"C:\docs\single-check.txt",
+                filename="single-check.txt",
+                extension=".txt",
+                modified_time=1.0,
+                size=10,
+                chunks=chunks(),
+                validate_source=validate_source,
+            )
+
+        self.assertEqual(events, ["parse", "validate"])
+
+    def test_spooled_office_keeps_prewrite_and_postwrite_validation(self) -> None:
+        events: list[str] = []
+
+        def chunks():
+            events.append("parse")
+            yield DocumentChunk(0, "工作表 Sheet1 · 行 1-1", "现代 Excel 内容")
+
+        def validate_source() -> None:
+            events.append("validate")
+
+        with ChunkBatchWriter(self.store, batch_size=32) as writer:
+            writer.replace_document(
+                path=r"C:\docs\double-check.xlsx",
+                filename="double-check.xlsx",
+                extension=".xlsx",
+                modified_time=1.0,
+                size=10,
+                chunks=chunks(),
+                validate_source=validate_source,
+            )
+
+        self.assertEqual(events, ["parse", "validate", "validate"])
+
     def test_failed_document_rolls_back_without_losing_batch_neighbors(self) -> None:
         with ChunkBatchWriter(self.store, batch_size=32) as writer:
             writer.replace_document(
