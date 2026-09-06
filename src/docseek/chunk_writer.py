@@ -108,7 +108,17 @@ class ChunkBatchWriter:
         chunks: Iterable[DocumentChunk],
         extraction_revision: int | None = None,
         validate_source: Callable[[], None] | None = None,
+        delete_existing_chunks: bool = True,
     ) -> int:
+        """Write one document atomically.
+
+        ``delete_existing_chunks`` may be disabled only when the caller already
+        knows from a consistent metadata snapshot that ``path`` has no committed
+        file row. Full reconciliation has exactly that information, so first-time
+        documents can avoid an otherwise pointless SELECT + DELETE on ``chunks``.
+        Precise watcher updates and normal replacement keep the conservative
+        default because they do not carry that snapshot guarantee.
+        """
         normalized_extension = extension.lower()
         compatibility_format = normalized_extension not in DIRECT_SUPPORTED_EXTENSIONS
         spool_before_write = (
@@ -156,7 +166,8 @@ class ChunkBatchWriter:
                 if file_id is None:
                     raise RuntimeError(f"无法为索引文件分配 file_id：{path}")
 
-                self.store._delete_chunks(conn, path, file_id=file_id)
+                if delete_existing_chunks:
+                    self.store._delete_chunks(conn, path, file_id=file_id)
                 # The filename is identical for every chunk in this document.
                 # Tokenize it once instead of once per PDF page / Excel chunk.
                 filename_tokens = self.store._cjk_bigrams(filename)
