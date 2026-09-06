@@ -109,24 +109,26 @@ def _iter_text_chunks(path: Path, *, target_chars: int) -> Iterator[DocumentChun
 
 
 def _iter_text_lines(path: Path) -> Iterator[str]:
-    """Decode plain text with one file open and no duplicate read for small files.
+    """Decode plain text with one file open and one probe read for small files.
 
     Encoding detection needs a bounded prefix. Historically DocSeek opened the
     file once for that 64 KiB probe and then opened it again from byte zero for
     normal text iteration. Small office-side text files therefore paid two file
     opens and read their whole payload twice.
 
-    Reuse the already-read probe when it contains the complete file. Large files
-    keep the established streaming TextIOWrapper path and bounded memory usage;
-    they merely rewind the same handle instead of opening a second one.
+    Read one extra byte with the probe so a complete small file can be decoded
+    directly without a second read. Large files keep the established streaming
+    TextIOWrapper path and bounded memory usage; they merely rewind the same
+    handle instead of opening a second one.
     """
     with path.open("rb") as raw:
-        sample = raw.read(TEXT_ENCODING_SAMPLE_BYTES)
-        has_more = bool(raw.read(1))
+        probe = raw.read(TEXT_ENCODING_SAMPLE_BYTES + 1)
+        has_more = len(probe) > TEXT_ENCODING_SAMPLE_BYTES
+        sample = probe[:TEXT_ENCODING_SAMPLE_BYTES]
         encoding = _detect_text_encoding_sample(sample)
 
         if not has_more:
-            decoded = sample.decode(encoding, errors="ignore")
+            decoded = probe.decode(encoding, errors="ignore")
             with io.StringIO(decoded, newline=None) as text:
                 yield from text
             return
