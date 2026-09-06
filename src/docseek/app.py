@@ -69,6 +69,19 @@ class MainWindow(app_base.MainWindow):
         self._history_ui_ready = True
         self._refresh_saved_button()
 
+        # A watcher only sees changes that happen while DocSeek is running.
+        # Snapshot the already-configured active roots at startup and reconcile
+        # them once the event loop can paint the window. This catches files that
+        # were created, modified, renamed or deleted while DocSeek was closed.
+        # Roots added later in this session are intentionally not captured here;
+        # their explicit first scan already performs the same reconciliation.
+        startup_roots = [Path(root) for root in self._active_index_roots()]
+        if startup_roots:
+            QTimer.singleShot(
+                0,
+                lambda roots=startup_roots: self._reconcile_startup_roots(roots),
+            )
+
     def closeEvent(self, event) -> None:  # noqa: N802
         """Persist UI state, finish searches and release SQLite handles."""
         if hasattr(self, "results_layout_timer"):
@@ -233,14 +246,53 @@ class MainWindow(app_base.MainWindow):
                 continue
         return False
 
+    def _reconcile_startup_roots(self, roots: list[Path]) -> None:
+        """Catch up changes made while DocSeek was closed without blocking paint."""
+        if self.current_worker is not None:
+            # A user-initiated index task already provides stronger freshness
+            # than launching a duplicate startup reconciliation behind it.
+            return
+
+        active_roots = set(self._active_index_roots())
+        candidates: list[Path] = []
+        for root in roots:
+            try:
+                resolved = root.resolve()
+            except OSError:
+                resolved = root.absolute()
+            if str(resolved) not in active_roots:
+                continue
+            if not resolved.exists() or not resolved.is_dir():
+                continue
+            candidates.append(resolved)
+
+        if not candidates:
+            return
+
+        self._start_index(candidates, automatic=True)
+        self.statusBar().showMessage(
+            "正在检查关闭期间的文件变化；已完成的索引内容可继续搜索"
+        )
+
     def _choose_directory(self) -> None:
         initial = self.database.get_index_root() or str(Path.home())
         selected = QFileDialog.getExistingDirectory(self, "选择需要索引的目录", initial)
         if selected:
-            # Re-adding a previously removed/paused path must make it active;
-            # otherwise stale pause metadata could silently disable monitoring.
-            self._root_state_store().set_paused(selected, False)
-            self._start_index([Path(selected)])
+            try:
+                root = Path(selected).resolve()
+            except OSError:
+                root = Path(selected).absolute()
+
+            # Persist the user's intent before starting any asynchronous work.
+            # A cancelled scan, crash or power loss can therefore recover on the
+            # next launch through startup reconciliation instead of forgetting
+            # the directory after partially writing its index.
+            self.database.add_index_root(str(root))
+            self._root_state_store().set_paused(root, False)
+            self._refresh_scope()
+            self._restart_watcher()
+            self._refresh_status()
+            self._start_index([root])
 
     def _open_index_settings(self) -> None:
         if self.current_worker is not None:
