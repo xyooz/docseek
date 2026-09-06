@@ -69,7 +69,10 @@ def _snapshot_view(snapshot: dict[str, Any]) -> dict[str, Any]:
     roots = _mapping(index.get("roots"), "diagnostic.index.roots")
     issues = _mapping(index.get("issues"), "diagnostic.index.issues")
     sqlite_files = _mapping(snapshot.get("sqlite_files"), "sqlite_files")
-    issue_codes_raw = _mapping(issues.get("by_error_code"), "diagnostic.index.issues.by_error_code")
+    issue_codes_raw = _mapping(
+        issues.get("by_error_code"),
+        "diagnostic.index.issues.by_error_code",
+    )
     issue_codes = {
         str(code): _integer(count, f"issue code {code}")
         for code, count in issue_codes_raw.items()
@@ -284,12 +287,22 @@ def beta_comparison_markdown(comparison: dict[str, Any]) -> str:
 def write_beta_comparison(
     before_path: str | Path,
     after_path: str | Path,
-    output_path: str | Path,
-) -> Path:
+    output_dir: str | Path,
+) -> tuple[Path, Path]:
     before = load_beta_snapshot(before_path)
     after = load_beta_snapshot(after_path)
     comparison = compare_beta_snapshots(before, after)
-    destination = Path(output_path).expanduser()
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_text(beta_comparison_markdown(comparison), encoding="utf-8")
-    return destination
+
+    after_time = _parse_utc(comparison.get("after_generated_at_utc"))
+    if after_time is None:
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    else:
+        stamp = after_time.strftime("%Y%m%d-%H%M%S")
+
+    directory = Path(output_dir).expanduser()
+    directory.mkdir(parents=True, exist_ok=True)
+    json_path = directory / f"beta-comparison-{stamp}.json"
+    markdown_path = directory / f"beta-comparison-{stamp}.md"
+    json_path.write_text(beta_comparison_json(comparison), encoding="utf-8")
+    markdown_path.write_text(beta_comparison_markdown(comparison), encoding="utf-8")
+    return json_path, markdown_path
