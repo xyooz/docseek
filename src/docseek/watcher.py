@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -85,19 +86,38 @@ class _DocSeekEventHandler(FileSystemEventHandler):
 
 
 class WatchManager:
-    """Watch indexed roots and collapse noisy events into one precise batch."""
+    """Watch indexed roots and converge them with periodic reconciliation.
+
+    Native filesystem notifications provide low-latency updates, but they are
+    not treated as the sole source of truth. A bounded periodic full rescan is
+    the safety net for events missed during sleep/resume, observer disruption,
+    or platform-specific notification loss.
+
+    The normal debounce window collapses noisy Office/WPS save sequences. A
+    maximum batch delay prevents continuous file activity from postponing the
+    flush forever.
+    """
 
     def __init__(
         self,
         on_change: Callable[[WatchBatch], None],
         *,
         debounce_seconds: float = 1.2,
+        max_batch_delay_seconds: float = 10.0,
+        reconcile_seconds: float = 3600.0,
     ) -> None:
         self.on_change = on_change
-        self.debounce_seconds = debounce_seconds
+        self.debounce_seconds = max(0.0, float(debounce_seconds))
+        self.max_batch_delay_seconds = max(
+            self.debounce_seconds,
+            float(max_batch_delay_seconds),
+        )
+        self.reconcile_seconds = max(0.0, float(reconcile_seconds))
         self._observer: Observer | None = None
         self._lock = threading.Lock()
         self._timer: threading.Timer | None = None
+        self._reconcile_timer: threading.Timer | None = None
+        self._pending_since: float | None = None
         self._pending_paths: set[str] = set()
         self._full_rescan = False
         self._config: tuple[tuple[str, ...], tuple[str, ...]] | None = None
@@ -131,6 +151,8 @@ class WatchManager:
             observer.start()
             self._observer = observer
             self._config = config
+            with self._lock:
+                self._schedule_reconcile_locked()
 
     def stop(self) -> None:
         observer = self._observer
@@ -142,11 +164,16 @@ class WatchManager:
 
         with self._lock:
             timer = self._timer
+            reconcile_timer = self._reconcile_timer
             self._timer = None
+            self._reconcile_timer = None
+            self._pending_since = None
             self._pending_paths.clear()
             self._full_rescan = False
         if timer is not None:
             timer.cancel()
+        if reconcile_timer is not None:
+            reconcile_timer.cancel()
 
     def _queue_path(self, path: Path) -> None:
         with self._lock:
@@ -159,12 +186,38 @@ class WatchManager:
             self._restart_timer_locked()
 
     def _restart_timer_locked(self) -> None:
+        now = time.monotonic()
+        if self._pending_since is None:
+            self._pending_since = now
+        elapsed = max(0.0, now - self._pending_since)
+        remaining = max(0.0, self.max_batch_delay_seconds - elapsed)
+        delay = min(self.debounce_seconds, remaining)
+
         if self._timer is not None:
             self._timer.cancel()
-        timer = threading.Timer(self.debounce_seconds, self._flush)
+        timer = threading.Timer(delay, self._flush)
         timer.daemon = True
         self._timer = timer
         timer.start()
+
+    def _schedule_reconcile_locked(self) -> None:
+        if self.reconcile_seconds <= 0 or self._observer is None or self._config is None:
+            return
+        if self._reconcile_timer is not None:
+            self._reconcile_timer.cancel()
+        timer = threading.Timer(self.reconcile_seconds, self._periodic_reconcile)
+        timer.daemon = True
+        self._reconcile_timer = timer
+        timer.start()
+
+    def _periodic_reconcile(self) -> None:
+        with self._lock:
+            self._reconcile_timer = None
+            if self._observer is None or self._config is None:
+                return
+            self._full_rescan = True
+            self._restart_timer_locked()
+            self._schedule_reconcile_locked()
 
     def _flush(self) -> None:
         with self._lock:
@@ -172,6 +225,7 @@ class WatchManager:
             full_rescan = self._full_rescan
             self._pending_paths.clear()
             self._full_rescan = False
+            self._pending_since = None
             self._timer = None
 
         if full_rescan or paths:
