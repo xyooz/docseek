@@ -6,6 +6,16 @@ from pathlib import Path
 from .document_types import DIRECT_SUPPORTED_EXTENSIONS
 
 
+MODERN_OFFICE_EXTENSIONS = frozenset({".docx", ".xlsx", ".pptx", ".pdf"})
+OFFICE_COMPATIBILITY_EXTENSIONS = frozenset(
+    {
+        ".doc", ".dot", ".rtf", ".odt", ".ppt", ".pps", ".odp",
+        ".xls", ".xlsb", ".ods", ".wps", ".wpt", ".et", ".ett",
+        ".xlt", ".dps", ".dpt",
+    }
+)
+
+
 def is_fast_lane_path(path: Path) -> bool:
     """Return True for mature in-process formats that should be indexed first."""
     return Path(path).suffix.lower() in DIRECT_SUPPORTED_EXTENSIONS
@@ -27,15 +37,27 @@ def prioritize_index_candidates(candidates: Iterable[Path]) -> Iterator[Path]:
     small first-index discovery delay for a much stronger writer-ownership
     invariant on real multi-level Windows directory trees.
     """
-    fast_lane: list[Path] = []
-    compatibility_lane: list[Path] = []
+    modern_office: list[Path] = []
+    lightweight: list[Path] = []
+    office_compatibility: list[Path] = []
+    other_compatibility: list[Path] = []
 
     for path in candidates:
         candidate = Path(path)
-        if is_fast_lane_path(candidate):
-            fast_lane.append(candidate)
+        extension = candidate.suffix.lower()
+        if extension in MODERN_OFFICE_EXTENSIONS:
+            modern_office.append(candidate)
+        elif extension in DIRECT_SUPPORTED_EXTENSIONS:
+            lightweight.append(candidate)
+        elif extension in OFFICE_COMPATIBILITY_EXTENSIONS:
+            office_compatibility.append(candidate)
         else:
-            compatibility_lane.append(candidate)
+            # Unknown candidates are retained for callers that use this helper
+            # independently; the production discovery path only yields known
+            # formats.
+            other_compatibility.append(candidate)
 
-    yield from fast_lane
-    yield from compatibility_lane
+    yield from modern_office
+    yield from lightweight
+    yield from office_compatibility
+    yield from other_compatibility

@@ -486,10 +486,6 @@ class MainWindow(app_base.MainWindow):
             self._start_index([root])
 
     def _open_index_settings(self) -> None:
-        if self.current_worker is not None:
-            self.statusBar().showMessage("请等待当前索引任务完成后再修改设置", 5000)
-            return
-
         dialog = PausableIndexSettingsDialog(self.database, self)
         if not dialog.exec():
             return
@@ -756,6 +752,7 @@ class MainWindow(app_base.MainWindow):
 def main() -> None:
     app = QApplication(sys.argv)
     app.setApplicationName("DocSeek")
+    app.setWindowIcon(app_base.load_app_icon())
     window = MainWindow()
     window.show()
     raise SystemExit(app.exec())

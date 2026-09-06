@@ -51,7 +51,7 @@ DocSeek 是一个面向 Windows 办公环境的本地全文检索工具：像 Ev
 
 优先使用结构保真度最高的专用解析器：
 
-- 文本：`.txt` `.md` `.log` `.csv`
+- 文本与网页：`.txt` `.md` `.log` `.csv` `.tsv` `.html` `.htm` `.xhtml`
 - Word：`.docx`
 - Excel：`.xlsx`
 - PowerPoint：`.pptx`
@@ -60,7 +60,7 @@ DocSeek 是一个面向 Windows 办公环境的本地全文检索工具：像 Ev
 可选兼容后端：
 
 - Calamine：`.xls` `.xlsb` `.ods`
-- `iscc-tika` 原生兼容：`.xls` `.ods` `.doc` `.dot` `.rtf` `.odt` `.ppt` `.pps` `.odp` `.xlt`
+- `iscc-tika` 原生兼容：`.xml` `.eml` `.msg` `.epub`、旧 Office、开放文档及其他长尾格式
 - Windows 本机 WPS COM 兜底：部分旧 Office / WPS 格式
 
 WPS 不是主解析路径；专有格式是否可解析取决于本机 WPS 能力。

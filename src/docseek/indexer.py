@@ -767,6 +767,12 @@ class DirectoryIndexer:
                     self._record_failure_state(normalized, error_code)
                     self.issues.record(normalized, error_code, str(exc))
 
+        if on_progress and candidates:
+            # Always publish the terminal count. Unchanged files deliberately
+            # report in coarse batches, so without this event a short refresh
+            # could disappear while its progress bar still showed 0%.
+            on_progress(candidates[-1], stats)
+
         self.issues.clear_many(successful_paths)
         stats.removed += remove_missing_under_root(self.chunk_store, str(root), seen_paths)
         self.issues.clear_under_root_if_missing(str(root), seen_paths)

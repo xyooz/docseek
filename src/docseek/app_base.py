@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
 )
 
 from .chunk_store import ChunkStore
+from .app_icon import load_app_icon
 from .location_preview import preview_kind
 from .structure_store import preview_location
 from .indexer import DirectoryIndexer, IndexCancelled, IndexStats
@@ -56,6 +57,11 @@ FILE_FILTERS = [
     ("Word", ".docx"),
     ("Excel", ".xlsx"),
     ("PowerPoint", ".pptx"),
+    ("WPS 文字", ".wps"),
+    ("WPS 表格", ".et"),
+    ("WPS 演示", ".dps"),
+    ("HTML", ".html"),
+    ("Markdown", ".md"),
     ("文本", ".txt"),
 ]
 
@@ -121,6 +127,8 @@ def idle_preview_html() -> str:
 
 class IndexSignals(QObject):
     progress = Signal(str, int, int)
+    plan = Signal(str, int, int, int)
+    detailed_progress = Signal(str, int, int, int, str)
     finished = Signal(object)
     cancelled = Signal()
     failed = Signal(str)
@@ -159,26 +167,54 @@ class IndexWorker(QRunnable):
             self.indexer = DirectoryIndexer(database)
 
             if self.paths is not None:
+                candidate_total = len(self.paths)
+                self.signals.plan.emit("", candidate_total, 1, 1)
+
+                def report_path(path: Path, current: IndexStats) -> None:
+                    self.signals.progress.emit(
+                        str(path), current.scanned, current.indexed
+                    )
+                    self.signals.detailed_progress.emit(
+                        str(path), current.scanned, current.indexed,
+                        candidate_total, "",
+                    )
+
                 stats = self.indexer.update_paths(
                     self.paths,
-                    on_progress=lambda path, current: self.signals.progress.emit(
-                        str(path), current.scanned, current.indexed
-                    ),
+                    on_progress=report_path,
                 )
                 self.signals.finished.emit(stats)
                 return
 
             total = IndexStats()
-            for root in self.roots or []:
-                if not root.exists() or not root.is_dir():
-                    continue
+            valid_roots = [
+                root for root in (self.roots or [])
+                if root.exists() and root.is_dir()
+            ]
+            for root_position, root in enumerate(valid_roots, start=1):
+                candidate_total = 0
+
+                def candidates_ready(count: int) -> None:
+                    nonlocal candidate_total
+                    candidate_total = count
+                    self.signals.plan.emit(
+                        str(root), count, root_position, len(valid_roots)
+                    )
 
                 def report(path: Path, stats: IndexStats) -> None:
                     self.signals.progress.emit(
                         str(path), total.scanned + stats.scanned, total.indexed + stats.indexed
                     )
+                    self.signals.detailed_progress.emit(
+                        str(path), stats.scanned, stats.indexed,
+                        candidate_total, str(root),
+                    )
 
-                stats = self.indexer.scan(root, on_progress=report)
+                stats = self.indexer.scan(
+                    root,
+                    on_progress=report,
+                    on_candidates_ready=candidates_ready,
+                )
                 total.merge(stats)
 
             self.signals.finished.emit(total)
@@ -192,6 +228,7 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("DocSeek — 本地文档全文检索")
+        self.setWindowIcon(load_app_icon())
         self.resize(1300, 800)
         self.setMinimumSize(1040, 640)
         self.setStyleSheet(APPLICATION_STYLESHEET)
@@ -210,6 +247,11 @@ class MainWindow(QMainWindow):
         self.loading_generation: int | None = None
 
         self.current_worker: IndexWorker | None = None
+        self.index_root_progress: dict[str, tuple[int, int]] = {}
+        self.index_root_position = 1
+        self.index_root_count = 1
+        self.index_candidate_total = 0
+        self.index_current_root = ""
         self.search_offset = 0
         self.has_more_results = False
         self.loading_more = False
@@ -298,8 +340,9 @@ class MainWindow(QMainWindow):
         self.index_progress_bar = QProgressBar()
         self.index_progress_bar.setRange(0, 0)
         self.index_progress_bar.setTextVisible(False)
-        self.index_progress_bar.setFixedWidth(110)
-        self.index_progress_bar.setFixedHeight(10)
+        self.index_progress_bar.setFormat("%p%")
+        self.index_progress_bar.setFixedWidth(180)
+        self.index_progress_bar.setFixedHeight(16)
 
         progress_text = QVBoxLayout()
         progress_text.setContentsMargins(0, 0, 0, 0)
@@ -558,7 +601,9 @@ class MainWindow(QMainWindow):
     def _launch_worker(self, worker: IndexWorker, *, automatic: bool) -> None:
         self.choose_button.setEnabled(False)
         self.refresh_button.setEnabled(False)
-        self.settings_button.setEnabled(False)
+        # Settings remains available as a live, read-only progress view while
+        # an index job owns the database writer.
+        self.settings_button.setEnabled(True)
         # Full scans can take long enough that users must retain control even
         # when the scan was started automatically during startup recovery.
         self.cancel_button.setVisible(worker.is_full_scan)
@@ -567,8 +612,15 @@ class MainWindow(QMainWindow):
         self.index_file_label.setToolTip("")
         self.index_detail_label.setText("已写入的内容可以继续搜索")
         self.index_counts_label.setText("已处理 0 · 更新 0")
+        self.index_candidate_total = 0
+        self.index_current_root = ""
+        self.index_progress_bar.setRange(0, 0)
+        self.index_progress_bar.setTextVisible(False)
+        if worker.is_full_scan:
+            self.index_root_progress = {}
         self.current_worker = worker
-        worker.signals.progress.connect(self._index_progress)
+        worker.signals.plan.connect(self._index_plan)
+        worker.signals.detailed_progress.connect(self._index_progress_detailed)
         worker.signals.finished.connect(self._index_finished)
         worker.signals.cancelled.connect(self._index_cancelled)
         worker.signals.failed.connect(self._index_failed)
@@ -610,6 +662,61 @@ class MainWindow(QMainWindow):
             self.index_file_label.setToolTip(path)
         self.index_detail_label.setText(detail or "已写入的内容可以继续搜索")
         self.index_counts_label.setText(f"已处理 {scanned:,} · 更新 {indexed:,}")
+
+    def _index_plan(
+        self,
+        root: str,
+        candidate_total: int,
+        root_position: int,
+        root_count: int,
+    ) -> None:
+        self.index_current_root = root
+        self.index_candidate_total = candidate_total
+        self.index_root_position = root_position
+        self.index_root_count = root_count
+        if root:
+            self.index_root_progress[root] = (0, candidate_total)
+        if candidate_total > 0:
+            self.index_progress_bar.setRange(0, candidate_total)
+            self.index_progress_bar.setValue(0)
+            self.index_progress_bar.setTextVisible(True)
+        else:
+            self.index_progress_bar.setRange(0, 0)
+            self.index_progress_bar.setTextVisible(False)
+
+    def _index_progress_detailed(
+        self,
+        path: str,
+        scanned: int,
+        indexed: int,
+        candidate_total: int,
+        root: str,
+    ) -> None:
+        filename, detail = split_index_progress_display(path)
+        self.index_file_label.setText(filename)
+        if not detail:
+            self.index_file_label.setToolTip(path)
+        self.index_detail_label.setText(detail or "已写入的内容可以继续搜索")
+
+        if candidate_total > 0:
+            completed = min(scanned, candidate_total)
+            self.index_progress_bar.setRange(0, candidate_total)
+            self.index_progress_bar.setValue(completed)
+            self.index_progress_bar.setTextVisible(True)
+            if root:
+                self.index_root_progress[root] = (completed, candidate_total)
+            root_prefix = (
+                f"目录 {self.index_root_position}/{self.index_root_count} · "
+                if self.index_root_count > 1
+                else ""
+            )
+            self.index_counts_label.setText(
+                f"{root_prefix}完成 {completed:,}/{candidate_total:,} · 更新 {indexed:,}"
+            )
+        else:
+            self.index_progress_bar.setRange(0, 0)
+            self.index_progress_bar.setTextVisible(False)
+            self.index_counts_label.setText(f"已发现并处理 {scanned:,} · 更新 {indexed:,}")
 
     def _index_finished(self, stats: IndexStats) -> None:
         worker = self.current_worker

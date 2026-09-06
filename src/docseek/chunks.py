@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 from dataclasses import dataclass
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Callable, Iterable, Iterator
 
@@ -20,7 +21,8 @@ class DocumentChunk:
     content: str
 
 
-TEXT_EXTENSIONS = {".txt", ".md", ".log", ".csv"}
+TEXT_EXTENSIONS = {".txt", ".md", ".log", ".csv", ".tsv"}
+HTML_EXTENSIONS = {".html", ".htm", ".xhtml"}
 TEXT_ENCODING_SAMPLE_BYTES = 65_536
 TEXT_ENCODING_CANDIDATES = ("utf-8", "gb18030")
 XLSX_PROGRESS_ROW_INTERVAL = 1_000
@@ -68,6 +70,8 @@ def _iter_direct_document_chunks(
     suffix = path.suffix.lower()
     if suffix in TEXT_EXTENSIONS:
         yield from _iter_text_chunks(path, target_chars=target_chars)
+    elif suffix in HTML_EXTENSIONS:
+        yield from _iter_html_chunks(path, target_chars=target_chars)
     elif suffix == ".docx":
         yield from _iter_docx_chunks(path, target_chars=target_chars)
     elif suffix == ".xlsx":
@@ -171,6 +175,126 @@ def _decode_text_bytes(data: bytes) -> tuple[str, str]:
 def _detect_text_encoding_sample(sample: bytes) -> str:
     encoding, _decoded = _decode_text_bytes(sample)
     return encoding
+
+
+class _VisibleHtmlParser(HTMLParser):
+    """Collect visible HTML text while dropping executable and style content."""
+
+    _BLOCK_TAGS = frozenset(
+        {"address", "article", "aside", "blockquote", "br", "dd", "div", "dl",
+         "dt", "figcaption", "figure", "footer", "form", "h1", "h2", "h3",
+         "h4", "h5", "h6", "header", "hr", "li", "main", "nav", "ol", "p",
+         "pre", "section", "table", "td", "th", "title", "tr", "ul"}
+    )
+    _SKIP_TAGS = frozenset({"script", "style", "noscript", "svg", "canvas"})
+    _HEADING_TAGS = frozenset({"title", "h1", "h2", "h3", "h4", "h5", "h6"})
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.lines: list[tuple[str, str]] = []
+        self._parts: list[str] = []
+        self._skip_depth = 0
+        self._heading_tag = ""
+        self._heading_parts: list[str] = []
+        self._current_heading = ""
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        del attrs
+        tag = tag.casefold()
+        if tag in self._SKIP_TAGS:
+            self._skip_depth += 1
+            return
+        if self._skip_depth:
+            return
+        if tag in self._HEADING_TAGS:
+            self._flush_line()
+            self._heading_tag = tag
+            self._heading_parts = []
+        elif tag in self._BLOCK_TAGS:
+            self._flush_line()
+
+    def handle_startendtag(self, tag: str, attrs) -> None:
+        self.handle_starttag(tag, attrs)
+        self.handle_endtag(tag)
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.casefold()
+        if tag in self._SKIP_TAGS:
+            self._skip_depth = max(0, self._skip_depth - 1)
+            return
+        if self._skip_depth:
+            return
+        if tag == self._heading_tag:
+            heading = _clean_location_title(" ".join(self._heading_parts))
+            self._flush_line(heading=heading)
+            if heading:
+                self._current_heading = heading
+            self._heading_tag = ""
+            self._heading_parts = []
+        elif tag in self._BLOCK_TAGS:
+            self._flush_line()
+
+    def handle_data(self, data: str) -> None:
+        if self._skip_depth:
+            return
+        text = " ".join(data.split())
+        if not text:
+            return
+        self._parts.append(text)
+        if self._heading_tag:
+            self._heading_parts.append(text)
+
+    def close(self) -> None:
+        super().close()
+        self._flush_line()
+
+    def _flush_line(self, *, heading: str = "") -> None:
+        text = " ".join(self._parts).strip()
+        self._parts = []
+        if text:
+            self.lines.append((heading or self._current_heading, text))
+
+
+def _iter_html_chunks(path: Path, *, target_chars: int) -> Iterator[DocumentChunk]:
+    """Extract visible HTML locally without paying one Tika process per file."""
+    with path.open("rb") as handle:
+        sample = handle.read(TEXT_ENCODING_SAMPLE_BYTES)
+        encoding = _detect_text_encoding_sample(sample)
+        handle.seek(0)
+        text = handle.read().decode(encoding, errors="ignore")
+
+    parser = _VisibleHtmlParser()
+    parser.feed(text)
+    parser.close()
+
+    ordinal = 0
+    buffer: list[str] = []
+    char_count = 0
+    chunk_heading = ""
+    for heading, line in parser.lines:
+        if buffer and char_count >= target_chars:
+            location = f"网页内容 {ordinal + 1}"
+            if chunk_heading:
+                location += f" · 标题 {chunk_heading}"
+            yield DocumentChunk(ordinal, location, "\n".join(buffer))
+            ordinal += 1
+            buffer = []
+            char_count = 0
+            chunk_heading = ""
+        if heading and line == heading:
+            # Prefer the most specific heading encountered in this chunk over
+            # an earlier document <title> label.
+            chunk_heading = heading
+        elif not buffer:
+            chunk_heading = heading
+        buffer.append(line)
+        char_count += len(line)
+
+    if buffer:
+        location = f"网页内容 {ordinal + 1}"
+        if chunk_heading:
+            location += f" · 标题 {chunk_heading}"
+        yield DocumentChunk(ordinal, location, "\n".join(buffer))
 
 
 def _clean_location_title(text: str, *, max_chars: int = 80) -> str:

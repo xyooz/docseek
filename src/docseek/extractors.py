@@ -20,7 +20,7 @@ SUPPORTED_EXTENSIONS = set(KNOWN_DOCUMENT_EXTENSIONS)
 def extract_text(path: Path) -> str:
     suffix = path.suffix.lower()
 
-    if suffix in {".txt", ".md", ".log", ".csv"}:
+    if suffix in {".txt", ".md", ".log", ".csv", ".tsv"}:
         return _extract_plain_text(path)
     if suffix == ".docx":
         return _extract_docx(path)

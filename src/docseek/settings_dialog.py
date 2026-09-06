@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
@@ -11,6 +12,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QListWidget,
+    QListWidgetItem,
     QMessageBox,
     QPushButton,
     QSpinBox,
@@ -37,16 +39,17 @@ class IndexSettingsDialog(QDialog):
         self.resize(700, 640)
 
         self.root_list = QListWidget()
-        self.root_list.addItems(database.get_index_roots())
+        for root in database.get_index_roots():
+            self._add_path_item(self.root_list, root)
 
-        add_root_button = QPushButton("添加目录")
-        remove_root_button = QPushButton("移除")
-        add_root_button.clicked.connect(self._add_root)
-        remove_root_button.clicked.connect(self._remove_selected_root)
+        self.add_root_button = QPushButton("添加目录")
+        self.remove_root_button = QPushButton("移除")
+        self.add_root_button.clicked.connect(self._add_root)
+        self.remove_root_button.clicked.connect(self._remove_selected_root)
 
         root_buttons = QHBoxLayout()
-        root_buttons.addWidget(add_root_button)
-        root_buttons.addWidget(remove_root_button)
+        root_buttons.addWidget(self.add_root_button)
+        root_buttons.addWidget(self.remove_root_button)
         root_buttons.addStretch(1)
 
         roots_group = QGroupBox("索引目录")
@@ -55,18 +58,20 @@ class IndexSettingsDialog(QDialog):
         roots_layout.addWidget(self.root_list)
         roots_layout.addLayout(root_buttons)
         roots_group.setLayout(roots_layout)
+        self.roots_group = roots_group
 
         self.exclude_list = QListWidget()
-        self.exclude_list.addItems(database.get_excluded_paths())
+        for path in database.get_excluded_paths():
+            self._add_path_item(self.exclude_list, path)
 
-        add_exclude_button = QPushButton("添加排除目录")
-        remove_exclude_button = QPushButton("取消排除")
-        add_exclude_button.clicked.connect(self._add_excluded)
-        remove_exclude_button.clicked.connect(self._remove_selected_excluded)
+        self.add_exclude_button = QPushButton("添加排除目录")
+        self.remove_exclude_button = QPushButton("取消排除")
+        self.add_exclude_button.clicked.connect(self._add_excluded)
+        self.remove_exclude_button.clicked.connect(self._remove_selected_excluded)
 
         exclude_buttons = QHBoxLayout()
-        exclude_buttons.addWidget(add_exclude_button)
-        exclude_buttons.addWidget(remove_exclude_button)
+        exclude_buttons.addWidget(self.add_exclude_button)
+        exclude_buttons.addWidget(self.remove_exclude_button)
         exclude_buttons.addStretch(1)
 
         exclude_group = QGroupBox("排除目录")
@@ -75,6 +80,7 @@ class IndexSettingsDialog(QDialog):
         exclude_layout.addWidget(self.exclude_list)
         exclude_layout.addLayout(exclude_buttons)
         exclude_group.setLayout(exclude_layout)
+        self.exclude_group = exclude_group
 
         self.max_size = QSpinBox()
         self.max_size.setRange(1, 4096)
@@ -85,6 +91,7 @@ class IndexSettingsDialog(QDialog):
         advanced_layout = QFormLayout()
         advanced_layout.addRow("单文件索引上限", self.max_size)
         advanced_group.setLayout(advanced_layout)
+        self.advanced_group = advanced_group
 
         self.storage_location_label = QLabel()
         self.storage_location_label.setWordWrap(True)
@@ -128,6 +135,7 @@ class IndexSettingsDialog(QDialog):
         issues_layout.addWidget(self.issue_summary, 1)
         issues_layout.addWidget(self.issue_button)
         issues_group.setLayout(issues_layout)
+        self.issues_group = issues_group
 
         self.button_box = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
         self.button_box.accepted.connect(self.accept)
@@ -147,7 +155,19 @@ class IndexSettingsDialog(QDialog):
 
     @staticmethod
     def _items(widget: QListWidget) -> list[str]:
-        return [widget.item(i).text() for i in range(widget.count())]
+        return [IndexSettingsDialog._item_path(widget.item(i)) for i in range(widget.count())]
+
+    @staticmethod
+    def _item_path(item: QListWidgetItem) -> str:
+        stored = item.data(Qt.ItemDataRole.UserRole)
+        return str(stored) if stored else item.text()
+
+    @staticmethod
+    def _add_path_item(widget: QListWidget, path: str) -> QListWidgetItem:
+        item = QListWidgetItem(path)
+        item.setData(Qt.ItemDataRole.UserRole, path)
+        widget.addItem(item)
+        return item
 
     def _add_root(self) -> None:
         selected = QFileDialog.getExistingDirectory(self, "选择索引目录")
@@ -155,7 +175,7 @@ class IndexSettingsDialog(QDialog):
             return
         resolved = str(Path(selected).resolve())
         if resolved not in self._items(self.root_list):
-            self.root_list.addItem(resolved)
+            self._add_path_item(self.root_list, resolved)
 
     def _remove_selected_root(self) -> None:
         row = self.root_list.currentRow()
@@ -168,7 +188,7 @@ class IndexSettingsDialog(QDialog):
             return
         resolved = str(Path(selected).resolve())
         if resolved not in self._items(self.exclude_list):
-            self.exclude_list.addItem(resolved)
+            self._add_path_item(self.exclude_list, resolved)
 
     def _remove_selected_excluded(self) -> None:
         row = self.exclude_list.currentRow()

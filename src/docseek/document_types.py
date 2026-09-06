@@ -113,10 +113,22 @@ _FORMATS = (
     ),
 
     # Additional formats explicitly covered by the bundled native Tika layer.
-    FormatCapability(".tsv", DocumentFamily.TEXT, (SupportMode.TIKA_NATIVE,), "TSV"),
-    FormatCapability(".html", DocumentFamily.TEXT, (SupportMode.TIKA_NATIVE,), "HTML"),
-    FormatCapability(".htm", DocumentFamily.TEXT, (SupportMode.TIKA_NATIVE,), "HTML"),
-    FormatCapability(".xhtml", DocumentFamily.TEXT, (SupportMode.TIKA_NATIVE,), "XHTML"),
+    FormatCapability(
+        ".tsv", DocumentFamily.TEXT,
+        (SupportMode.DIRECT, SupportMode.TIKA_NATIVE), "TSV"
+    ),
+    FormatCapability(
+        ".html", DocumentFamily.TEXT,
+        (SupportMode.DIRECT, SupportMode.TIKA_NATIVE), "HTML"
+    ),
+    FormatCapability(
+        ".htm", DocumentFamily.TEXT,
+        (SupportMode.DIRECT, SupportMode.TIKA_NATIVE), "HTML"
+    ),
+    FormatCapability(
+        ".xhtml", DocumentFamily.TEXT,
+        (SupportMode.DIRECT, SupportMode.TIKA_NATIVE), "XHTML"
+    ),
     FormatCapability(".xml", DocumentFamily.TEXT, (SupportMode.TIKA_NATIVE,), "XML"),
     FormatCapability(".epub", DocumentFamily.WRITER, (SupportMode.TIKA_NATIVE,), "EPUB"),
     FormatCapability(".eml", DocumentFamily.WRITER, (SupportMode.TIKA_NATIVE,), "E-mail Message"),

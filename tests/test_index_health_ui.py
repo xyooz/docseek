@@ -48,6 +48,8 @@ class IndexHealthUiTests(unittest.TestCase):
 
             dialog = PausableIndexSettingsDialog(db)
             try:
+                self.assertEqual(dialog.settings_tabs.count(), 3)
+                self.assertIn("已索引 1 个文件", dialog.root_list.item(0).text())
                 text = dialog.health_summary_label.text()
                 self.assertIn("1 个文件", text)
                 self.assertIn("目录 2（监测 1 / 暂停 1）", text)

@@ -49,6 +49,28 @@ class IndexPriorityTests(unittest.TestCase):
             ["first.xls", "second.doc", "third.ppt"],
         )
 
+    def test_office_then_lightweight_then_legacy_then_other(self) -> None:
+        candidates = [
+            Path("mail.eml"),
+            Path("notes.md"),
+            Path("legacy.wps"),
+            Path("slides.pptx"),
+            Path("page.html"),
+            Path("sheet.et"),
+        ]
+
+        self.assertEqual(
+            [path.name for path in prioritize_index_candidates(candidates)],
+            [
+                "slides.pptx",
+                "notes.md",
+                "page.html",
+                "legacy.wps",
+                "sheet.et",
+                "mail.eml",
+            ],
+        )
+
     def test_all_compatibility_candidates_are_preserved(self) -> None:
         candidates = [Path("a.xls"), Path("b.doc"), Path("c.ppt")]
         self.assertEqual(list(prioritize_index_candidates(candidates)), candidates)

@@ -6,7 +6,7 @@ from .document_types import document_family_for_extension
 
 FIELDS = ("kind", "title", "page", "slide", "sheet", "row_start", "row_end",
           "line_start", "line_end", "block_start", "block_end")
-_DIRECT_TEXT_EXTENSIONS = frozenset({".txt", ".md", ".log", ".csv"})
+_DIRECT_TEXT_EXTENSIONS = frozenset({".txt", ".md", ".log", ".csv", ".tsv"})
 _INSERT_SQL = (
     "INSERT INTO chunk_structure(chunk_id, " + ",".join(FIELDS) + ") VALUES ("
     + ",".join("?" for _ in range(len(FIELDS) + 1)) + ")"

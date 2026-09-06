@@ -9,6 +9,10 @@ BASE_EXTRACTION_REVISION = 1
 _FORMAT_REVISIONS = {
     ".docx": 3,  # preserve body/table order and split at heading boundaries
     ".pptx": 2,  # preserve slide titles in slide locations
+    ".html": 2,  # direct visible-text parser replaces per-file Tika process
+    ".htm": 2,
+    ".xhtml": 2,
+    ".tsv": 2,  # direct text parser replaces flat Tika extraction
 }
 
 

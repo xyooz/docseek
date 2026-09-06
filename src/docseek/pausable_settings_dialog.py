@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import os
 from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QGroupBox,
     QHBoxLayout,
@@ -13,7 +15,9 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QTabWidget,
     QVBoxLayout,
+    QWidget,
 )
 
 from .diagnostics import write_diagnostic_report
@@ -73,7 +77,8 @@ class PausableIndexSettingsDialog(IndexSettingsDialog):
 
     def __init__(self, database, parent=None) -> None:
         super().__init__(database, parent)
-        self.resize(740, 840)
+        self.resize(1060, 700)
+        self.setMinimumSize(900, 620)
         self.root_state_store = IndexRootStateStore(database)
         self.file_exclusion_store = FileExclusionStore(database)
         self._maintenance_worker: MaintenanceWorker | None = None
@@ -85,12 +90,13 @@ class PausableIndexSettingsDialog(IndexSettingsDialog):
         note.setWordWrap(True)
         note.setStyleSheet("color: palette(mid);")
         self.layout().insertWidget(0, note)
+        self.settings_note = note
 
         paused = set(self.root_state_store.paused_roots())
         self._original_paused = paused
         for row in range(self.root_list.count()):
             item = self.root_list.item(row)
-            self._make_checkable(item, checked=item.text() not in paused)
+            self._make_checkable(item, checked=self._item_path(item) not in paused)
 
         self.root_list.setToolTip(
             "取消勾选目录可暂停 watcher 和手动刷新；重新勾选并保存后会自动进行增量校准。"
@@ -118,6 +124,7 @@ class PausableIndexSettingsDialog(IndexSettingsDialog):
         pattern_layout.addWidget(self.file_pattern_edit)
         pattern_layout.addWidget(pattern_hint)
         pattern_group.setLayout(pattern_layout)
+        self.pattern_group = pattern_group
 
         self.health_summary_label = QLabel()
         self.health_summary_label.setWordWrap(True)
@@ -149,6 +156,7 @@ class PausableIndexSettingsDialog(IndexSettingsDialog):
         health_layout.addWidget(self.diagnostic_button)
         health_layout.addWidget(self.diagnostic_hint_label)
         health_group.setLayout(health_layout)
+        self.health_group = health_group
 
         self.backup_button = QPushButton("备份索引…")
         self.rebuild_button = QPushButton("重建索引…")
@@ -185,13 +193,142 @@ class PausableIndexSettingsDialog(IndexSettingsDialog):
         maintenance_group.setLayout(maintenance_layout)
         self.maintenance_group = maintenance_group
 
-        # After the leading note is inserted, the layout is:
-        # note, roots, excludes, performance, issues, buttons. Keep filename
-        # exclusions, health, maintenance and issue remediation together.
-        self.layout().insertWidget(4, pattern_group)
-        self.layout().insertWidget(5, health_group)
-        self.layout().insertWidget(6, maintenance_group)
+        self._install_tabbed_layout()
+        self._root_indexed_count_cache: dict[str, int] = {}
+        self._refresh_root_progress_labels()
         self._refresh_health_summary()
+
+        self.indexing_read_only = bool(
+            parent is not None and getattr(parent, "current_worker", None) is not None
+        )
+        self.progress_refresh_timer = QTimer(self)
+        self.progress_refresh_timer.setInterval(300)
+        self.progress_refresh_timer.timeout.connect(self._refresh_live_progress)
+        if self.indexing_read_only:
+            self._set_indexing_read_only(True)
+            self.progress_refresh_timer.start()
+
+    def _install_tabbed_layout(self) -> None:
+        """Use the available width instead of growing one long settings page."""
+        main_layout = self.layout()
+        groups = (
+            self.roots_group,
+            self.exclude_group,
+            self.advanced_group,
+            self.storage_group,
+            self.issues_group,
+        )
+        for group in groups:
+            main_layout.removeWidget(group)
+
+        directory_page = QWidget()
+        directory_layout = QHBoxLayout(directory_page)
+        directory_layout.setContentsMargins(10, 12, 10, 10)
+        directory_layout.setSpacing(12)
+        directory_layout.addWidget(self.roots_group, 3)
+        directory_layout.addWidget(self.exclude_group, 2)
+
+        rules_page = QWidget()
+        rules_layout = QHBoxLayout(rules_page)
+        rules_layout.setContentsMargins(10, 12, 10, 10)
+        rules_layout.setSpacing(12)
+        rules_left = QVBoxLayout()
+        rules_left.addWidget(self.pattern_group, 1)
+        rules_left.addWidget(self.advanced_group)
+        rules_right = QVBoxLayout()
+        rules_right.addWidget(self.storage_group)
+        rules_right.addStretch(1)
+        rules_layout.addLayout(rules_left, 1)
+        rules_layout.addLayout(rules_right, 1)
+
+        status_page = QWidget()
+        status_layout = QVBoxLayout(status_page)
+        status_layout.setContentsMargins(10, 12, 10, 10)
+        status_layout.setSpacing(10)
+        status_layout.addWidget(self.health_group)
+        status_layout.addWidget(self.issues_group)
+        status_layout.addWidget(self.maintenance_group)
+        status_layout.addStretch(1)
+
+        self.settings_tabs = QTabWidget()
+        self.settings_tabs.addTab(directory_page, "目录与排除")
+        self.settings_tabs.addTab(rules_page, "规则与存储")
+        self.settings_tabs.addTab(status_page, "状态与维护")
+        main_layout.insertWidget(1, self.settings_tabs, 1)
+
+    def _indexed_count_under_root(self, root: str) -> int:
+        cached = self._root_indexed_count_cache.get(root)
+        if cached is not None:
+            return cached
+        prefix = str(Path(root)).rstrip("\\/") + os.sep
+        with self.database.connect() as conn:
+            count = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM files WHERE path >= ? AND path < ?",
+                    (prefix, prefix + "\U0010ffff"),
+                ).fetchone()[0]
+            )
+        self._root_indexed_count_cache[root] = count
+        return count
+
+    def _refresh_root_progress_labels(self) -> None:
+        parent = self.parentWidget()
+        progress_by_root = getattr(parent, "index_root_progress", {})
+        paused = set(self.root_state_store.paused_roots())
+        for row in range(self.root_list.count()):
+            item = self.root_list.item(row)
+            root = self._item_path(item)
+            progress = progress_by_root.get(root)
+            if root in paused:
+                status = "已暂停更新"
+            elif progress and progress[1] > 0:
+                completed, total = progress
+                percent = min(100, round(completed * 100 / total))
+                status = f"索引进度 {percent}%（{completed:,}/{total:,}）"
+            else:
+                indexed = self._indexed_count_under_root(root)
+                status = f"已索引 {indexed:,} 个文件" if indexed else "等待建立索引"
+            item.setText(f"{status}    ·    {root}")
+
+    def _set_indexing_read_only(self, active: bool) -> None:
+        self.indexing_read_only = active
+        for widget in (
+            self.root_list,
+            self.exclude_list,
+            self.add_root_button,
+            self.remove_root_button,
+            self.add_exclude_button,
+            self.remove_exclude_button,
+            self.file_pattern_edit,
+            self.max_size,
+            self.storage_move_button,
+            self.backup_button,
+            self.rebuild_button,
+            self.reset_button,
+            self.restore_button,
+        ):
+            widget.setEnabled(not active)
+        save_button = self.button_box.button(QDialogButtonBox.StandardButton.Save)
+        if save_button is not None:
+            save_button.setEnabled(not active)
+        if active:
+            self.settings_note.setText(
+                "索引正在运行：此窗口暂时只读，目录后的进度会自动更新；"
+                "已完成的内容仍可搜索。"
+            )
+        else:
+            self.settings_note.setText(
+                "勾选 = 正常监测和刷新；取消勾选 = 暂停更新，但保留现有索引和搜索结果。"
+            )
+
+    def _refresh_live_progress(self) -> None:
+        self._refresh_root_progress_labels()
+        parent = self.parentWidget()
+        if parent is None or getattr(parent, "current_worker", None) is None:
+            self.progress_refresh_timer.stop()
+            self._root_indexed_count_cache.clear()
+            self._set_indexing_read_only(False)
+            self._refresh_root_progress_labels()
 
     @staticmethod
     def _make_checkable(item, *, checked: bool) -> None:
@@ -205,10 +342,11 @@ class PausableIndexSettingsDialog(IndexSettingsDialog):
         super()._add_root()
         for row in range(previous_count, self.root_list.count()):
             self._make_checkable(self.root_list.item(row), checked=True)
+        self._refresh_root_progress_labels()
 
     def _paused_roots_from_ui(self) -> list[str]:
         return [
-            self.root_list.item(row).text()
+            self._item_path(self.root_list.item(row))
             for row in range(self.root_list.count())
             if self.root_list.item(row).checkState() == Qt.CheckState.Unchecked
         ]

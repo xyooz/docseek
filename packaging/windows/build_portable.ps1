@@ -33,6 +33,8 @@ $pyInstallerArgs = @(
     "--windowed",
     "--onedir",
     "--name", "DocSeek",
+    "--icon", (Join-Path $repoRoot "assets\docseek.ico"),
+    "--add-data", ((Join-Path $repoRoot "assets\docseek.svg") + ";assets"),
     "--distpath", $stageRoot,
     "--workpath", $workRoot,
     "--specpath", $workRoot,

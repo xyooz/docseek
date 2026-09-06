@@ -66,6 +66,8 @@ class FirstRunUiTests(unittest.TestCase):
                     self.assertFalse(window.workspace_bar_panel.isHidden())
                     self.assertFalse(window.type_filter.isHidden())
                     self.assertFalse(window.settings_button.isHidden())
+                    for extension in (".wps", ".et", ".dps"):
+                        self.assertGreaterEqual(window.type_filter.findData(extension), 0)
                 finally:
                     window.close()
 

@@ -83,4 +83,18 @@ QStatusBar {
 QMenu { background: #FFFFFF; border: 1px solid #DDE3EC; padding: 6px; }
 QMenu::item { border-radius: 6px; padding: 7px 24px 7px 10px; }
 QMenu::item:selected { background: #EFF6FF; color: #1D4ED8; }
+QTabWidget::pane {
+    background: #FFFFFF; border: 1px solid #DFE5EE; border-radius: 10px;
+}
+QTabBar::tab {
+    background: transparent; color: #667085; padding: 9px 18px;
+    border-bottom: 2px solid transparent;
+}
+QTabBar::tab:selected { color: #1D4ED8; border-bottom-color: #2563EB; font-weight: 600; }
+QTabBar::tab:hover { color: #344054; background: #F8FAFC; }
+QGroupBox {
+    background: #FFFFFF; border: 1px solid #E4E7EC; border-radius: 9px;
+    margin-top: 10px; padding-top: 8px; font-weight: 600;
+}
+QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 5px; }
 """

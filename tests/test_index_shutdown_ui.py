@@ -59,6 +59,26 @@ class IndexShutdownUiTests(unittest.TestCase):
                     window.current_worker = None
                     window.close()
 
+    def test_known_candidate_total_drives_percent_and_counts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "docseek.db"
+            root = str(Path(temp_dir) / "docs")
+            with patch.object(app_module, "DB_PATH", db_path):
+                window = app_module.MainWindow()
+                try:
+                    window._index_plan(root, 120, 1, 1)
+                    window._index_progress_detailed(
+                        str(Path(root) / "制度.docx"), 48, 45, 120, root
+                    )
+
+                    self.assertEqual(window.index_progress_bar.maximum(), 120)
+                    self.assertEqual(window.index_progress_bar.value(), 48)
+                    self.assertTrue(window.index_progress_bar.isTextVisible())
+                    self.assertIn("48/120", window.index_counts_label.text())
+                    self.assertEqual(window.index_root_progress[root], (48, 120))
+                finally:
+                    window.close()
+
 
 if __name__ == "__main__":
     unittest.main()

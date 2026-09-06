@@ -42,6 +42,24 @@ class _CountingBinaryPath:
 
 
 class DocumentChunkExtractionTests(unittest.TestCase):
+    def test_html_extracts_visible_text_and_preserves_heading(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "制度.html"
+            path.write_text(
+                "<html><head><title>办公门户</title><style>隐藏样式</style></head>"
+                "<body><h1>客户管理办法</h1><p>请完成客户身份核验。</p>"
+                "<script>不应建立索引</script></body></html>",
+                encoding="utf-8",
+            )
+
+            chunks = list(iter_document_chunks(path))
+
+        self.assertEqual(len(chunks), 1)
+        self.assertIn("客户管理办法", chunks[0].location)
+        self.assertIn("客户身份核验", chunks[0].content)
+        self.assertNotIn("隐藏样式", chunks[0].content)
+        self.assertNotIn("不应建立索引", chunks[0].content)
+
     def test_small_utf8_text_uses_one_open_one_read_without_rewind(self) -> None:
         path = _CountingBinaryPath(
             "第一行 客户经理\r\n第二行 信贷\n".encode("utf-8"),

@@ -9,7 +9,7 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QDialogButtonBox, QWidget
 
 from docseek import app as app_module
 from docseek.index_root_state import IndexRootStateStore
@@ -47,6 +47,35 @@ class IndexRootPauseUiTests(unittest.TestCase):
                 self.assertEqual(state.active_roots(), [str(root_b.resolve())])
             finally:
                 dialog.close()
+
+    def test_running_index_exposes_live_read_only_root_progress(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db = SearchDatabase(Path(temp_dir) / "docseek.db")
+            root = Path(temp_dir) / "docs"
+            root.mkdir()
+            normalized = str(root.resolve())
+            db.add_index_root(normalized)
+            parent = QWidget()
+            parent.current_worker = object()
+            parent.index_root_progress = {normalized: (25, 100)}
+
+            dialog = PausableIndexSettingsDialog(db, parent)
+            try:
+                self.assertFalse(dialog.root_list.isEnabled())
+                save = dialog.button_box.button(QDialogButtonBox.StandardButton.Save)
+                self.assertFalse(save.isEnabled())
+                self.assertIn("25%", dialog.root_list.item(0).text())
+                self.assertIn("只读", dialog.settings_note.text())
+
+                parent.current_worker = None
+                parent.index_root_progress[normalized] = (100, 100)
+                dialog._refresh_live_progress()
+                self.assertTrue(dialog.root_list.isEnabled())
+                self.assertTrue(save.isEnabled())
+                self.assertIn("100%", dialog.root_list.item(0).text())
+            finally:
+                dialog.close()
+                parent.close()
 
     def test_desktop_refresh_watcher_and_pending_events_ignore_paused_root(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

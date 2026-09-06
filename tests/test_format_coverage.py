@@ -34,7 +34,7 @@ class FormatCoverageTests(unittest.TestCase):
         self.assertTrue(matches, filename)
         self.assertIn(filename, [match.filename for match in matches])
 
-    def test_html_content_is_indexed_through_tika(self) -> None:
+    def test_html_content_is_indexed_through_direct_parser(self) -> None:
         self._assert_indexed(
             "业务说明.html",
             "<html><body><h1>电子渠道</h1><p>跨境汇款操作指引</p></body></html>",
@@ -48,7 +48,7 @@ class FormatCoverageTests(unittest.TestCase):
             "风险等级",
         )
 
-    def test_tsv_content_is_indexed_through_tika(self) -> None:
+    def test_tsv_content_is_indexed_through_direct_parser(self) -> None:
         self._assert_indexed(
             "客户清单.tsv",
             "客户号\t状态\n10001\t待核验\n10002\t正常\n",
