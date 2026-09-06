@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 from dataclasses import dataclass
@@ -638,6 +639,18 @@ class DirectoryIndexer:
 
         discovery_issue_clears: set[str] = set()
         discovery_issue_records: list[tuple[str, str, str]] = []
+
+        discovery_callback = on_discovery
+        if discovery_callback is None and on_progress is not None:
+            def discovery_callback(path: Path, count: int) -> None:
+                current = path.name or str(path)
+                on_progress(
+                    Path(
+                        f"正在扫描目录 · 已发现 {count:,} 个候选文件 · 当前：{current}"
+                    ),
+                    stats,
+                )
+
         candidates = list(
             prioritize_index_candidates(
                 self._iter_supported_files(
@@ -645,12 +658,17 @@ class DirectoryIndexer:
                     stats,
                     issue_clears=discovery_issue_clears,
                     issue_records=discovery_issue_records,
-                    on_discovery=on_discovery,
+                    on_discovery=discovery_callback,
                 )
             )
         )
         if on_candidates_ready:
             on_candidates_ready(len(candidates))
+        elif on_progress:
+            on_progress(
+                Path(f"扫描完成 · 共发现 {len(candidates):,} 个候选文件"),
+                stats,
+            )
 
         # Discovery stays outside the batched chunk writer. Healthy directory
         # traversal therefore performs no SQLite writes, while issue cleanup is
@@ -791,7 +809,13 @@ class DirectoryIndexer:
                     clear_issue(normalized_dir)
                     stats.excluded += 1
                     continue
-                entries = list(directory.iterdir())
+                # Keep DirEntry objects until type filtering is finished. On
+                # Windows, FindFirstFile/FindNextFile already supplies most of
+                # the metadata needed by is_dir()/is_file(), avoiding the extra
+                # stat-family calls caused by turning entries into bare Paths
+                # too early.
+                with os.scandir(directory) as iterator:
+                    entries = list(iterator)
                 clear_issue(normalized_dir)
                 report_discovery(directory)
             except OSError as exc:
@@ -800,19 +824,20 @@ class DirectoryIndexer:
                 report_discovery(directory)
                 continue
 
-            for path in entries:
+            for entry in entries:
                 if self._cancel.is_set():
                     raise IndexCancelled()
+                path = Path(entry.path)
                 try:
                     if self._is_excluded(path):
                         clear_issue(self._normalize(path))
                         stats.excluded += 1
                         continue
-                    if path.is_dir():
-                        if path.name.casefold() not in self.ignored_dir_names:
+                    if entry.is_dir():
+                        if entry.name.casefold() not in self.ignored_dir_names:
                             stack.append(path)
                         continue
-                    if not path.is_file():
+                    if not entry.is_file():
                         continue
                     if not self._is_supported_candidate(path):
                         continue
