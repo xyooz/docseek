@@ -14,6 +14,7 @@ from docseek.chunks import DocumentChunk
 from docseek.index_maintenance import create_index_backup, stage_index_restore
 from docseek.legacy_worker import iter_chunk_file
 from docseek.search_db import SearchDatabase
+from docseek.storage_location import DATABASE_FILENAME, stage_index_storage_move
 
 
 class BootstrapTests(unittest.TestCase):
@@ -73,6 +74,61 @@ class BootstrapTests(unittest.TestCase):
             )
             self.assertEqual(restored.search("临时索引内容"), [])
             self.assertFalse((base / "restore-error.txt").exists())
+
+    def test_product_startup_applies_staged_storage_move_before_app_open(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            control = base / "control"
+            destination = base / "E-drive" / "DocSeekData"
+            old_db = control / DATABASE_FILENAME
+            config = control / "storage.json"
+            pending = control / "storage-move-pending.json"
+
+            database = SearchDatabase(old_db)
+            store = ChunkStore(old_db)
+            source = base / "policy.txt"
+            source.write_text("产品启动后应继续搜索迁移索引", encoding="utf-8")
+            stat = source.stat()
+            database.add_index_root(str(base))
+            store.replace_document(
+                path=str(source.resolve()),
+                filename=source.name,
+                extension=".txt",
+                modified_time=stat.st_mtime,
+                size=stat.st_size,
+                chunks=[DocumentChunk(0, "文本行 1-1", "产品启动后应继续搜索迁移索引")],
+            )
+            stage_index_storage_move(
+                destination,
+                config_path=config,
+                pending_path=pending,
+                default_dir=control,
+            )
+
+            old_app_dir = bootstrap.APP_DIR
+            old_db_path = bootstrap.DB_PATH
+            old_restore_error = bootstrap.RESTORE_ERROR_PATH
+            old_storage_error = bootstrap.STORAGE_ERROR_PATH
+            try:
+                bootstrap.APP_DIR = control
+                bootstrap.DB_PATH = old_db
+                bootstrap.RESTORE_ERROR_PATH = control / "restore-error.txt"
+                bootstrap.STORAGE_ERROR_PATH = control / "storage-error.txt"
+                runtime_db = bootstrap._prepare_runtime_database()
+            finally:
+                bootstrap.APP_DIR = old_app_dir
+                bootstrap.DB_PATH = old_db_path
+                bootstrap.RESTORE_ERROR_PATH = old_restore_error
+                bootstrap.STORAGE_ERROR_PATH = old_storage_error
+
+            expected = destination.resolve() / DATABASE_FILENAME
+            self.assertEqual(runtime_db, expected)
+            self.assertFalse(old_db.exists())
+            self.assertFalse(pending.exists())
+            self.assertEqual(
+                [row.filename for row in ChunkStore(expected).search("继续搜索迁移索引")],
+                [source.name],
+            )
 
     @staticmethod
     def _launcher_namespace():
