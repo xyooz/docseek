@@ -12,30 +12,40 @@ from pptx import Presentation
 from docseek.chunks import TEXT_ENCODING_SAMPLE_BYTES, _iter_text_chunks, iter_document_chunks
 
 
-class _NoRewindBytesIO(io.BytesIO):
+class _SingleReadNoRewindBytesIO(io.BytesIO):
+    def __init__(self, payload: bytes) -> None:
+        super().__init__(payload)
+        self.read_count = 0
+
+    def read(self, *args, **kwargs):
+        self.read_count += 1
+        if self.read_count > 1:
+            raise AssertionError("small text fast path must use one binary read")
+        return super().read(*args, **kwargs)
+
     def seek(self, *args, **kwargs):
-        raise AssertionError("small text fast path must not rewind and reread the probe")
+        raise AssertionError("small text fast path must not rewind the probe")
 
 
 class _CountingBinaryPath:
-    def __init__(self, payload: bytes, *, forbid_seek: bool = False) -> None:
+    def __init__(self, payload: bytes, *, single_read_no_rewind: bool = False) -> None:
         self.payload = payload
-        self.forbid_seek = forbid_seek
+        self.single_read_no_rewind = single_read_no_rewind
         self.open_count = 0
 
     def open(self, mode: str):
         self.open_count += 1
         if mode != "rb":
             raise AssertionError(f"unexpected mode: {mode}")
-        stream_type = _NoRewindBytesIO if self.forbid_seek else io.BytesIO
+        stream_type = _SingleReadNoRewindBytesIO if self.single_read_no_rewind else io.BytesIO
         return stream_type(self.payload)
 
 
 class DocumentChunkExtractionTests(unittest.TestCase):
-    def test_small_utf8_text_reuses_encoding_probe_without_reopen_or_rewind(self) -> None:
+    def test_small_utf8_text_uses_one_open_one_read_without_rewind(self) -> None:
         path = _CountingBinaryPath(
             "第一行 客户经理\r\n第二行 信贷\n".encode("utf-8"),
-            forbid_seek=True,
+            single_read_no_rewind=True,
         )
 
         chunks = list(_iter_text_chunks(path, target_chars=12_000))  # type: ignore[arg-type]
@@ -45,10 +55,10 @@ class DocumentChunkExtractionTests(unittest.TestCase):
         self.assertEqual(chunks[0].location, "行 1-2")
         self.assertEqual(chunks[0].content, "第一行 客户经理\n第二行 信贷")
 
-    def test_small_gb18030_text_reuses_probe_and_preserves_content(self) -> None:
+    def test_small_gb18030_text_uses_one_open_one_read_and_preserves_content(self) -> None:
         path = _CountingBinaryPath(
             "客户编号,姓名\r\n001,张三\r\n".encode("gb18030"),
-            forbid_seek=True,
+            single_read_no_rewind=True,
         )
 
         chunks = list(_iter_text_chunks(path, target_chars=12_000))  # type: ignore[arg-type]
