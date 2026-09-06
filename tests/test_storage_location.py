@@ -131,7 +131,21 @@ class StorageLocationTests(unittest.TestCase):
             legacy = base / "legacy"
             destination = base / "target"
             old_db = legacy / DATABASE_FILENAME
-            SearchDatabase(old_db)
+
+            database = SearchDatabase(old_db)
+            store = ChunkStore(old_db)
+            source = base / "source.txt"
+            source.write_text("配置失败后旧索引仍然有效", encoding="utf-8")
+            stat = source.stat()
+            database.add_index_root(str(base))
+            store.replace_document(
+                path=str(source.resolve()),
+                filename=source.name,
+                extension=".txt",
+                modified_time=stat.st_mtime,
+                size=stat.st_size,
+                chunks=[DocumentChunk(0, "文本行 1-1", "配置失败后旧索引仍然有效")],
+            )
 
             stage_index_storage_move(
                 destination,
@@ -157,6 +171,10 @@ class StorageLocationTests(unittest.TestCase):
             self.assertEqual(
                 configured_database_path(config_path=config, default_dir=legacy),
                 old_db.resolve(),
+            )
+            self.assertEqual(
+                [row.filename for row in ChunkStore(old_db).search("旧索引仍然有效")],
+                [source.name],
             )
 
 
