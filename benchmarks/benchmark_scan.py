@@ -229,11 +229,17 @@ def main() -> None:
                 if second_post_discovery > 0
                 else 0.0
             )
+            normalize_per_1k_ms = (
+                normalize_post * 1_000_000 / second_candidates
+                if second_candidates > 0
+                else 0.0
+            )
             print(
                 "unchanged_phases "
                 + format_phase_timings(second_timings)
                 + f" residual_post={residual:.3f}s"
                 + f" path_hot_share={hot_share:.1%}"
+                + f" normalize_per_1k={normalize_per_1k_ms:.2f}ms"
             )
         print(
             f"single_file_total={total_update_ms:.2f}ms "
