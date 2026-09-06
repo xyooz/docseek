@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterator
@@ -20,6 +21,7 @@ class DocumentChunk:
 
 
 TEXT_EXTENSIONS = {".txt", ".md", ".log", ".csv"}
+TEXT_ENCODING_SAMPLE_BYTES = 65_536
 XLSX_PROGRESS_ROW_INTERVAL = 1_000
 ChunkProgressCallback = Callable[[str, int], None]
 
@@ -82,25 +84,23 @@ def _iter_direct_document_chunks(
 
 
 def _iter_text_chunks(path: Path, *, target_chars: int) -> Iterator[DocumentChunk]:
-    encoding = _detect_text_encoding(path)
     ordinal = 0
     start_line = 1
     line_no = 0
     buffer: list[str] = []
     char_count = 0
 
-    with path.open("r", encoding=encoding, errors="ignore") as handle:
-        for line_no, line in enumerate(handle, start=1):
-            buffer.append(line.rstrip("\n"))
-            char_count += len(line)
-            if char_count >= target_chars:
-                content = "\n".join(buffer).strip()
-                if content:
-                    yield DocumentChunk(ordinal, f"行 {start_line}-{line_no}", content)
-                    ordinal += 1
-                buffer = []
-                char_count = 0
-                start_line = line_no + 1
+    for line_no, line in enumerate(_iter_text_lines(path), start=1):
+        buffer.append(line.rstrip("\n"))
+        char_count += len(line)
+        if char_count >= target_chars:
+            content = "\n".join(buffer).strip()
+            if content:
+                yield DocumentChunk(ordinal, f"行 {start_line}-{line_no}", content)
+                ordinal += 1
+            buffer = []
+            char_count = 0
+            start_line = line_no + 1
 
     content = "\n".join(buffer).strip()
     if content:
@@ -108,9 +108,40 @@ def _iter_text_chunks(path: Path, *, target_chars: int) -> Iterator[DocumentChun
         yield DocumentChunk(ordinal, f"行 {start_line}-{end_line}", content)
 
 
-def _detect_text_encoding(path: Path) -> str:
-    with path.open("rb") as handle:
-        sample = handle.read(65536)
+def _iter_text_lines(path: Path) -> Iterator[str]:
+    """Decode plain text with one file open and no duplicate read for small files.
+
+    Encoding detection needs a bounded prefix. Historically DocSeek opened the
+    file once for that 64 KiB probe and then opened it again from byte zero for
+    normal text iteration. Small office-side text files therefore paid two file
+    opens and read their whole payload twice.
+
+    Reuse the already-read probe when it contains the complete file. Large files
+    keep the established streaming TextIOWrapper path and bounded memory usage;
+    they merely rewind the same handle instead of opening a second one.
+    """
+    with path.open("rb") as raw:
+        sample = raw.read(TEXT_ENCODING_SAMPLE_BYTES)
+        has_more = bool(raw.read(1))
+        encoding = _detect_text_encoding_sample(sample)
+
+        if not has_more:
+            decoded = sample.decode(encoding, errors="ignore")
+            with io.StringIO(decoded, newline=None) as text:
+                yield from text
+            return
+
+        raw.seek(0)
+        with io.TextIOWrapper(
+            raw,
+            encoding=encoding,
+            errors="ignore",
+            newline=None,
+        ) as text:
+            yield from text
+
+
+def _detect_text_encoding_sample(sample: bytes) -> str:
     for encoding in ("utf-8", "utf-8-sig", "gb18030"):
         try:
             sample.decode(encoding, errors="strict")
