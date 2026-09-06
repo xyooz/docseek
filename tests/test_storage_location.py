@@ -111,6 +111,7 @@ class StorageLocationTests(unittest.TestCase):
             self.assertEqual(result.current_db_path, new_db)
             self.assertTrue(result.moved_existing_index)
             self.assertTrue(result.old_files_removed)
+            self.assertTrue(result.pending_request_removed)
             self.assertFalse(pending.exists())
             self.assertFalse(old_db.exists())
             self.assertEqual(
@@ -174,6 +175,67 @@ class StorageLocationTests(unittest.TestCase):
             )
             self.assertEqual(
                 [row.filename for row in ChunkStore(old_db).search("旧索引仍然有效")],
+                [source.name],
+            )
+
+    def test_pending_cleanup_failure_keeps_new_index_authoritative(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            control = base / "control"
+            config = control / "storage.json"
+            pending = control / "pending.json"
+            legacy = base / "legacy"
+            destination = base / "target"
+            old_db = legacy / DATABASE_FILENAME
+
+            database = SearchDatabase(old_db)
+            store = ChunkStore(old_db)
+            source = base / "source.txt"
+            source.write_text("清理失败后新索引仍然有效", encoding="utf-8")
+            stat = source.stat()
+            database.add_index_root(str(base))
+            store.replace_document(
+                path=str(source.resolve()),
+                filename=source.name,
+                extension=".txt",
+                modified_time=stat.st_mtime,
+                size=stat.st_size,
+                chunks=[DocumentChunk(0, "文本行 1-1", "清理失败后新索引仍然有效")],
+            )
+            stage_index_storage_move(
+                destination,
+                config_path=config,
+                pending_path=pending,
+                default_dir=legacy,
+            )
+
+            real_unlink = Path.unlink
+
+            def fail_pending_cleanup(path: Path, *args, **kwargs):
+                if path == pending:
+                    raise PermissionError("synthetic sharing violation")
+                return real_unlink(path, *args, **kwargs)
+
+            with patch.object(Path, "unlink", fail_pending_cleanup):
+                result = apply_pending_index_storage_move(
+                    config_path=config,
+                    pending_path=pending,
+                    default_dir=legacy,
+                )
+
+            self.assertIsNotNone(result)
+            assert result is not None
+            new_db = destination.resolve() / DATABASE_FILENAME
+            self.assertFalse(result.pending_request_removed)
+            self.assertTrue(new_db.exists())
+            self.assertTrue(pending.exists())
+            self.assertFalse(old_db.exists())
+            self.assertEqual(
+                configured_database_path(config_path=config, default_dir=legacy),
+                new_db,
+            )
+            self.assertEqual(
+                [row.filename for row in ChunkStore(new_db).search("新索引仍然有效")],
                 [source.name],
             )
 

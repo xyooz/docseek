@@ -49,6 +49,10 @@ DEFAULT_IGNORED_DIR_NAMES = {
 # flush per document in ChunkBatchWriter.
 FULL_SCAN_BATCH_SIZE = 512
 FULL_SCAN_BATCH_TEXT_CHARS = 8_000_000
+# Commit the first useful results quickly, then widen batches for sustained
+# throughput. This makes a first search possible without returning to the high
+# transaction overhead of committing every small text document.
+FULL_SCAN_EARLY_COMMIT_COUNTS = frozenset({16, 64})
 DISCOVERY_PROGRESS_INTERVAL_SECONDS = 0.15
 DISCOVERY_PROGRESS_CANDIDATE_STEP = 250
 
@@ -736,6 +740,8 @@ class DirectoryIndexer:
                     )
                     if success:
                         successful_paths.add(normalized)
+                    if stats.indexed in FULL_SCAN_EARLY_COMMIT_COUNTS:
+                        writer.flush()
                     if on_progress and stats.scanned % 250 == 0:
                         on_progress(path, stats)
                 except IndexCancelled:

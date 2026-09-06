@@ -116,10 +116,18 @@ def _prepare_runtime_database() -> Path | None:
         )
         _write_storage_error(move_warning)
     else:
-        if move_result is not None and not move_result.old_files_removed:
+        if move_result is not None and (
+            not move_result.old_files_removed
+            or not move_result.pending_request_removed
+        ):
+            warnings: list[str] = []
+            if not move_result.old_files_removed:
+                warnings.append("旧位置的部分数据库文件未能自动删除")
+            if not move_result.pending_request_removed:
+                warnings.append("待迁移标记暂时无法清理，将在下次启动重试")
             move_warning = (
-                "索引已成功切换到新位置，但旧位置的部分数据库文件未能自动删除。\n"
-                "新索引可以正常使用；可在确认稳定后手动清理旧位置。"
+                "索引已成功切换到新位置，但" + "；".join(warnings) + "。\n"
+                "新索引可以正常使用。"
             )
             _write_storage_error(move_warning)
         else:

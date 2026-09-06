@@ -26,6 +26,7 @@ class StorageMoveResult:
     current_db_path: Path
     moved_existing_index: bool
     old_files_removed: bool
+    pending_request_removed: bool
 
 
 def _normalized_directory(path: str | Path) -> Path:
@@ -211,12 +212,17 @@ def apply_pending_index_storage_move(
     current_db = destination / DATABASE_FILENAME
 
     if destination == current_dir:
-        pending.unlink(missing_ok=True)
+        try:
+            pending.unlink(missing_ok=True)
+            pending_removed = True
+        except OSError:
+            pending_removed = False
         return StorageMoveResult(
             previous_db_path=previous_db,
             current_db_path=previous_db,
             moved_existing_index=False,
             old_files_removed=True,
+            pending_request_removed=pending_removed,
         )
 
     destination.mkdir(parents=True, exist_ok=True)
@@ -240,7 +246,6 @@ def apply_pending_index_storage_move(
         # good. If there was no database yet, this simply changes where the first
         # index will be created.
         save_index_data_dir(destination, config_path=config_path)
-        pending.unlink(missing_ok=True)
     except Exception:
         if staged_db is not None:
             try:
@@ -254,6 +259,18 @@ def apply_pending_index_storage_move(
                 pass
         raise
 
+    # Saving the location config is the migration commit point. From here on,
+    # the new database is authoritative and must never be removed merely
+    # because cleanup of the retry marker fails (for example due to antivirus
+    # or a transient Windows sharing violation). A leftover marker is harmless:
+    # the next startup sees that the destination is already current and retries
+    # removing it without copying or deleting either database.
+    try:
+        pending.unlink(missing_ok=True)
+        pending_removed = True
+    except OSError:
+        pending_removed = False
+
     old_removed = True
     if moved_existing and previous_db != current_db:
         old_removed = _remove_database_family(previous_db)
@@ -263,4 +280,5 @@ def apply_pending_index_storage_move(
         current_db_path=current_db,
         moved_existing_index=moved_existing,
         old_files_removed=old_removed,
+        pending_request_removed=pending_removed,
     )

@@ -6,11 +6,37 @@ from pathlib import Path
 from unittest.mock import patch
 
 from docseek.chunk_store import ChunkStore
-from docseek.indexer import DirectoryIndexer
+from docseek.indexer import DirectoryIndexer, FULL_SCAN_EARLY_COMMIT_COUNTS
 from docseek.search_db import SearchDatabase
 
 
 class IndexDiscoveryBatchingTests(unittest.TestCase):
+    def test_first_text_results_are_committed_before_large_batch_finishes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            root = base / "docs"
+            root.mkdir()
+            first_commit = min(FULL_SCAN_EARLY_COMMIT_COUNTS)
+            for number in range(first_commit + 4):
+                (root / f"制度-{number:03d}.txt").write_text(
+                    f"客户经理制度 第{number}份",
+                    encoding="utf-8",
+                )
+
+            database = SearchDatabase(base / "docseek.db")
+            searchable_during_scan: list[bool] = []
+
+            def observe_progress(_path: Path, stats) -> None:
+                if stats.indexed == first_commit:
+                    searchable_during_scan.append(
+                        bool(ChunkStore(database.db_path).search("第0份"))
+                    )
+
+            stats = DirectoryIndexer(database).scan(root, on_progress=observe_progress)
+
+            self.assertEqual(stats.indexed, first_commit + 4)
+            self.assertEqual(searchable_during_scan, [True])
+
     def test_full_scan_batches_discovery_issue_metadata_before_indexing(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             base = Path(temp_dir)

@@ -36,6 +36,10 @@ class FirstRunUiTests(unittest.TestCase):
                     self.assertTrue(window.settings_button.isHidden())
                     self.assertIn("文件名或正文关键词", window.search_input.placeholderText())
                     self.assertEqual(window.first_run_button.text(), "选择资料目录")
+                    self.assertEqual(
+                        window.first_run_storage_button.text(),
+                        "先设置索引保存位置…",
+                    )
                 finally:
                     window.close()
 
@@ -91,6 +95,64 @@ class FirstRunUiTests(unittest.TestCase):
                     self.assertTrue(window.search_input.isEnabled())
                     self.assertFalse(window.type_filter.isHidden())
                     start_index.assert_called_once_with([root.resolve()])
+                finally:
+                    window.close()
+
+    def test_pending_storage_move_blocks_first_index_until_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            db_path = base / "docseek.db"
+            destination = base / "other-drive"
+            with (
+                patch.object(app_module, "DB_PATH", db_path),
+                patch.object(
+                    app_module,
+                    "pending_index_storage_move",
+                    return_value=destination,
+                ),
+            ):
+                window = app_module.MainWindow()
+                try:
+                    self.assertFalse(window.first_run_button.isEnabled())
+                    self.assertIn(str(destination), window.first_run_storage_status.text())
+                    self.assertIn("重新启动", window.first_run_storage_status.text())
+                finally:
+                    window.close()
+
+    def test_first_run_can_stage_non_system_disk_before_choosing_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            db_path = base / "current" / "docseek.db"
+            destination = base / "E-drive" / "DocSeekData"
+            pending_values = iter((None, destination))
+            with (
+                patch.object(app_module, "DB_PATH", db_path),
+                patch.object(
+                    app_module,
+                    "pending_index_storage_move",
+                    side_effect=lambda: next(pending_values),
+                ),
+            ):
+                window = app_module.MainWindow()
+                try:
+                    with (
+                        patch.object(
+                            app_module.QFileDialog,
+                            "getExistingDirectory",
+                            return_value=str(destination),
+                        ),
+                        patch.object(
+                            app_module,
+                            "stage_index_storage_move",
+                            return_value=destination,
+                        ) as stage,
+                        patch.object(app_module.QMessageBox, "information") as info,
+                    ):
+                        window._choose_first_run_storage_location()
+
+                    stage.assert_called_once_with(str(destination))
+                    info.assert_called_once()
+                    self.assertFalse(window.first_run_button.isEnabled())
                 finally:
                     window.close()
 

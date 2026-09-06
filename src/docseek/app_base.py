@@ -182,7 +182,11 @@ class MainWindow(QMainWindow):
 
         self.database = SearchDatabase(DB_PATH)
         self.chunk_store = ChunkStore(DB_PATH)
-        self.thread_pool = QThreadPool.globalInstance()
+        # Keep indexing ownership local to this window. This lets shutdown stop
+        # exactly DocSeek's index job without waiting on unrelated global Qt
+        # tasks, while current_worker still enforces one active job at a time.
+        self.thread_pool = QThreadPool(self)
+        self.thread_pool.setMaxThreadCount(1)
         self.search_thread_pool = QThreadPool(self)
         self.search_thread_pool.setMaxThreadCount(2)
         self.active_search_workers: set[SearchWorker] = set()
@@ -196,6 +200,7 @@ class MainWindow(QMainWindow):
         self.seen_result_paths: set[str] = set()
         self.pending_watch_paths: set[str] = set()
         self.watch_full_rescan_pending = False
+        self._close_when_index_stops = False
 
         self.watch_signals = WatchSignals()
         self.watch_signals.changed.connect(self._on_watch_batch)
@@ -425,10 +430,25 @@ class MainWindow(QMainWindow):
         return super().eventFilter(watched, event)
 
     def closeEvent(self, event) -> None:  # noqa: N802
+        if self._defer_close_until_index_stops(event):
+            return
         self.search_generation += 1
         self.search_thread_pool.clear()
+        self.thread_pool.clear()
         self.watch_manager.stop()
         super().closeEvent(event)
+
+    def _defer_close_until_index_stops(self, event) -> bool:
+        """Cancel an active index job and close after its worker has unwound."""
+        if self.current_worker is None:
+            return False
+        self._close_when_index_stops = True
+        self.current_worker.cancel()
+        self.watch_manager.stop()
+        self.index_detail_label.setText("正在安全停止索引…")
+        self.statusBar().showMessage("正在安全停止索引，完成后将关闭 DocSeek…")
+        event.ignore()
+        return True
 
     def _choose_directory(self) -> None:
         initial = self.database.get_index_root() or str(Path.home())
@@ -462,7 +482,9 @@ class MainWindow(QMainWindow):
         self.choose_button.setEnabled(False)
         self.refresh_button.setEnabled(False)
         self.settings_button.setEnabled(False)
-        self.cancel_button.setVisible(not automatic)
+        # Full scans can take long enough that users must retain control even
+        # when the scan was started automatically during startup recovery.
+        self.cancel_button.setVisible(worker.is_full_scan)
         self.index_progress_panel.setVisible(True)
         self.index_file_label.setText("准备建立索引…")
         self.index_file_label.setToolTip("")
@@ -515,7 +537,10 @@ class MainWindow(QMainWindow):
     def _index_finished(self, stats: IndexStats) -> None:
         worker = self.current_worker
         was_full_scan = worker.is_full_scan if worker is not None else False
+        closing = self._close_when_index_stops
         self._finish_index_ui()
+        if closing:
+            return
         self._refresh_scope()
         if was_full_scan:
             self._restart_watcher()
@@ -531,12 +556,18 @@ class MainWindow(QMainWindow):
         self._drain_watch_queue()
 
     def _index_cancelled(self) -> None:
+        closing = self._close_when_index_stops
         self._finish_index_ui()
+        if closing:
+            return
         self.statusBar().showMessage("索引已停止", 6000)
         self._drain_watch_queue()
 
     def _index_failed(self, message: str) -> None:
+        closing = self._close_when_index_stops
         self._finish_index_ui()
+        if closing:
+            return
         self.statusBar().showMessage(f"索引失败：{message}", 10000)
         self._drain_watch_queue()
 
@@ -548,6 +579,8 @@ class MainWindow(QMainWindow):
         self.index_progress_panel.setVisible(False)
         self.current_worker = None
         self._refresh_status()
+        if self._close_when_index_stops:
+            QTimer.singleShot(0, self.close)
 
     def _on_watch_batch(self, batch: WatchBatch) -> None:
         if batch.full_rescan:
@@ -558,7 +591,7 @@ class MainWindow(QMainWindow):
         self._drain_watch_queue()
 
     def _drain_watch_queue(self) -> None:
-        if self.current_worker is not None:
+        if self.current_worker is not None or self._close_when_index_stops:
             return
 
         if self.watch_full_rescan_pending:

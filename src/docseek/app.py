@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QLabel,
     QMenu,
+    QMessageBox,
     QPushButton,
     QToolButton,
     QVBoxLayout,
@@ -30,6 +31,11 @@ from .search_help import SearchHelpDialog
 from .search_presets import SearchState, SearchStateStore, search_state_label
 from .search_session import close_persistent_search_stores
 from .search_sort import SORT_RELEVANCE
+from .storage_location import (
+    StorageLocationError,
+    pending_index_storage_move,
+    stage_index_storage_move,
+)
 
 # Keep the established public helpers available from docseek.app. Existing
 # tests, scripts and users should not need to know that the stable core window
@@ -99,6 +105,8 @@ class MainWindow(app_base.MainWindow):
 
     def closeEvent(self, event) -> None:  # noqa: N802
         """Persist UI state, finish searches and release SQLite handles."""
+        if self._defer_close_until_index_stops(event):
+            return
         if hasattr(self, "results_layout_timer"):
             self.results_layout_timer.stop()
             self._save_results_layout()
@@ -207,7 +215,7 @@ class MainWindow(app_base.MainWindow):
 
         description = QLabel(
             "选择你的办公资料目录，DocSeek 会在本机建立全文索引。\n"
-            "文档内容不会上传；索引过程中已完成的内容即可搜索。"
+            "文档内容不会上传；索引会分批写入，已写入的内容即可搜索。"
         )
         description.setAlignment(Qt.AlignCenter)
         description.setWordWrap(True)
@@ -219,6 +227,21 @@ class MainWindow(app_base.MainWindow):
         self.first_run_button.setMinimumWidth(180)
         self.first_run_button.clicked.connect(self._choose_directory)
         welcome_layout.addWidget(self.first_run_button, 0, Qt.AlignHCenter)
+
+        self.first_run_storage_button = QPushButton("先设置索引保存位置…")
+        self.first_run_storage_button.setToolTip(
+            "如果不希望索引占用系统盘，可在添加资料目录前选择其他本地磁盘"
+        )
+        self.first_run_storage_button.clicked.connect(
+            self._choose_first_run_storage_location
+        )
+        welcome_layout.addWidget(self.first_run_storage_button, 0, Qt.AlignHCenter)
+
+        self.first_run_storage_status = QLabel("")
+        self.first_run_storage_status.setAlignment(Qt.AlignCenter)
+        self.first_run_storage_status.setWordWrap(True)
+        self.first_run_storage_status.setStyleSheet("color: palette(mid);")
+        welcome_layout.addWidget(self.first_run_storage_status)
 
         steps = QLabel("1. 选择目录   →   2. 建立索引   →   3. 输入关键词搜索并打开文件")
         steps.setAlignment(Qt.AlignCenter)
@@ -248,8 +271,58 @@ class MainWindow(app_base.MainWindow):
         if not has_roots:
             self.filter_chip_panel.setVisible(False)
             self.scope_label.setText("尚未选择资料目录")
+            try:
+                pending_storage = pending_index_storage_move()
+            except StorageLocationError as exc:
+                self.first_run_button.setEnabled(False)
+                self.first_run_storage_status.setText(f"索引位置配置异常：{exc}")
+            else:
+                self.first_run_button.setEnabled(pending_storage is None)
+                if pending_storage is None:
+                    self.first_run_storage_status.setText(
+                        f"当前索引保存位置：{Path(self.database.db_path).parent}"
+                    )
+                else:
+                    self.first_run_storage_status.setText(
+                        f"已安排迁移到：{pending_storage}\n"
+                        "请关闭并重新启动 DocSeek，然后再选择资料目录。"
+                    )
         else:
             self._refresh_scope()
+
+    def _choose_first_run_storage_location(self) -> None:
+        selected = QFileDialog.getExistingDirectory(
+            self,
+            "选择索引数据保存位置",
+            str(Path(self.database.db_path).parent),
+        )
+        if not selected:
+            return
+        try:
+            destination = stage_index_storage_move(selected)
+        except StorageLocationError as exc:
+            QMessageBox.warning(self, "无法更改索引位置", str(exc))
+            self._refresh_first_run_state()
+            return
+
+        self._refresh_first_run_state()
+        try:
+            current_directory = Path(self.database.db_path).parent.resolve()
+        except OSError:
+            current_directory = Path(self.database.db_path).parent.absolute()
+        if destination == current_directory:
+            QMessageBox.information(
+                self,
+                "索引位置未变化",
+                f"DocSeek 已使用该位置：\n{destination}",
+            )
+            return
+        QMessageBox.information(
+            self,
+            "索引位置已安排",
+            f"索引将在下次启动前迁移到：\n{destination}\n\n"
+            "请关闭并重新启动 DocSeek，然后再选择资料目录。",
+        )
 
     def _save_results_layout(self) -> None:
         state = encode_header_state(self.results.horizontalHeader().saveState())
@@ -424,7 +497,7 @@ class MainWindow(app_base.MainWindow):
         self._start_index(active_roots)
 
     def _drain_watch_queue(self) -> None:
-        if self.current_worker is not None:
+        if self.current_worker is not None or self._close_when_index_stops:
             return
 
         active_roots = self._active_index_roots()
