@@ -20,7 +20,6 @@ from .extraction_state import (
     status_for_extraction_result,
     unchanged_state_is_complete,
 )
-from .extractors import SUPPORTED_EXTENSIONS
 from .file_exclusions import (
     FILE_EXCLUSION_PATTERNS_KEY,
     decode_file_exclusion_patterns,
@@ -30,6 +29,11 @@ from .file_exclusions import (
 from .index_cleanup import remove_missing_under_root
 from .index_health import record_successful_reconcile
 from .index_issues import IndexIssueStore
+from .index_formats import (
+    ENABLED_INDEX_EXTENSIONS_KEY,
+    decode_enabled_extensions,
+    normalize_enabled_extensions,
+)
 from .index_priority import prioritize_index_candidates
 from .search_db import SearchDatabase
 
@@ -100,6 +104,7 @@ class DirectoryIndexer:
         ignored_dir_names: set[str] | None = None,
         excluded_paths: list[str] | None = None,
         excluded_file_patterns: list[str] | None = None,
+        enabled_extensions: set[str] | frozenset[str] | None = None,
     ) -> None:
         self.database = database
         self.chunk_store = ChunkStore(database.db_path)
@@ -109,6 +114,7 @@ class DirectoryIndexer:
             configured_max_mb,
             configured_excluded,
             configured_file_patterns,
+            configured_enabled_extensions,
         ) = self._load_runtime_settings()
         if max_file_size is None:
             max_file_size = configured_max_mb * 1024 * 1024
@@ -124,9 +130,16 @@ class DirectoryIndexer:
             else configured_file_patterns
         )
         self.excluded_file_patterns = normalize_file_exclusion_patterns(raw_patterns)
+        self.enabled_extensions = (
+            configured_enabled_extensions
+            if enabled_extensions is None
+            else normalize_enabled_extensions(enabled_extensions)
+        )
         self._cancel = threading.Event()
 
-    def _load_runtime_settings(self) -> tuple[int, list[str], list[str]]:
+    def _load_runtime_settings(
+        self,
+    ) -> tuple[int, list[str], list[str], frozenset[str]]:
         """Read indexer settings with one lightweight metadata connection.
 
         The legacy SearchDatabase connection still owns compatibility FTS
@@ -138,8 +151,8 @@ class DirectoryIndexer:
         with self.chunk_store.connect() as conn:
             rows = conn.execute(
                 "SELECT key, value FROM settings "
-                "WHERE key IN ('max_file_size_mb', 'excluded_paths', ?) ",
-                (FILE_EXCLUSION_PATTERNS_KEY,),
+                "WHERE key IN ('max_file_size_mb', 'excluded_paths', ?, ?) ",
+                (FILE_EXCLUSION_PATTERNS_KEY, ENABLED_INDEX_EXTENSIONS_KEY),
             ).fetchall()
         values = {str(row["key"]): str(row["value"]) for row in rows}
 
@@ -161,7 +174,10 @@ class DirectoryIndexer:
         file_patterns = decode_file_exclusion_patterns(
             values.get(FILE_EXCLUSION_PATTERNS_KEY)
         )
-        return max_mb, excluded, file_patterns
+        enabled_extensions = decode_enabled_extensions(
+            values.get(ENABLED_INDEX_EXTENSIONS_KEY)
+        )
+        return max_mb, excluded, file_patterns, enabled_extensions
 
     def cancel(self) -> None:
         self._cancel.set()
@@ -424,13 +440,12 @@ class DirectoryIndexer:
             return "os_error"
         return type(exc).__name__
 
-    @staticmethod
-    def _is_supported_candidate(path: Path) -> bool:
+    def _is_supported_candidate(self, path: Path) -> bool:
         name = path.name
         return (
             not name.startswith("~$")
             and not name.endswith(".tmp")
-            and path.suffix.lower() in SUPPORTED_EXTENSIONS
+            and path.suffix.lower() in self.enabled_extensions
         )
 
     def _is_file_pattern_excluded(self, path: Path) -> bool:

@@ -11,6 +11,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtWidgets import QApplication
 
 from docseek import app as app_module
+from docseek.index_formats import DEFAULT_ENABLED_INDEX_EXTENSIONS, IndexFormatStore
 from docseek.search_db import SearchDatabase
 
 
@@ -95,6 +96,10 @@ class FirstRunUiTests(unittest.TestCase):
                     self.assertEqual(
                         window.database.get_index_roots(),
                         [str(root.resolve())],
+                    )
+                    self.assertEqual(
+                        IndexFormatStore(window.database).enabled_extensions(),
+                        DEFAULT_ENABLED_INDEX_EXTENSIONS,
                     )
                     self.assertTrue(window.first_run_panel.isHidden())
                     self.assertFalse(window.content_splitter.isHidden())

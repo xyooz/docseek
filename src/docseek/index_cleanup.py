@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 
 from .chunk_store import ChunkStore
+from .document_types import KNOWN_DOCUMENT_EXTENSIONS
 
 
 def _path_key(path: str | Path) -> str:
@@ -82,3 +83,53 @@ def remove_missing_under_root(
             conn.execute("DELETE FROM files WHERE id = ?", (file_id,))
 
     return len(missing)
+
+
+def remove_disabled_extensions(
+    store: ChunkStore,
+    enabled_extensions: set[str] | frozenset[str],
+) -> int:
+    """Remove indexed content for formats the user has disabled.
+
+    This is global rather than root-scoped so a paused directory cannot keep
+    stale XML or other disabled content searchable after the setting changes.
+    Source files are never touched.
+    """
+    enabled = {str(extension).lower() for extension in enabled_extensions}
+    removed_paths: list[str] = []
+
+    with store.connect() as conn:
+        rows = conn.execute("SELECT id, path, extension FROM files").fetchall()
+        for row in rows:
+            if str(row["extension"]).lower() in enabled:
+                continue
+            file_id = int(row["id"])
+            path = str(row["path"])
+            store._delete_chunks(conn, path, file_id=file_id)
+            conn.execute("DELETE FROM extraction_state WHERE path = ?", (path,))
+            conn.execute("DELETE FROM files WHERE id = ?", (file_id,))
+            removed_paths.append(path)
+
+        for table in ("file_fts", "file_fts_cjk2", "file_fts_tri"):
+            if store._table_exists(conn, table):
+                conn.executemany(
+                    f"DELETE FROM {table} WHERE path = ?",
+                    ((path,) for path in removed_paths),
+                )
+
+        if store._table_exists(conn, "index_issues"):
+            issue_rows = conn.execute("SELECT path FROM index_issues").fetchall()
+            disabled_issue_paths = [
+                str(row["path"])
+                for row in issue_rows
+                if (
+                    Path(str(row["path"])).suffix.lower()
+                    in KNOWN_DOCUMENT_EXTENSIONS - enabled
+                )
+            ]
+            conn.executemany(
+                "DELETE FROM index_issues WHERE path = ?",
+                ((path,) for path in disabled_issue_paths),
+            )
+
+    return len(removed_paths)

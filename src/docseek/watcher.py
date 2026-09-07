@@ -32,12 +32,15 @@ def _is_under(path: Path, roots: list[Path]) -> bool:
     return False
 
 
-def _is_supported(path: Path) -> bool:
+def _is_supported(
+    path: Path,
+    enabled_extensions: set[str] | frozenset[str] = frozenset(SUPPORTED_EXTENSIONS),
+) -> bool:
     name = path.name
     return (
         not name.startswith("~$")
         and not name.endswith(".tmp")
-        and path.suffix.lower() in SUPPORTED_EXTENSIONS
+        and path.suffix.lower() in enabled_extensions
     )
 
 
@@ -53,11 +56,13 @@ class _DocSeekEventHandler(FileSystemEventHandler):
         queue_path: Callable[[Path], None],
         queue_rescan: Callable[[], None],
         excluded_paths: list[Path],
+        enabled_extensions: set[str] | frozenset[str] = frozenset(SUPPORTED_EXTENSIONS),
     ) -> None:
         super().__init__()
         self.queue_path = queue_path
         self.queue_rescan = queue_rescan
         self.excluded_paths = excluded_paths
+        self.enabled_extensions = frozenset(enabled_extensions)
 
     def on_any_event(self, event: FileSystemEvent) -> None:
         if event.event_type not in {"created", "modified", "deleted", "moved"}:
@@ -81,7 +86,7 @@ class _DocSeekEventHandler(FileSystemEventHandler):
         for path in candidates:
             if _is_under(path, self.excluded_paths):
                 continue
-            if _is_supported(path):
+            if _is_supported(path, self.enabled_extensions):
                 self.queue_path(path)
 
 
@@ -133,14 +138,20 @@ class WatchManager:
         self._pending_since: float | None = None
         self._pending_paths: set[str] = set()
         self._full_rescan = False
-        self._config: tuple[tuple[str, ...], tuple[str, ...]] | None = None
+        self._config: tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]] | None = None
 
-    def start(self, roots: list[str], excluded_paths: list[str] | None = None) -> None:
+    def start(
+        self,
+        roots: list[str],
+        excluded_paths: list[str] | None = None,
+        enabled_extensions: set[str] | frozenset[str] = frozenset(SUPPORTED_EXTENSIONS),
+    ) -> None:
         resolved_roots = tuple(sorted(str(_safe_resolve(Path(path))) for path in roots))
         resolved_excluded = tuple(
             sorted(str(_safe_resolve(Path(path))) for path in (excluded_paths or []))
         )
-        config = (resolved_roots, resolved_excluded)
+        resolved_extensions = tuple(sorted(enabled_extensions))
+        config = (resolved_roots, resolved_excluded, resolved_extensions)
 
         if (
             self._observer is not None
@@ -152,7 +163,12 @@ class WatchManager:
         self.stop()
         excluded = [Path(path) for path in resolved_excluded]
         observer = Observer()
-        handler = _DocSeekEventHandler(self._queue_path, self._queue_rescan, excluded)
+        handler = _DocSeekEventHandler(
+            self._queue_path,
+            self._queue_rescan,
+            excluded,
+            frozenset(resolved_extensions),
+        )
         scheduled = 0
         for root in resolved_roots:
             path = Path(root)

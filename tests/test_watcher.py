@@ -58,6 +58,20 @@ class WatcherEventTests(unittest.TestCase):
         self.assertEqual(paths, [])
         self.assertEqual(rescans, [True])
 
+    def test_disabled_extension_is_not_queued(self) -> None:
+        paths: list[Path] = []
+        handler = _DocSeekEventHandler(
+            paths.append,
+            lambda: None,
+            [],
+            frozenset({".docx"}),
+        )
+
+        handler.on_any_event(FileModifiedEvent(r"C:\docs\slow.xml"))
+        handler.on_any_event(FileModifiedEvent(r"C:\docs\report.docx"))
+
+        self.assertEqual(paths, [Path(r"C:\docs\report.docx")])
+
 
 if __name__ == "__main__":
     unittest.main()

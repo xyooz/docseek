@@ -68,8 +68,8 @@ class WpsNativeFormatTests(unittest.TestCase):
                 data = fixture_bytes(name)
                 self.assertEqual(data[:8], CFB_MAGIC)
 
-    def test_wps_et_dps_prefer_native_tika_before_vendor_fallback(self) -> None:
-        for extension in (".wps", ".et", ".dps"):
+    def test_wps_formats_prefer_native_tika_before_vendor_fallback(self) -> None:
+        for extension in (".wps", ".et", ".ett", ".etx", ".ettx", ".dps"):
             with self.subTest(extension=extension):
                 capability = get_format_capability(extension)
                 self.assertIsNotNone(capability)
@@ -89,6 +89,30 @@ class WpsNativeFormatTests(unittest.TestCase):
                 with self.subTest(name=name):
                     path = materialize_fixture(name, root)
                     content = "\n".join(chunk.content for chunk in adapter.iter_chunks(path))
+                    self.assertIn("测试测试", content)
+                    self.assertIn("xingyu", content)
+
+    def test_tika_accepts_et_container_through_template_and_2007_suffixes(self) -> None:
+        """Prove suffix routing does not block Tika while real fixtures are pending.
+
+        The bytes are the repository's genuine ET sample, deliberately copied
+        under each newly registered suffix. This is not a claim that every
+        ETT/ETX/ETTX producer emits identical bytes; dedicated fixtures should
+        replace these aliases when they become available.
+        """
+        adapter = TikaNativeAdapter()
+        self.assertTrue(adapter.is_available(), "Windows CI installs DocSeek's tika extra")
+        data = fixture_bytes("sample_sheet.et")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            for extension in (".ett", ".etx", ".ettx"):
+                with self.subTest(extension=extension):
+                    path = root / f"sample{extension}"
+                    path.write_bytes(data)
+                    content = "\n".join(
+                        chunk.content for chunk in adapter.iter_chunks(path)
+                    )
                     self.assertIn("测试测试", content)
                     self.assertIn("xingyu", content)
 

@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
 
 from . import app_base
 from .index_root_state import IndexRootStateStore
+from .index_formats import IndexFormatStore
 from .pausable_settings_dialog import PausableIndexSettingsDialog
 from .results_layout import (
     DEFAULT_COLUMN_WIDTHS,
@@ -477,6 +478,8 @@ class MainWindow(app_base.MainWindow):
             # A cancelled scan, crash or power loss can therefore recover on the
             # next launch through startup reconciliation instead of forgetting
             # the directory after partially writing its index.
+            if not self.database.get_index_roots():
+                IndexFormatStore(self.database).ensure_new_index_default()
             self.database.add_index_root(str(root))
             self._root_state_store().set_paused(root, False)
             self._refresh_scope()
@@ -553,6 +556,7 @@ class MainWindow(app_base.MainWindow):
         self.watch_manager.start(
             self._active_index_roots(),
             self.database.get_excluded_paths(),
+            IndexFormatStore(self.database).enabled_extensions(),
         )
 
     def _refresh_scope(self) -> None:

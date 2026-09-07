@@ -161,7 +161,29 @@ _FORMATS = (
         (SupportMode.TIKA_NATIVE, SupportMode.WPS_LOCAL),
         "WPS Spreadsheet",
     ),
-    FormatCapability(".ett", DocumentFamily.SPREADSHEET, (SupportMode.WPS_LOCAL,), "WPS Spreadsheet Template"),
+    FormatCapability(
+        ".ett",
+        DocumentFamily.SPREADSHEET,
+        (SupportMode.TIKA_NATIVE, SupportMode.WPS_LOCAL),
+        "WPS Spreadsheet Template",
+    ),
+    # ETX is WPS Spreadsheet's 2007/2010 format; ETTX is its template variant.
+    # Route them through the same native Tika compatibility lane as ET. WPS
+    # automation remains an optional last resort, never a normal requirement.
+    # Real ETT/ETX/ETTX fixtures are still needed for byte-level regression
+    # proof across the variants encountered in production.
+    FormatCapability(
+        ".etx",
+        DocumentFamily.SPREADSHEET,
+        (SupportMode.TIKA_NATIVE, SupportMode.WPS_LOCAL),
+        "WPS Spreadsheet 2007/2010",
+    ),
+    FormatCapability(
+        ".ettx",
+        DocumentFamily.SPREADSHEET,
+        (SupportMode.TIKA_NATIVE, SupportMode.WPS_LOCAL),
+        "WPS Spreadsheet 2007/2010 Template",
+    ),
     FormatCapability(
         ".xlt",
         DocumentFamily.SPREADSHEET,
