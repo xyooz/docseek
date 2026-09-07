@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import io
+import re
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Callable, Iterable, Iterator
-from xml.etree import ElementTree
 
 import pymupdf
 from docx import Document
@@ -300,50 +300,116 @@ def _iter_html_chunks(path: Path, *, target_chars: int) -> Iterator[DocumentChun
         yield DocumentChunk(ordinal, location, "\n".join(buffer))
 
 
-def _xml_local_name(tag: object) -> str:
-    value = str(tag)
-    if "}" in value:
-        value = value.rsplit("}", 1)[-1]
-    return value[:80]
+class _TolerantXmlTextParser(HTMLParser):
+    """Collect searchable XML text without requiring a single strict root.
+
+    Real developer and office trees contain XML fragments, vendor entities and
+    occasionally truncated metadata files. HTMLParser gives us a bounded,
+    non-executing markup tokenizer that still extracts useful text from those
+    files instead of classifying every non-canonical document as corrupt.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=False)
+        self.elements: list[str] = []
+        self.lines: list[tuple[str, str]] = []
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        element = tag.rsplit(":", 1)[-1][:80]
+        self.elements.append(element)
+        values = [" ".join(str(value).split()) for _name, value in attrs if value]
+        text = " ".join(value for value in values if value)
+        if text:
+            self.lines.append((element, text))
+
+    def handle_startendtag(self, tag: str, attrs) -> None:
+        element = tag.rsplit(":", 1)[-1][:80]
+        values = [" ".join(str(value).split()) for _name, value in attrs if value]
+        text = " ".join(value for value in values if value)
+        if text:
+            self.lines.append((element, text))
+
+    def handle_endtag(self, tag: str) -> None:
+        target = tag.rsplit(":", 1)[-1]
+        for index in range(len(self.elements) - 1, -1, -1):
+            if self.elements[index].casefold() == target.casefold():
+                del self.elements[index:]
+                return
+
+    def handle_data(self, data: str) -> None:
+        text = " ".join(data.split())
+        if text:
+            self.lines.append((self.elements[-1] if self.elements else "", text))
+
+    def handle_entityref(self, name: str) -> None:
+        # Keep custom entity names searchable without attempting expansion.
+        if name:
+            self.lines.append((self.elements[-1] if self.elements else "", name))
+
+    def handle_charref(self, name: str) -> None:
+        if name:
+            self.lines.append((self.elements[-1] if self.elements else "", name))
+
+    def drain_lines(self) -> list[tuple[str, str]]:
+        lines, self.lines = self.lines, []
+        return lines
+
+
+def _markup_encoding(sample: bytes) -> str:
+    if sample.startswith(b"\xef\xbb\xbf"):
+        return "utf-8-sig"
+    if sample.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return "utf-16"
+    declaration = sample[:512].decode("ascii", errors="ignore")
+    match = re.search(
+        r"<\?xml\b[^>]*\bencoding\s*=\s*(['\"])([^'\"]+)\1",
+        declaration,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        candidate = match.group(2).strip()
+        if candidate:
+            try:
+                "".encode(candidate)
+                return candidate
+            except LookupError:
+                pass
+    return _detect_text_encoding_sample(sample)
 
 
 def _iter_xml_chunks(path: Path, *, target_chars: int) -> Iterator[DocumentChunk]:
-    """Stream XML text and attribute values without starting a compatibility worker."""
+    """Stream useful text from strict XML, fragments and vendor XML variants."""
+    parser = _TolerantXmlTextParser()
     ordinal = 0
     buffer: list[str] = []
     char_count = 0
     current_element = ""
 
-    for _event, element in ElementTree.iterparse(path, events=("end",)):
-        current_element = _xml_local_name(element.tag)
-        values: list[str] = []
-        for value in element.attrib.values():
-            normalized = " ".join(str(value).split())
-            if normalized:
-                values.append(normalized)
-        if element.text:
-            normalized = " ".join(element.text.split())
-            if normalized:
-                values.append(normalized)
-        if element.tail:
-            normalized = " ".join(element.tail.split())
-            if normalized:
-                values.append(normalized)
+    def ready_chunks() -> Iterator[DocumentChunk]:
+        nonlocal ordinal, buffer, char_count, current_element
+        for element, text in parser.drain_lines():
+            current_element = element or current_element
+            buffer.append(text)
+            char_count += len(text)
+            if char_count >= target_chars:
+                location = f"XML 内容 {ordinal + 1}"
+                if current_element:
+                    location += f" · 元素 {current_element}"
+                yield DocumentChunk(ordinal, location, "\n".join(buffer))
+                ordinal += 1
+                buffer = []
+                char_count = 0
 
-        if values:
-            line = " ".join(dict.fromkeys(values))
-            buffer.append(line)
-            char_count += len(line)
-        element.clear()
-
-        if buffer and char_count >= target_chars:
-            location = f"XML 内容 {ordinal + 1}"
-            if current_element:
-                location += f" · 元素 {current_element}"
-            yield DocumentChunk(ordinal, location, "\n".join(buffer))
-            ordinal += 1
-            buffer = []
-            char_count = 0
+    with path.open("rb") as raw:
+        sample = raw.read(TEXT_ENCODING_SAMPLE_BYTES)
+        encoding = _markup_encoding(sample)
+        raw.seek(0)
+        with io.TextIOWrapper(raw, encoding=encoding, errors="ignore", newline=None) as text:
+            while data := text.read(TEXT_ENCODING_SAMPLE_BYTES):
+                parser.feed(data)
+                yield from ready_chunks()
+    parser.close()
+    yield from ready_chunks()
 
     if buffer:
         location = f"XML 内容 {ordinal + 1}"

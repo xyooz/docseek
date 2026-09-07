@@ -48,6 +48,27 @@ class DirectoryIndexerTests(unittest.TestCase):
         self.assertEqual([row.filename for row in self.chunks.search("信贷")], ["visible.txt"])
         self.assertEqual(self.chunks.search("内部资料"), [])
 
+    def test_virtual_environment_and_tool_cache_directories_are_not_scanned(self) -> None:
+        visible = self.root / "工作说明.txt"
+        visible.write_text("应当建立索引的办公资料", encoding="utf-8")
+        for directory_name in (".venv", "venv", ".pytest_cache", ".idea"):
+            hidden = self.root / directory_name
+            hidden.mkdir()
+            (hidden / "metadata.xml").write_text(
+                "<entry>不应进入索引的问题噪声</entry><fragment>",
+                encoding="utf-8",
+            )
+
+        stats = DirectoryIndexer(self.db).scan(self.root)
+
+        self.assertEqual(stats.scanned, 1)
+        self.assertEqual(stats.indexed, 1)
+        self.assertEqual(self.chunks.search("问题噪声"), [])
+        self.assertEqual(
+            [row.filename for row in self.chunks.search("办公资料")],
+            ["工作说明.txt"],
+        )
+
     def test_second_scan_skips_unchanged_file(self) -> None:
         target = self.root / "guide.txt"
         target.write_text("客户服务操作指引", encoding="utf-8")

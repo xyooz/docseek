@@ -63,13 +63,30 @@ class DocumentChunkExtractionTests(unittest.TestCase):
         self.assertIn("人工复核", content)
         self.assertTrue(all(chunk.location.startswith("XML 内容 ") for chunk in chunks))
 
-    def test_malformed_xml_reports_parse_error(self) -> None:
+    def test_xml_fragments_and_unknown_entities_remain_searchable(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            path = Path(temp_dir) / "损坏.xml"
-            path.write_text("<root><unclosed></root>", encoding="utf-8")
+            path = Path(temp_dir) / "片段.xml"
+            path.write_text(
+                "<entry>第一段</entry>\n<entry>第二段 &vendorEntity;</entry>\n"
+                "<unfinished>仍然需要检索",
+                encoding="utf-8",
+            )
 
-            with self.assertRaisesRegex(Exception, "mismatched tag"):
-                list(iter_document_chunks(path))
+            content = "\n".join(
+                chunk.content for chunk in iter_document_chunks(path)
+            )
+
+        self.assertIn("第一段", content)
+        self.assertIn("第二段", content)
+        self.assertIn("vendorEntity", content)
+        self.assertIn("仍然需要检索", content)
+
+    def test_empty_xml_has_no_chunks_without_becoming_a_parse_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "空.xml"
+            path.write_text("", encoding="utf-8")
+
+            self.assertEqual(list(iter_document_chunks(path)), [])
 
     def test_html_extracts_visible_text_and_preserves_heading(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
