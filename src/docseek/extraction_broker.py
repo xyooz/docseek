@@ -54,12 +54,14 @@ class ContentExtractionBroker:
     def adapter_for(self, path: Path) -> DocumentAdapter:
         return self.registry.adapter_for(path)
 
-    @staticmethod
-    def _should_isolate(path: Path) -> bool:
-        return (
-            path.suffix.lower() not in DIRECT_SUPPORTED_EXTENSIONS
-            and os.environ.get("DOCSEEK_LEGACY_WORKER") != "1"
-        )
+    def _should_isolate(self, path: Path) -> bool:
+        if os.environ.get("DOCSEEK_LEGACY_WORKER") == "1":
+            return False
+        if path.suffix.lower() not in DIRECT_SUPPORTED_EXTENSIONS:
+            return True
+        # A direct extension can still select a compatibility adapter after
+        # container sniffing, notably an OLE presentation named *.pptx.
+        return self.registry.adapter_for(path).name in {"tika-native", "wps-local"}
 
     def iter_blocks(
         self,
@@ -95,12 +97,31 @@ class ContentExtractionBroker:
             return
 
         adapter = self.registry.adapter_for(path)
-        yield from adapter.iter_chunks(
-            path,
-            target_chars=target_chars,
-            spreadsheet_rows_per_chunk=spreadsheet_rows_per_chunk,
-            on_progress=on_progress,
-        )
+        yielded = False
+        try:
+            for chunk in adapter.iter_chunks(
+                path,
+                target_chars=target_chars,
+                spreadsheet_rows_per_chunk=spreadsheet_rows_per_chunk,
+                on_progress=on_progress,
+            ):
+                yielded = True
+                yield chunk
+        except Exception:
+            # Real-world PPTX files sometimes use a valid ZIP container but a
+            # package variant python-pptx cannot open. If opening failed before
+            # producing any content, give the isolated Tika/WPS cascade a
+            # chance. Never switch after yielding, which would duplicate slides.
+            if (
+                yielded
+                or path.suffix.lower() != ".pptx"
+                or adapter.name != "direct"
+                or os.environ.get("DOCSEEK_LEGACY_WORKER") == "1"
+            ):
+                raise
+            from .legacy_isolation import iter_legacy_chunks_isolated
+
+            yield from iter_legacy_chunks_isolated(path)
 
 
 DEFAULT_EXTRACTION_BROKER = ContentExtractionBroker()

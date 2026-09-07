@@ -42,6 +42,35 @@ class _CountingBinaryPath:
 
 
 class DocumentChunkExtractionTests(unittest.TestCase):
+    def test_xml_extracts_nested_text_attributes_and_tail_content(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "配置.xml"
+            path.write_text(
+                '<?xml version="1.0" encoding="utf-8"?>'
+                '<policy name="客户准入"><section>风险<b>等级</b>管理</section>'
+                '<item code="ABC-2026-001">人工复核</item></policy>',
+                encoding="utf-8",
+            )
+
+            chunks = list(iter_document_chunks(path, target_chars=30))
+
+        content = "\n".join(chunk.content for chunk in chunks)
+        self.assertIn("客户准入", content)
+        self.assertIn("风险", content)
+        self.assertIn("等级", content)
+        self.assertIn("管理", content)
+        self.assertIn("ABC-2026-001", content)
+        self.assertIn("人工复核", content)
+        self.assertTrue(all(chunk.location.startswith("XML 内容 ") for chunk in chunks))
+
+    def test_malformed_xml_reports_parse_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "损坏.xml"
+            path.write_text("<root><unclosed></root>", encoding="utf-8")
+
+            with self.assertRaisesRegex(Exception, "mismatched tag"):
+                list(iter_document_chunks(path))
+
     def test_html_extracts_visible_text_and_preserves_heading(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "制度.html"

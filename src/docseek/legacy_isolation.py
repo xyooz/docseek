@@ -96,11 +96,11 @@ def wait_for_worker(
             return int(code)
         if cancelled is not None and cancelled():
             _terminate_process(process)
-            raise LegacyExtractionCancelled("旧格式解析已取消")
+            raise LegacyExtractionCancelled("兼容格式解析已取消")
         if time.monotonic() >= deadline:
             _terminate_process(process)
             raise LegacyExtractionTimeout(
-                f"旧格式解析超过 {timeout_seconds:g} 秒，已终止该解析进程"
+                f"兼容格式解析超过 {timeout_seconds:g} 秒，已终止该解析进程"
             )
         time.sleep(LEGACY_WORKER_POLL_SECONDS)
 
@@ -147,14 +147,14 @@ def iter_legacy_chunks_isolated(
 
         for attempt_no, adapter_name in enumerate(adapter_names, start=1):
             if cancelled is not None and cancelled():
-                raise LegacyExtractionCancelled("旧格式解析已取消")
+                raise LegacyExtractionCancelled("兼容格式解析已取消")
 
             elapsed = time.monotonic() - started
             remaining = float(timeout_seconds) - elapsed
             if remaining <= 0:
                 summary = "；".join(attempts) if attempts else "尚未完成任何解析器"
                 raise LegacyExtractionTimeout(
-                    f"旧格式解析总时限 {timeout_seconds:g} 秒已用尽：{summary}"
+                    f"兼容格式解析总时限 {timeout_seconds:g} 秒已用尽：{summary}"
                 )
 
             attempt_timeout = min(

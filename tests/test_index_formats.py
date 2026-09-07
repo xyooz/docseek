@@ -8,6 +8,7 @@ from docseek.chunk_store import ChunkStore
 from docseek.document_types import KNOWN_DOCUMENT_EXTENSIONS
 from docseek.index_cleanup import remove_disabled_extensions
 from docseek.index_formats import (
+    COMMON_LOCAL_EXTENSIONS,
     DEFAULT_ENABLED_INDEX_EXTENSIONS,
     OFFICE_WPS_EXTENSIONS,
     IndexFormatStore,
@@ -18,7 +19,7 @@ from docseek.search_db import SearchDatabase
 
 
 class IndexFormatSettingsTests(unittest.TestCase):
-    def test_first_user_created_index_defaults_to_office_and_wps_only(self) -> None:
+    def test_first_user_created_index_defaults_to_common_office_formats(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             database = SearchDatabase(Path(directory) / "docseek.db")
             formats = IndexFormatStore(database)
@@ -26,11 +27,14 @@ class IndexFormatSettingsTests(unittest.TestCase):
             enabled = formats.ensure_new_index_default()
 
         self.assertEqual(enabled, DEFAULT_ENABLED_INDEX_EXTENSIONS)
-        self.assertEqual(enabled, OFFICE_WPS_EXTENSIONS)
+        self.assertEqual(enabled, OFFICE_WPS_EXTENSIONS | COMMON_LOCAL_EXTENSIONS)
         self.assertIn(".docx", enabled)
         self.assertIn(".etx", enabled)
+        self.assertIn(".pdf", enabled)
+        self.assertIn(".txt", enabled)
+        self.assertIn(".md", enabled)
+        self.assertIn(".html", enabled)
         self.assertNotIn(".xml", enabled)
-        self.assertNotIn(".pdf", enabled)
 
     def test_database_without_setting_keeps_legacy_all_format_behaviour(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -12,6 +12,7 @@ _FORMAT_REVISIONS = {
     ".html": 2,  # direct visible-text parser replaces per-file Tika process
     ".htm": 2,
     ".xhtml": 2,
+    ".xml": 2,  # direct streaming parser replaces compatibility-only extraction
     ".tsv": 2,  # direct text parser replaces flat Tika extraction
 }
 

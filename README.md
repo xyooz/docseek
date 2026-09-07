@@ -35,7 +35,7 @@ DocSeek 是一个面向 Windows 办公环境的本地全文检索工具：像 Ev
 - 多个索引目录；
 - 单目录暂停 / 恢复，暂停时保留已有搜索结果；
 - 排除目录和文件名通配规则；
-- 可逐项选择参与索引的文件格式；新建索引默认仅启用 Office / WPS，XML 等长尾格式按需开启；
+- 可逐项选择参与索引的文件格式；新建索引默认启用常用 Office / WPS、PDF、文本和网页格式，XML 等长尾格式按需开启；
 - watchdog 精确单文件增量更新；
 - 目录结构变化时回退到根目录校准；
 - watcher 单 Timer 防抖，避免高噪声环境制造大量线程；
@@ -52,7 +52,7 @@ DocSeek 是一个面向 Windows 办公环境的本地全文检索工具：像 Ev
 
 优先使用结构保真度最高的专用解析器：
 
-- 文本与网页：`.txt` `.md` `.log` `.csv` `.tsv` `.html` `.htm` `.xhtml`
+- 文本、网页与 XML：`.txt` `.md` `.log` `.csv` `.tsv` `.html` `.htm` `.xhtml` `.xml`
 - Word：`.docx`
 - Excel：`.xlsx`
 - PowerPoint：`.pptx`
@@ -61,10 +61,12 @@ DocSeek 是一个面向 Windows 办公环境的本地全文检索工具：像 Ev
 可选兼容后端：
 
 - Calamine：`.xls` `.xlsb` `.ods`
-- `iscc-tika` 原生兼容：`.wps` `.et` `.ett` `.etx` `.ettx` `.dps`、`.xml` `.eml` `.msg` `.epub`、旧 Office、开放文档及其他长尾格式
+- `iscc-tika` 原生兼容：`.wps` `.et` `.ett` `.etx` `.ettx` `.dps`、`.eml` `.msg` `.epub`、旧 Office、开放文档及其他长尾格式
 - Windows 本机 WPS COM 兜底：部分旧 Office / WPS 格式
 
 WPS 专有格式优先由本地 `iscc-tika` 原生库解析，不要求安装 WPS Office；Windows WPS COM 仅作为可选兜底。仓库已有真实 `.wps/.et/.dps` 回归样本，`.ett/.etx/.ettx` 已接入同一 Tika 路径，仍建议继续补充来自实际 WPS 版本的独立样本。
+
+XML 使用本地流式解析器。标准 PPTX 保留结构化内置解析；如果检测到旧 OLE 容器，或内置解析器在输出任何内容前无法打开包，则自动尝试隔离的 Tika / WPS 兼容解析器。
 
 ## Windows 使用
 

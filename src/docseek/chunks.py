@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Callable, Iterable, Iterator
+from xml.etree import ElementTree
 
 import pymupdf
 from docx import Document
@@ -72,6 +73,8 @@ def _iter_direct_document_chunks(
         yield from _iter_text_chunks(path, target_chars=target_chars)
     elif suffix in HTML_EXTENSIONS:
         yield from _iter_html_chunks(path, target_chars=target_chars)
+    elif suffix == ".xml":
+        yield from _iter_xml_chunks(path, target_chars=target_chars)
     elif suffix == ".docx":
         yield from _iter_docx_chunks(path, target_chars=target_chars)
     elif suffix == ".xlsx":
@@ -294,6 +297,58 @@ def _iter_html_chunks(path: Path, *, target_chars: int) -> Iterator[DocumentChun
         location = f"网页内容 {ordinal + 1}"
         if chunk_heading:
             location += f" · 标题 {chunk_heading}"
+        yield DocumentChunk(ordinal, location, "\n".join(buffer))
+
+
+def _xml_local_name(tag: object) -> str:
+    value = str(tag)
+    if "}" in value:
+        value = value.rsplit("}", 1)[-1]
+    return value[:80]
+
+
+def _iter_xml_chunks(path: Path, *, target_chars: int) -> Iterator[DocumentChunk]:
+    """Stream XML text and attribute values without starting a compatibility worker."""
+    ordinal = 0
+    buffer: list[str] = []
+    char_count = 0
+    current_element = ""
+
+    for _event, element in ElementTree.iterparse(path, events=("end",)):
+        current_element = _xml_local_name(element.tag)
+        values: list[str] = []
+        for value in element.attrib.values():
+            normalized = " ".join(str(value).split())
+            if normalized:
+                values.append(normalized)
+        if element.text:
+            normalized = " ".join(element.text.split())
+            if normalized:
+                values.append(normalized)
+        if element.tail:
+            normalized = " ".join(element.tail.split())
+            if normalized:
+                values.append(normalized)
+
+        if values:
+            line = " ".join(dict.fromkeys(values))
+            buffer.append(line)
+            char_count += len(line)
+        element.clear()
+
+        if buffer and char_count >= target_chars:
+            location = f"XML 内容 {ordinal + 1}"
+            if current_element:
+                location += f" · 元素 {current_element}"
+            yield DocumentChunk(ordinal, location, "\n".join(buffer))
+            ordinal += 1
+            buffer = []
+            char_count = 0
+
+    if buffer:
+        location = f"XML 内容 {ordinal + 1}"
+        if current_element:
+            location += f" · 元素 {current_element}"
         yield DocumentChunk(ordinal, location, "\n".join(buffer))
 
 

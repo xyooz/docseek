@@ -303,6 +303,7 @@ class PausableIndexSettingsDialog(IndexSettingsDialog):
             self.remove_exclude_button,
             self.file_pattern_edit,
             *self.format_checkboxes.values(),
+            self.recommended_formats_button,
             self.office_formats_button,
             self.all_formats_button,
             self.clear_formats_button,

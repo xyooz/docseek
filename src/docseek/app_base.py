@@ -58,6 +58,7 @@ FILE_FILTERS = [
     ("Word", ".docx"),
     ("Excel", ".xlsx"),
     ("PowerPoint", ".pptx"),
+    ("PowerPoint 97-2003", ".ppt"),
     ("WPS 文字", ".wps"),
     ("WPS 表格", ".et"),
     ("WPS 表格模板", ".ett"),
@@ -65,6 +66,7 @@ FILE_FILTERS = [
     ("WPS 表格模板 2007/2010", ".ettx"),
     ("WPS 演示", ".dps"),
     ("HTML", ".html"),
+    ("XML", ".xml"),
     ("Markdown", ".md"),
     ("文本", ".txt"),
 ]

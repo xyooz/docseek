@@ -7,7 +7,11 @@ from typing import Iterator
 from unittest.mock import patch
 
 from docseek.chunks import DocumentChunk, iter_document_chunks
-from docseek.document_adapters import AdapterUnavailable, DocumentAdapterRegistry
+from docseek.document_adapters import (
+    AdapterUnavailable,
+    DirectDocumentAdapter,
+    DocumentAdapterRegistry,
+)
 from docseek.document_types import DocumentFamily, SupportMode, get_format_capability
 from docseek.extraction_broker import ContentExtractionBroker
 
@@ -51,11 +55,20 @@ class FakeBroker:
         yield DocumentChunk(0, "文档块 1-1", "broker-routed")
 
 
+@dataclass(slots=True, frozen=True)
+class FailingDirectAdapter(FakeAdapter):
+    def iter_chunks(self, path: Path, **kwargs) -> Iterator[DocumentChunk]:
+        del path, kwargs
+        raise ValueError("unsupported PPTX package variant")
+        yield  # pragma: no cover - keeps this method an iterator
+
+
 class ExtractionBrokerTests(unittest.TestCase):
     def test_format_capabilities_keep_mature_backend_preferences(self) -> None:
         xlsx = get_format_capability(".xlsx")
         xls = get_format_capability(".xls")
         doc = get_format_capability(".doc")
+        pptx = get_format_capability(".pptx")
         wps = get_format_capability(".wps")
 
         self.assertEqual(xlsx.modes, (SupportMode.DIRECT,))
@@ -64,6 +77,10 @@ class ExtractionBrokerTests(unittest.TestCase):
             (SupportMode.CALAMINE, SupportMode.TIKA_NATIVE, SupportMode.WPS_LOCAL),
         )
         self.assertEqual(doc.modes, (SupportMode.TIKA_NATIVE, SupportMode.WPS_LOCAL))
+        self.assertEqual(
+            pptx.modes,
+            (SupportMode.DIRECT, SupportMode.TIKA_NATIVE, SupportMode.WPS_LOCAL),
+        )
         self.assertEqual(wps.modes, (SupportMode.TIKA_NATIVE, SupportMode.WPS_LOCAL))
 
     def test_registry_prefers_higher_priority_available_adapter(self) -> None:
@@ -79,6 +96,59 @@ class ExtractionBrokerTests(unittest.TestCase):
         registry = DocumentAdapterRegistry((first, second))
 
         self.assertEqual(registry.adapter_for(Path("book.xls")).name, "second")
+
+    def test_ole_container_with_pptx_suffix_skips_direct_adapter(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "旧演示文稿.pptx"
+            path.write_bytes(bytes.fromhex("D0CF11E0A1B11AE1") + b"legacy")
+            compatibility = FakeAdapter(
+                "tika-native", 70, frozenset({".pptx"})
+            )
+            registry = DocumentAdapterRegistry(
+                (DirectDocumentAdapter(), compatibility)
+            )
+
+            self.assertEqual(registry.adapter_for(path).name, "tika-native")
+
+            broker = ContentExtractionBroker(registry)
+            fallback = iter(
+                [DocumentChunk(0, "兼容内容块 1", "旧容器演示文稿正文")]
+            )
+            with patch(
+                "docseek.legacy_isolation.iter_legacy_chunks_isolated",
+                return_value=fallback,
+            ) as isolated:
+                chunks = list(broker.iter_chunks(path))
+
+            isolated.assert_called_once_with(path)
+            self.assertEqual(chunks[0].content, "旧容器演示文稿正文")
+
+    def test_standard_pptx_candidate_keeps_direct_adapter(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "正常演示文稿.pptx"
+            path.write_bytes(b"PK\x03\x04placeholder")
+            registry = DocumentAdapterRegistry((DirectDocumentAdapter(),))
+
+            self.assertEqual(registry.adapter_for(path).name, "direct")
+
+    def test_pptx_open_failure_falls_back_before_any_chunk_is_yielded(self) -> None:
+        direct = FailingDirectAdapter("direct", 100, frozenset({".pptx"}))
+        broker = ContentExtractionBroker(DocumentAdapterRegistry((direct,)))
+        path = Path("兼容演示文稿.pptx")
+        fallback = iter([DocumentChunk(0, "兼容内容块 1", "备用解析正文")])
+
+        with patch(
+            "docseek.legacy_isolation.iter_legacy_chunks_isolated",
+            return_value=fallback,
+        ) as isolated:
+            chunks = list(broker.iter_chunks(path))
+
+        isolated.assert_called_once_with(path)
+        self.assertEqual(chunks[0].content, "备用解析正文")
 
     def test_broker_lifts_adapter_chunks_into_structured_ir(self) -> None:
         registry = DocumentAdapterRegistry(

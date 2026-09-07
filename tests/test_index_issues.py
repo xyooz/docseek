@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from docseek.index_issues import IndexIssueStore
+from docseek.index_issues import IndexIssueStore, issue_label
 
 
 class IndexIssueStoreTests(unittest.TestCase):
@@ -43,6 +43,12 @@ class IndexIssueStoreTests(unittest.TestCase):
 
         self.assertEqual(removed, 0)
         self.assertEqual(self.store.count(), 1)
+
+    def test_compatibility_and_container_errors_use_user_facing_labels(self) -> None:
+        self.assertEqual(issue_label("LegacyExtractionError"), "兼容格式解析失败")
+        self.assertIn("扩展名不一致", issue_label("PackageNotFoundError"))
+        self.assertIn("XML", issue_label("ParseError"))
+        self.assertIn("解析组件", issue_label("AdapterUnavailable"))
 
 
 if __name__ == "__main__":

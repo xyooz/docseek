@@ -29,6 +29,7 @@ from .index_cleanup import remove_disabled_extensions
 from .index_formats import (
     DEFAULT_ENABLED_INDEX_EXTENSIONS,
     INDEX_FORMAT_GROUPS,
+    OFFICE_WPS_EXTENSIONS,
     IndexFormatStore,
 )
 from .index_issues import IndexIssueStore
@@ -128,11 +129,15 @@ class IndexSettingsDialog(QDialog):
         format_scroll.setWidget(format_container)
         format_scroll.setMaximumHeight(280)
 
+        self.recommended_formats_button = QPushButton("推荐格式")
         self.office_formats_button = QPushButton("仅 Office / WPS")
         self.all_formats_button = QPushButton("全选")
         self.clear_formats_button = QPushButton("清空")
-        self.office_formats_button.clicked.connect(
+        self.recommended_formats_button.clicked.connect(
             lambda: self._set_format_preset(DEFAULT_ENABLED_INDEX_EXTENSIONS)
+        )
+        self.office_formats_button.clicked.connect(
+            lambda: self._set_format_preset(OFFICE_WPS_EXTENSIONS)
         )
         self.all_formats_button.clicked.connect(
             lambda: self._set_format_preset(KNOWN_DOCUMENT_EXTENSIONS)
@@ -140,14 +145,16 @@ class IndexSettingsDialog(QDialog):
         self.clear_formats_button.clicked.connect(lambda: self._set_format_preset(set()))
 
         format_buttons = QHBoxLayout()
+        format_buttons.addWidget(self.recommended_formats_button)
         format_buttons.addWidget(self.office_formats_button)
         format_buttons.addWidget(self.all_formats_button)
         format_buttons.addWidget(self.clear_formats_button)
         format_buttons.addStretch(1)
 
         format_hint = QLabel(
-            "只勾选需要全文检索的格式。新建索引默认仅启用 Office / WPS；"
-            "XML 等兼容格式默认关闭。取消格式并保存后，会删除其本地索引，绝不删除源文件。"
+            "只勾选需要全文检索的格式。新建索引默认启用常用 Office / WPS、"
+            "PDF、文本和网页格式；XML 等兼容格式按需开启。取消格式并保存后，"
+            "会删除其本地索引，绝不删除源文件。"
         )
         format_hint.setWordWrap(True)
         format_hint.setStyleSheet("color: palette(mid); font-size: 11px;")

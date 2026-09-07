@@ -136,7 +136,16 @@ class IndexRootPauseUiTests(unittest.TestCase):
             try:
                 self.assertTrue(dialog.format_checkboxes[".docx"].isChecked())
                 self.assertTrue(dialog.format_checkboxes[".etx"].isChecked())
+                self.assertTrue(dialog.format_checkboxes[".pdf"].isChecked())
+                self.assertTrue(dialog.format_checkboxes[".html"].isChecked())
                 self.assertFalse(dialog.format_checkboxes[".xml"].isChecked())
+
+                dialog.office_formats_button.click()
+                self.assertTrue(dialog.format_checkboxes[".docx"].isChecked())
+                self.assertFalse(dialog.format_checkboxes[".pdf"].isChecked())
+                dialog.recommended_formats_button.click()
+                self.assertTrue(dialog.format_checkboxes[".pdf"].isChecked())
+                self.assertTrue(dialog.format_checkboxes[".html"].isChecked())
 
                 dialog.format_checkboxes[".xml"].setChecked(True)
                 dialog.format_checkboxes[".doc"].setChecked(False)
