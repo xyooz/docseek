@@ -214,6 +214,7 @@ class PausableIndexSettingsDialog(IndexSettingsDialog):
         groups = (
             self.roots_group,
             self.exclude_group,
+            self.format_group,
             self.advanced_group,
             self.storage_group,
             self.issues_group,
@@ -233,6 +234,7 @@ class PausableIndexSettingsDialog(IndexSettingsDialog):
         rules_layout.setContentsMargins(10, 12, 10, 10)
         rules_layout.setSpacing(12)
         rules_left = QVBoxLayout()
+        rules_left.addWidget(self.format_group, 2)
         rules_left.addWidget(self.pattern_group, 1)
         rules_left.addWidget(self.advanced_group)
         rules_right = QVBoxLayout()
@@ -300,6 +302,10 @@ class PausableIndexSettingsDialog(IndexSettingsDialog):
             self.add_exclude_button,
             self.remove_exclude_button,
             self.file_pattern_edit,
+            *self.format_checkboxes.values(),
+            self.office_formats_button,
+            self.all_formats_button,
+            self.clear_formats_button,
             self.max_size,
             self.storage_move_button,
             self.backup_button,
@@ -363,6 +369,8 @@ class PausableIndexSettingsDialog(IndexSettingsDialog):
             or set(self._paused_roots_from_ui()) != self._original_paused
             or self.file_pattern_edit.toPlainText().strip()
             != self._original_file_pattern_text.strip()
+            or self._enabled_extensions_from_ui()
+            != self._original_enabled_extensions
             or self.max_size.value() != self.database.get_max_file_size_mb()
         )
 
@@ -692,6 +700,8 @@ class PausableIndexSettingsDialog(IndexSettingsDialog):
 
     def accept(self) -> None:
         if self._maintenance_worker is not None:
+            return
+        if not self._validate_enabled_extensions():
             return
         try:
             file_patterns = self._file_patterns_from_ui()

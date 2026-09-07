@@ -6,8 +6,10 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
+    QCheckBox,
     QFileDialog,
     QFormLayout,
+    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -15,10 +17,20 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QVBoxLayout,
+    QWidget,
 )
 
+from .chunk_store import ChunkStore
+from .document_types import FORMAT_CAPABILITIES, KNOWN_DOCUMENT_EXTENSIONS
+from .index_cleanup import remove_disabled_extensions
+from .index_formats import (
+    DEFAULT_ENABLED_INDEX_EXTENSIONS,
+    INDEX_FORMAT_GROUPS,
+    IndexFormatStore,
+)
 from .index_issues import IndexIssueStore
 from .index_issues_dialog import IndexIssuesDialog
 from .index_maintenance import purge_root_index
@@ -82,6 +94,72 @@ class IndexSettingsDialog(QDialog):
         exclude_group.setLayout(exclude_layout)
         self.exclude_group = exclude_group
 
+        self.format_store = IndexFormatStore(database)
+        self._original_enabled_extensions = (
+            DEFAULT_ENABLED_INDEX_EXTENSIONS
+            if not database.get_index_roots()
+            and not self.format_store.has_explicit_setting()
+            else self.format_store.enabled_extensions()
+        )
+        self.format_checkboxes: dict[str, QCheckBox] = {}
+        format_grid = QGridLayout()
+        format_grid.setColumnStretch(0, 1)
+        format_grid.setColumnStretch(1, 1)
+        row = 0
+        for group in INDEX_FORMAT_GROUPS:
+            heading = QLabel(f"<b>{group.label}</b>")
+            format_grid.addWidget(heading, row, 0, 1, 2)
+            row += 1
+            for index, extension in enumerate(group.extensions):
+                capability = FORMAT_CAPABILITIES[extension]
+                checkbox = QCheckBox(
+                    f"{extension.lstrip('.').upper()} · {capability.label}"
+                )
+                checkbox.setChecked(extension in self._original_enabled_extensions)
+                checkbox.setToolTip(f"索引 *{extension} 文件")
+                self.format_checkboxes[extension] = checkbox
+                format_grid.addWidget(checkbox, row + index // 2, index % 2)
+            row += (len(group.extensions) + 1) // 2
+
+        format_container = QWidget()
+        format_container.setLayout(format_grid)
+        format_scroll = QScrollArea()
+        format_scroll.setWidgetResizable(True)
+        format_scroll.setWidget(format_container)
+        format_scroll.setMaximumHeight(280)
+
+        self.office_formats_button = QPushButton("仅 Office / WPS")
+        self.all_formats_button = QPushButton("全选")
+        self.clear_formats_button = QPushButton("清空")
+        self.office_formats_button.clicked.connect(
+            lambda: self._set_format_preset(DEFAULT_ENABLED_INDEX_EXTENSIONS)
+        )
+        self.all_formats_button.clicked.connect(
+            lambda: self._set_format_preset(KNOWN_DOCUMENT_EXTENSIONS)
+        )
+        self.clear_formats_button.clicked.connect(lambda: self._set_format_preset(set()))
+
+        format_buttons = QHBoxLayout()
+        format_buttons.addWidget(self.office_formats_button)
+        format_buttons.addWidget(self.all_formats_button)
+        format_buttons.addWidget(self.clear_formats_button)
+        format_buttons.addStretch(1)
+
+        format_hint = QLabel(
+            "只勾选需要全文检索的格式。新建索引默认仅启用 Office / WPS；"
+            "XML 等兼容格式默认关闭。取消格式并保存后，会删除其本地索引，绝不删除源文件。"
+        )
+        format_hint.setWordWrap(True)
+        format_hint.setStyleSheet("color: palette(mid); font-size: 11px;")
+
+        format_group = QGroupBox("索引文件格式")
+        format_layout = QVBoxLayout()
+        format_layout.addLayout(format_buttons)
+        format_layout.addWidget(format_scroll)
+        format_layout.addWidget(format_hint)
+        format_group.setLayout(format_layout)
+        self.format_group = format_group
+
         self.max_size = QSpinBox()
         self.max_size.setRange(1, 4096)
         self.max_size.setSuffix(" MB")
@@ -144,6 +222,7 @@ class IndexSettingsDialog(QDialog):
         layout = QVBoxLayout()
         layout.addWidget(roots_group)
         layout.addWidget(exclude_group)
+        layout.addWidget(format_group)
         layout.addWidget(advanced_group)
         layout.addWidget(storage_group)
         layout.addWidget(issues_group)
@@ -194,6 +273,28 @@ class IndexSettingsDialog(QDialog):
         row = self.exclude_list.currentRow()
         if row >= 0:
             self.exclude_list.takeItem(row)
+
+    def _set_format_preset(self, extensions: set[str] | frozenset[str]) -> None:
+        enabled = set(extensions)
+        for extension, checkbox in self.format_checkboxes.items():
+            checkbox.setChecked(extension in enabled)
+
+    def _enabled_extensions_from_ui(self) -> frozenset[str]:
+        return frozenset(
+            extension
+            for extension, checkbox in self.format_checkboxes.items()
+            if checkbox.isChecked()
+        )
+
+    def _validate_enabled_extensions(self) -> bool:
+        if self._enabled_extensions_from_ui():
+            return True
+        QMessageBox.warning(
+            self,
+            "未选择索引格式",
+            "请至少勾选一种需要建立索引和搜索的文件格式。",
+        )
+        return False
 
     def _refresh_storage_location(self) -> None:
         current = Path(self.database.db_path).expanduser()
@@ -272,6 +373,8 @@ class IndexSettingsDialog(QDialog):
         self._refresh_issue_summary()
 
     def accept(self) -> None:
+        if not self._validate_enabled_extensions():
+            return
         roots = set(self._items(self.root_list))
         excluded = set(self._items(self.exclude_list))
 
@@ -290,4 +393,11 @@ class IndexSettingsDialog(QDialog):
             self.database.add_excluded_path(path)
 
         self.database.set_max_file_size_mb(self.max_size.value())
+        enabled_extensions = self._enabled_extensions_from_ui()
+        if enabled_extensions != self._original_enabled_extensions:
+            self.format_store.set_enabled_extensions(enabled_extensions)
+            remove_disabled_extensions(
+                ChunkStore(self.database.db_path),
+                enabled_extensions,
+            )
         super().accept()

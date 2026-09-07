@@ -10,7 +10,7 @@ MODERN_OFFICE_EXTENSIONS = frozenset({".docx", ".xlsx", ".pptx", ".pdf"})
 OFFICE_COMPATIBILITY_EXTENSIONS = frozenset(
     {
         ".doc", ".dot", ".rtf", ".odt", ".ppt", ".pps", ".odp",
-        ".xls", ".xlsb", ".ods", ".wps", ".wpt", ".et", ".ett",
+        ".xls", ".xlsb", ".ods", ".wps", ".wpt", ".et", ".ett", ".etx", ".ettx",
         ".xlt", ".dps", ".dpt",
     }
 )

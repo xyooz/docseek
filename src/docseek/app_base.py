@@ -37,6 +37,7 @@ from .app_icon import load_app_icon
 from .location_preview import preview_kind
 from .structure_store import preview_location
 from .indexer import DirectoryIndexer, IndexCancelled, IndexStats
+from .index_formats import IndexFormatStore
 from .query_parser import parse_query, query_filter_chips, remove_query_filter
 from .results_model import SearchResultsModel
 from .search_db import SearchDatabase
@@ -59,6 +60,9 @@ FILE_FILTERS = [
     ("PowerPoint", ".pptx"),
     ("WPS 文字", ".wps"),
     ("WPS 表格", ".et"),
+    ("WPS 表格模板", ".ett"),
+    ("WPS 表格 2007/2010", ".etx"),
+    ("WPS 表格模板 2007/2010", ".ettx"),
     ("WPS 演示", ".dps"),
     ("HTML", ".html"),
     ("Markdown", ".md"),
@@ -574,6 +578,8 @@ class MainWindow(QMainWindow):
         initial = self.database.get_index_root() or str(Path.home())
         selected = QFileDialog.getExistingDirectory(self, "选择需要索引的目录", initial)
         if selected:
+            if not self.database.get_index_roots():
+                IndexFormatStore(self.database).ensure_new_index_default()
             self._start_index([Path(selected)])
 
     def _open_index_settings(self) -> None:
@@ -795,6 +801,7 @@ class MainWindow(QMainWindow):
         self.watch_manager.start(
             self.database.get_index_roots(),
             self.database.get_excluded_paths(),
+            IndexFormatStore(self.database).enabled_extensions(),
         )
 
     def _refresh_filter_chips(self, *_args) -> None:

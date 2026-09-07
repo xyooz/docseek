@@ -13,6 +13,7 @@ from PySide6.QtWidgets import QApplication, QDialogButtonBox, QWidget
 
 from docseek import app as app_module
 from docseek.index_root_state import IndexRootStateStore
+from docseek.index_formats import IndexFormatStore
 from docseek.pausable_settings_dialog import PausableIndexSettingsDialog
 from docseek.search_db import SearchDatabase
 
@@ -62,6 +63,7 @@ class IndexRootPauseUiTests(unittest.TestCase):
             dialog = PausableIndexSettingsDialog(db, parent)
             try:
                 self.assertFalse(dialog.root_list.isEnabled())
+                self.assertFalse(dialog.format_checkboxes[".docx"].isEnabled())
                 save = dialog.button_box.button(QDialogButtonBox.StandardButton.Save)
                 self.assertFalse(save.isEnabled())
                 self.assertIn("25%", dialog.root_list.item(0).text())
@@ -112,6 +114,7 @@ class IndexRootPauseUiTests(unittest.TestCase):
                         watcher_start.assert_called_once_with(
                             [str(root_a.resolve())],
                             [],
+                            IndexFormatStore(window.database).enabled_extensions(),
                         )
 
                     window.pending_watch_paths = {str(active_file), str(paused_file)}
@@ -125,6 +128,25 @@ class IndexRootPauseUiTests(unittest.TestCase):
                 finally:
                     window.close()
                     QApplication.processEvents()
+
+    def test_settings_round_trip_individual_index_formats(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db = SearchDatabase(Path(temp_dir) / "docseek.db")
+            dialog = PausableIndexSettingsDialog(db)
+            try:
+                self.assertTrue(dialog.format_checkboxes[".docx"].isChecked())
+                self.assertTrue(dialog.format_checkboxes[".etx"].isChecked())
+                self.assertFalse(dialog.format_checkboxes[".xml"].isChecked())
+
+                dialog.format_checkboxes[".xml"].setChecked(True)
+                dialog.format_checkboxes[".doc"].setChecked(False)
+                dialog.accept()
+
+                enabled = IndexFormatStore(db).enabled_extensions()
+                self.assertIn(".xml", enabled)
+                self.assertNotIn(".doc", enabled)
+            finally:
+                dialog.close()
 
     def test_all_paused_roots_keep_search_scope_but_block_manual_refresh(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
