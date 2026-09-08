@@ -54,9 +54,16 @@ impl JobSnapshot {
 }
 
 #[derive(Debug)]
+struct ActiveJob {
+    id: JobId,
+    token: CancellationToken,
+    progress: Arc<Mutex<ScanProgress>>,
+}
+
+#[derive(Debug)]
 struct ControllerState {
     next_id: u64,
-    active: Option<(JobId, CancellationToken)>,
+    active: Option<ActiveJob>,
     jobs: BTreeMap<JobId, JobSnapshot>,
 }
 
@@ -96,8 +103,7 @@ impl JobController {
         root: impl AsRef<Path>,
         config: ScannerConfig,
     ) -> Result<ScanSession, CoreError> {
-        let (job_id, token) = self.begin(JobKind::FullScan)?;
-        let progress = Arc::new(Mutex::new(ScanProgress::default()));
+        let (job_id, token, progress) = self.begin(JobKind::FullScan)?;
         match Scanner::new(config).start_session_with_progress(root, token, progress) {
             Ok(inner) => {
                 self.update_progress(job_id, &inner.snapshot());
@@ -122,10 +128,11 @@ impl JobController {
 
     pub fn cancel(&self) -> bool {
         let mut state = self.state.lock().expect("job controller mutex poisoned");
-        let Some((job_id, token)) = state.active.clone() else {
+        let Some(active) = state.active.as_ref() else {
             return false;
         };
-        token.cancel();
+        let job_id = active.id;
+        active.token.cancel();
         if let Some(snapshot) = state.jobs.get_mut(&job_id) {
             if matches!(snapshot.state, JobState::Queued | JobState::Running) {
                 snapshot.state = JobState::Cancelling;
@@ -139,20 +146,24 @@ impl JobController {
         state
             .active
             .as_ref()
-            .is_some_and(|(_, token)| token.is_cancelled())
+            .is_some_and(|active| active.token.is_cancelled())
     }
 
     pub fn snapshot(&self, job_id: JobId) -> Option<JobSnapshot> {
         let state = self.state.lock().expect("job controller mutex poisoned");
-        state.jobs.get(&job_id).cloned()
+        Self::snapshot_from_state(&state, job_id)
     }
 
     pub fn last_snapshot(&self) -> Option<JobSnapshot> {
         let state = self.state.lock().expect("job controller mutex poisoned");
-        state.jobs.values().next_back().cloned()
+        let job_id = state.jobs.keys().next_back().copied()?;
+        Self::snapshot_from_state(&state, job_id)
     }
 
-    fn begin(&self, kind: JobKind) -> Result<(JobId, CancellationToken), CoreError> {
+    fn begin(
+        &self,
+        kind: JobKind,
+    ) -> Result<(JobId, CancellationToken, Arc<Mutex<ScanProgress>>), CoreError> {
         let mut state = self.state.lock().expect("job controller mutex poisoned");
         if state.active.is_some() {
             return Err(CoreError::Busy);
@@ -160,6 +171,7 @@ impl JobController {
         let id = JobId(state.next_id);
         state.next_id = state.next_id.saturating_add(1);
         let token = CancellationToken::new();
+        let progress = Arc::new(Mutex::new(ScanProgress::default()));
         state.jobs.insert(
             id,
             JobSnapshot {
@@ -174,13 +186,30 @@ impl JobController {
                 current_path: None,
             },
         );
-        state.active = Some((id, token.clone()));
+        state.active = Some(ActiveJob {
+            id,
+            token: token.clone(),
+            progress: progress.clone(),
+        });
         state
             .jobs
             .get_mut(&id)
             .expect("job was just inserted")
             .state = JobState::Running;
-        Ok((id, token))
+        Ok((id, token, progress))
+    }
+
+    fn snapshot_from_state(state: &ControllerState, job_id: JobId) -> Option<JobSnapshot> {
+        let mut snapshot = state.jobs.get(&job_id)?.clone();
+        if let Some(active) = state.active.as_ref().filter(|active| active.id == job_id) {
+            let progress = active
+                .progress
+                .lock()
+                .expect("scan progress mutex poisoned")
+                .clone();
+            snapshot.apply_progress(&progress);
+        }
+        Some(snapshot)
     }
 
     fn is_cancelling(&self, job_id: JobId) -> bool {
@@ -207,7 +236,7 @@ impl JobController {
         if state
             .active
             .as_ref()
-            .is_some_and(|(active_id, _)| *active_id == job_id)
+            .is_some_and(|active| active.id == job_id)
         {
             state.active = None;
         }
@@ -221,7 +250,7 @@ impl JobController {
         if state
             .active
             .as_ref()
-            .is_some_and(|(active_id, _)| *active_id == job_id)
+            .is_some_and(|active| active.id == job_id)
         {
             state.active = None;
         }
@@ -300,5 +329,38 @@ impl Drop for ScanSession {
                 .finish(self.job_id, JobState::Cancelled, &progress);
             self.completed = true;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn active_snapshot_reads_shared_scan_progress() {
+        let controller = JobController::new();
+        let (job_id, _token, progress) = controller.begin(JobKind::FullScan).expect("job starts");
+        {
+            let mut progress = progress.lock().expect("progress mutex is healthy");
+            progress.directories_seen = 4;
+            progress.files_seen = 37;
+            progress.candidates_discovered = 5;
+            progress.candidates_emitted = 2;
+            progress.errors = 1;
+            progress.current_path = Some(PathBuf::from("/tmp/live-progress.txt"));
+        }
+
+        let snapshot = controller.snapshot(job_id).expect("snapshot exists");
+        assert_eq!(snapshot.state, JobState::Running);
+        assert_eq!(snapshot.directories_seen, 4);
+        assert_eq!(snapshot.files_seen, 37);
+        assert_eq!(snapshot.candidates_discovered, 5);
+        assert_eq!(snapshot.candidates_emitted, 2);
+        assert_eq!(snapshot.errors, 1);
+        assert_eq!(
+            snapshot.current_path,
+            Some(PathBuf::from("/tmp/live-progress.txt"))
+        );
+        assert_eq!(controller.last_snapshot(), Some(snapshot));
     }
 }
