@@ -69,6 +69,11 @@ class FirstRunUiTests(unittest.TestCase):
                     self.assertFalse(window.settings_button.isHidden())
                     self.assertTrue(window.refresh_button.isHidden())
                     self.assertFalse(window.more_button.isHidden())
+                    self.assertTrue(window.favorite_button.isHidden())
+                    self.assertFalse(window.search_button.icon().isNull())
+                    self.assertFalse(window.history_button.icon().isNull())
+                    self.assertFalse(window.choose_button.icon().isNull())
+                    self.assertFalse(window.settings_button.icon().isNull())
                     self.assertIsNotNone(window.more_button.menu())
                     self.assertIn(
                         "重新扫描全部目录",

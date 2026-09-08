@@ -39,6 +39,7 @@ from .storage_location import (
     pending_index_storage_move,
     stage_index_storage_move,
 )
+from .ui_icons import line_icon
 
 # Keep the established public helpers available from docseek.app. Existing
 # tests, scripts and users should not need to know that the stable core window
@@ -125,7 +126,8 @@ class MainWindow(app_base.MainWindow):
 
     def _install_search_state_controls(self) -> None:
         self.history_button = QToolButton()
-        self.history_button.setText("历史 ▾")
+        self.history_button.setText("搜索记录")
+        self.history_button.setIcon(line_icon("history"))
         self.history_button.setMinimumHeight(38)
         self.history_button.setMinimumWidth(72)
         self.history_button.setToolTip("打开常用搜索和最近搜索")
@@ -136,6 +138,7 @@ class MainWindow(app_base.MainWindow):
         self.favorite_button.setMinimumWidth(84)
         self.favorite_button.setToolTip("收藏当前关键词、筛选和排序，方便以后直接恢复")
         self.favorite_button.clicked.connect(self._toggle_saved_search)
+        self.favorite_button.setVisible(False)
 
         self.help_button = QToolButton()
         self.help_button.setText("帮助")
@@ -150,10 +153,12 @@ class MainWindow(app_base.MainWindow):
         if insert_at < 0:
             insert_at = top_bar.count()
         top_bar.insertWidget(insert_at, self.history_button)
-        top_bar.insertWidget(insert_at + 1, self.favorite_button)
         if self.more_button.menu() is not None:
             self.more_button.menu().addSeparator()
-            self.more_button.menu().addAction("搜索帮助", self._show_search_help)
+            help_menu_action = self.more_button.menu().addAction(
+                "搜索帮助", self._show_search_help
+            )
+            help_menu_action.setIcon(line_icon("help"))
 
         help_action = QAction("搜索帮助", self)
         help_action.setShortcut("F1")
@@ -299,12 +304,12 @@ class MainWindow(app_base.MainWindow):
             self.sort_filter,
             self.search_button,
             self.history_button,
-            self.favorite_button,
             self.settings_button,
             self.more_button,
         ):
             widget.setVisible(has_roots)
         self.help_button.setVisible(False)
+        self.favorite_button.setVisible(False)
         self.refresh_button.setVisible(False)
 
         if not has_roots:

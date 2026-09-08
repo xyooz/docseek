@@ -6,7 +6,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QObject, QRunnable, Qt, QThreadPool, QTimer, Signal
+from PySide6.QtCore import QEvent, QObject, QRunnable, QSize, Qt, QThreadPool, QTimer, Signal
 from PySide6.QtGui import QAction, QGuiApplication
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -45,6 +45,7 @@ from .search_sort import SORT_FILENAME, SORT_MODIFIED, SORT_RELEVANCE
 from .search_worker import SearchRequest, SearchResponse, SearchWorker
 from .settings_dialog import IndexSettingsDialog
 from .ui_theme import APPLICATION_STYLESHEET
+from .ui_icons import line_icon
 from .watcher import WatchBatch, WatchManager
 
 
@@ -284,6 +285,8 @@ class MainWindow(QMainWindow):
         self.search_input.setMinimumHeight(44)
 
         self.search_button = QPushButton("搜索")
+        self.search_button.setIcon(line_icon("search", color="#FFFFFF"))
+        self.search_button.setIconSize(QSize(18, 18))
         self.search_button.setProperty("primary", True)
         self.search_button.setMinimumHeight(44)
         self.search_button.setMinimumWidth(76)
@@ -317,13 +320,18 @@ class MainWindow(QMainWindow):
         self.filter_chip_buttons: list[QToolButton] = []
 
         self.choose_button = QPushButton("添加目录")
+        self.choose_button.setIcon(line_icon("folder-plus"))
         self.refresh_button = QPushButton("刷新索引")
         self.settings_button = QPushButton("索引设置")
+        self.settings_button.setIcon(line_icon("settings"))
         self.more_button = QToolButton()
         self.more_button.setText("更多")
+        self.more_button.setIcon(line_icon("more"))
+        self.more_button.setIconSize(QSize(18, 18))
         self.more_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         workspace_menu = QMenu(self.more_button)
         refresh_action = workspace_menu.addAction("重新扫描全部目录")
+        refresh_action.setIcon(line_icon("refresh"))
         refresh_action.triggered.connect(self._refresh_all_roots)
         self.more_button.setMenu(workspace_menu)
         self.more_button.setToolTip("不常用的索引操作")
