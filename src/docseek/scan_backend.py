@@ -301,8 +301,14 @@ def _progress_from_rust(snapshot: object) -> ScanProgress:
 
 
 class RustScanSession:
-    def __init__(self, session: object) -> None:
+    def __init__(self, session: object, controller: object) -> None:
         self._session = session
+        # Keep cancellation on the controller object.  next_batch() holds a
+        # mutable PyO3 borrow of the session while it releases the GIL for
+        # discovery; calling session.cancel() from another Python thread can
+        # therefore contend with that borrow.  The controller is a separate
+        # PyO3 object backed by the same core cancellation token.
+        self._controller = controller
 
     def next_batch(self, max_items: int = MAX_SCAN_BATCH_SIZE) -> ScanBatch:
         try:
@@ -316,7 +322,7 @@ class RustScanSession:
         )
 
     def cancel(self) -> bool:
-        return bool(self._session.cancel())
+        return bool(self._controller.cancel())
 
     def snapshot(self) -> ScanProgress | None:
         snapshot = self._session.snapshot()
@@ -356,7 +362,7 @@ class RustScanBackend:
             # indexer can remove stale rows and record file_too_large.
             None,
         )
-        return RustScanSession(session)
+        return RustScanSession(session, controller)
 
 
 def iter_scan_candidates(

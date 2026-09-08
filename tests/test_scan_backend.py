@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -223,6 +225,50 @@ class PythonScanBackendTests(unittest.TestCase):
             self.assertTrue(session.cancel())
             with self.assertRaises(ScanCancelled):
                 session.next_batch()
+
+    def test_rust_cancel_from_another_thread_during_next_batch(self) -> None:
+        if docseek_rust is None:
+            self.skipTest("docseek_rust wheel is not installed")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "docs"
+            root.mkdir()
+            # Keep the scanner inside one long-running batch.  These files are
+            # deliberately unsupported, so next_batch(1) must inspect the
+            # whole directory instead of returning after the first candidate.
+            for index in range(50_000):
+                (root / f"noncandidate-{index:05d}.bin").touch()
+
+            session = RustScanBackend().start_scan(root)
+            started = threading.Event()
+            outcome: dict[str, object] = {}
+
+            def scan() -> None:
+                started.set()
+                try:
+                    outcome["batch"] = session.next_batch(1)
+                except BaseException as exc:  # pass the worker result to the test
+                    outcome["error"] = exc
+
+            worker = threading.Thread(target=scan)
+            worker.start()
+            self.assertTrue(started.wait(timeout=2))
+
+            # Wait until discovery has entered the directory before asking the
+            # separate controller object to cancel the in-flight PyO3 call.
+            deadline = time.monotonic() + 10
+            while worker.is_alive() and time.monotonic() < deadline:
+                snapshot = session._controller.last_snapshot()
+                if snapshot is not None and snapshot.files_seen > 0:
+                    break
+                time.sleep(0.001)
+
+            self.assertTrue(worker.is_alive(), "scan finished before concurrent cancel")
+            self.assertTrue(session.cancel())
+            worker.join(timeout=10)
+
+            self.assertFalse(worker.is_alive(), "cancelled scan worker did not finish")
+            self.assertIsInstance(outcome.get("error"), ScanCancelled)
 
 
 if __name__ == "__main__":
