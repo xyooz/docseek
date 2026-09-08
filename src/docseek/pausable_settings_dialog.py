@@ -234,28 +234,26 @@ class PausableIndexSettingsDialog(IndexSettingsDialog):
         rules_layout.setContentsMargins(10, 12, 10, 10)
         rules_layout.setSpacing(12)
         rules_left = QVBoxLayout()
-        rules_left.addWidget(self.format_group, 2)
-        rules_left.addWidget(self.pattern_group, 1)
+        rules_left.addWidget(self.format_group)
+        rules_left.addWidget(self.pattern_group)
         rules_left.addWidget(self.advanced_group)
-        rules_right = QVBoxLayout()
-        rules_right.addWidget(self.storage_group)
-        rules_right.addStretch(1)
+        rules_left.addStretch(1)
         rules_layout.addLayout(rules_left, 1)
-        rules_layout.addLayout(rules_right, 1)
 
         status_page = QWidget()
         status_layout = QVBoxLayout(status_page)
         status_layout.setContentsMargins(10, 12, 10, 10)
         status_layout.setSpacing(10)
+        status_layout.addWidget(self.storage_group)
         status_layout.addWidget(self.health_group)
         status_layout.addWidget(self.issues_group)
         status_layout.addWidget(self.maintenance_group)
         status_layout.addStretch(1)
 
         self.settings_tabs = QTabWidget()
-        self.settings_tabs.addTab(directory_page, "目录与排除")
-        self.settings_tabs.addTab(rules_page, "规则与存储")
-        self.settings_tabs.addTab(status_page, "状态与维护")
+        self.settings_tabs.addTab(directory_page, "索引范围")
+        self.settings_tabs.addTab(rules_page, "文件规则")
+        self.settings_tabs.addTab(status_page, "存储与维护")
         main_layout.insertWidget(1, self.settings_tabs, 1)
 
     def _indexed_count_under_root(self, root: str) -> int:
@@ -307,6 +305,7 @@ class PausableIndexSettingsDialog(IndexSettingsDialog):
             self.office_formats_button,
             self.all_formats_button,
             self.clear_formats_button,
+            self.format_preset_combo,
             self.max_size,
             self.storage_move_button,
             self.backup_button,

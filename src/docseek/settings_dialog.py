@@ -7,6 +7,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QCheckBox,
+    QComboBox,
     QFileDialog,
     QFormLayout,
     QGridLayout,
@@ -128,11 +129,31 @@ class IndexSettingsDialog(QDialog):
         format_scroll.setWidgetResizable(True)
         format_scroll.setWidget(format_container)
         format_scroll.setMaximumHeight(280)
+        self.format_scroll = format_scroll
+
+        self.format_preset_combo = QComboBox()
+        self.format_preset_combo.setMinimumHeight(36)
+        self.format_preset_combo.addItem(
+            "办公推荐 · Office/WPS、PDF、文本和网页", "recommended"
+        )
+        self.format_preset_combo.addItem("仅 Office / WPS", "office")
+        self.format_preset_combo.addItem("全部支持格式", "all")
+        self.format_preset_combo.addItem("自定义格式", "custom")
+        self.format_summary_label = QLabel()
+        self.format_summary_label.setObjectName("mutedLabel")
+        self.format_summary_label.setWordWrap(True)
 
         self.recommended_formats_button = QPushButton("推荐格式")
         self.office_formats_button = QPushButton("仅 Office / WPS")
         self.all_formats_button = QPushButton("全选")
         self.clear_formats_button = QPushButton("清空")
+        for button in (
+            self.recommended_formats_button,
+            self.office_formats_button,
+            self.all_formats_button,
+            self.clear_formats_button,
+        ):
+            button.setVisible(False)
         self.recommended_formats_button.clicked.connect(
             lambda: self._set_format_preset(DEFAULT_ENABLED_INDEX_EXTENSIONS)
         )
@@ -144,12 +165,21 @@ class IndexSettingsDialog(QDialog):
         )
         self.clear_formats_button.clicked.connect(lambda: self._set_format_preset(set()))
 
-        format_buttons = QHBoxLayout()
-        format_buttons.addWidget(self.recommended_formats_button)
-        format_buttons.addWidget(self.office_formats_button)
-        format_buttons.addWidget(self.all_formats_button)
-        format_buttons.addWidget(self.clear_formats_button)
-        format_buttons.addStretch(1)
+        preset_row = QHBoxLayout()
+        preset_row.addWidget(QLabel("格式范围"))
+        preset_row.addWidget(self.format_preset_combo, 1)
+
+        self._applying_format_preset = False
+        initial_preset = self._format_preset_key(self._original_enabled_extensions)
+        self.format_preset_combo.setCurrentIndex(
+            self.format_preset_combo.findData(initial_preset)
+        )
+        self.format_preset_combo.currentIndexChanged.connect(
+            self._on_format_preset_changed
+        )
+        for checkbox in self.format_checkboxes.values():
+            checkbox.toggled.connect(self._sync_format_preset_from_checks)
+        self._refresh_format_presentation()
 
         format_hint = QLabel(
             "只勾选需要全文检索的格式。新建索引默认启用常用 Office / WPS、"
@@ -161,7 +191,8 @@ class IndexSettingsDialog(QDialog):
 
         format_group = QGroupBox("索引文件格式")
         format_layout = QVBoxLayout()
-        format_layout.addLayout(format_buttons)
+        format_layout.addLayout(preset_row)
+        format_layout.addWidget(self.format_summary_label)
         format_layout.addWidget(format_scroll)
         format_layout.addWidget(format_hint)
         format_group.setLayout(format_layout)
@@ -223,6 +254,15 @@ class IndexSettingsDialog(QDialog):
         self.issues_group = issues_group
 
         self.button_box = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        save_button = self.button_box.button(QDialogButtonBox.StandardButton.Save)
+        cancel_button = self.button_box.button(QDialogButtonBox.StandardButton.Cancel)
+        if save_button is not None:
+            save_button.setText("保存设置")
+            save_button.setProperty("primary", True)
+            save_button.setMinimumHeight(36)
+        if cancel_button is not None:
+            cancel_button.setText("取消")
+            cancel_button.setMinimumHeight(36)
         self.button_box.accepted.connect(self.accept)
         self.button_box.rejected.connect(self.reject)
 
@@ -282,9 +322,65 @@ class IndexSettingsDialog(QDialog):
             self.exclude_list.takeItem(row)
 
     def _set_format_preset(self, extensions: set[str] | frozenset[str]) -> None:
+        self._applying_format_preset = True
         enabled = set(extensions)
         for extension, checkbox in self.format_checkboxes.items():
             checkbox.setChecked(extension in enabled)
+        self._applying_format_preset = False
+        key = self._format_preset_key(enabled)
+        index = self.format_preset_combo.findData(key)
+        self.format_preset_combo.blockSignals(True)
+        self.format_preset_combo.setCurrentIndex(index)
+        self.format_preset_combo.blockSignals(False)
+        self._refresh_format_presentation()
+
+    @staticmethod
+    def _format_preset_key(extensions: set[str] | frozenset[str]) -> str:
+        enabled = frozenset(extensions)
+        if enabled == DEFAULT_ENABLED_INDEX_EXTENSIONS:
+            return "recommended"
+        if enabled == OFFICE_WPS_EXTENSIONS:
+            return "office"
+        if enabled == KNOWN_DOCUMENT_EXTENSIONS:
+            return "all"
+        return "custom"
+
+    def _on_format_preset_changed(self) -> None:
+        presets = {
+            "recommended": DEFAULT_ENABLED_INDEX_EXTENSIONS,
+            "office": OFFICE_WPS_EXTENSIONS,
+            "all": KNOWN_DOCUMENT_EXTENSIONS,
+        }
+        key = self.format_preset_combo.currentData()
+        if key in presets:
+            self._set_format_preset(presets[key])
+        else:
+            self._refresh_format_presentation()
+
+    def _sync_format_preset_from_checks(self) -> None:
+        if self._applying_format_preset:
+            return
+        key = self._format_preset_key(self._enabled_extensions_from_ui())
+        index = self.format_preset_combo.findData(key)
+        self.format_preset_combo.blockSignals(True)
+        self.format_preset_combo.setCurrentIndex(index)
+        self.format_preset_combo.blockSignals(False)
+        self._refresh_format_presentation()
+
+    def _refresh_format_presentation(self) -> None:
+        enabled = self._enabled_extensions_from_ui()
+        custom = self.format_preset_combo.currentData() == "custom"
+        self.format_scroll.setVisible(custom)
+        if custom:
+            self.format_summary_label.setText(
+                f"已选择 {len(enabled)} 种格式；可在下方逐项调整。"
+            )
+            return
+        examples = "、".join(sorted(enabled)[:8])
+        suffix = "…" if len(enabled) > 8 else ""
+        self.format_summary_label.setText(
+            f"已启用 {len(enabled)} 种格式：{examples}{suffix}"
+        )
 
     def _enabled_extensions_from_ui(self) -> frozenset[str]:
         return frozenset(

@@ -274,7 +274,7 @@ class MainWindow(QMainWindow):
         self.search_input.setObjectName("searchInput")
         self.search_input.setClearButtonEnabled(True)
         self.search_input.setPlaceholderText(
-            '搜索正文或直接筛选，例如：信贷 ext:pdf，或 ext:pdf after:2026-01-01'
+            "搜索文件名或正文关键词"
         )
         self.search_input.setToolTip(
             "支持：ext:pdf 类型 · path:制度 路径 · after:2026-01-01 / before:2026-09-01 日期 · "
@@ -319,6 +319,15 @@ class MainWindow(QMainWindow):
         self.choose_button = QPushButton("添加目录")
         self.refresh_button = QPushButton("刷新索引")
         self.settings_button = QPushButton("索引设置")
+        self.more_button = QToolButton()
+        self.more_button.setText("更多")
+        self.more_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        workspace_menu = QMenu(self.more_button)
+        refresh_action = workspace_menu.addAction("重新扫描全部目录")
+        refresh_action.triggered.connect(self._refresh_all_roots)
+        self.more_button.setMenu(workspace_menu)
+        self.more_button.setToolTip("不常用的索引操作")
+        self.refresh_button.setVisible(False)
         self.cancel_button = QPushButton("停止")
         self.cancel_button.setProperty("danger", True)
         for button in (
@@ -326,6 +335,7 @@ class MainWindow(QMainWindow):
             self.refresh_button,
             self.settings_button,
             self.cancel_button,
+            self.more_button,
         ):
             button.setMinimumHeight(38)
         self.cancel_button.setVisible(False)
@@ -457,8 +467,8 @@ class MainWindow(QMainWindow):
         self.workspace_bar_layout.setSpacing(6)
         self.workspace_bar_layout.addWidget(self.scope_label, 1)
         self.workspace_bar_layout.addWidget(self.choose_button)
-        self.workspace_bar_layout.addWidget(self.refresh_button)
         self.workspace_bar_layout.addWidget(self.settings_button)
+        self.workspace_bar_layout.addWidget(self.more_button)
         self.workspace_bar_layout.addWidget(self.cancel_button)
 
         layout = QVBoxLayout()

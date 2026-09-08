@@ -143,6 +143,7 @@ class MainWindow(app_base.MainWindow):
         self.help_button.setMinimumWidth(58)
         self.help_button.setToolTip("查看搜索语法、结构定位和快捷键（F1）")
         self.help_button.clicked.connect(self._show_search_help)
+        self.help_button.setVisible(False)
 
         top_bar = self.workspace_bar_layout
         insert_at = top_bar.indexOf(self.choose_button)
@@ -150,7 +151,9 @@ class MainWindow(app_base.MainWindow):
             insert_at = top_bar.count()
         top_bar.insertWidget(insert_at, self.history_button)
         top_bar.insertWidget(insert_at + 1, self.favorite_button)
-        top_bar.insertWidget(top_bar.indexOf(self.cancel_button), self.help_button)
+        if self.more_button.menu() is not None:
+            self.more_button.menu().addSeparator()
+            self.more_button.menu().addAction("搜索帮助", self._show_search_help)
 
         help_action = QAction("搜索帮助", self)
         help_action.setShortcut("F1")
@@ -297,11 +300,12 @@ class MainWindow(app_base.MainWindow):
             self.search_button,
             self.history_button,
             self.favorite_button,
-            self.help_button,
-            self.refresh_button,
             self.settings_button,
+            self.more_button,
         ):
             widget.setVisible(has_roots)
+        self.help_button.setVisible(False)
+        self.refresh_button.setVisible(False)
 
         if not has_roots:
             self.filter_chip_panel.setVisible(False)
