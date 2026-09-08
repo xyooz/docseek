@@ -6,3 +6,5 @@ __pycache__/
 build/
 dist/
 manual-test-corpus/generated/
+target/
+.DS_Store

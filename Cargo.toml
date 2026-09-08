@@ -1,0 +1,7 @@
+[workspace]
+members = [
+    "crates/docseek-core",
+    "crates/docseek-python",
+]
+resolver = "2"
+

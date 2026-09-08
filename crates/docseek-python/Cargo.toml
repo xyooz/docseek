@@ -1,0 +1,15 @@
+[package]
+name = "docseek-python"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+publish = false
+
+[lib]
+name = "docseek_rust"
+crate-type = ["cdylib"]
+
+[dependencies]
+docseek-core = { path = "../docseek-core" }
+pyo3 = { version = "0.22.6", features = ["extension-module"] }
+
