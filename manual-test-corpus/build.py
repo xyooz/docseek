@@ -14,6 +14,8 @@ FIXTURE_ROOT = REPO_ROOT / "tests" / "fixtures"
 OFFICIAL_ROOT = FIXTURE_ROOT / "official"
 WPS_ROOT = FIXTURE_ROOT / "wps"
 DEFAULT_OUTPUT = REPO_ROOT / "manual-test-corpus" / "generated"
+SENTINEL_NAME = ".docseek-manual-corpus"
+SENTINEL_CONTENT = "docseek-manual-corpus-v1\n"
 
 WPS_OLE_FIXTURES: dict[str, dict[str, Any]] = {
     "sample_writer.wps": {
@@ -137,7 +139,7 @@ def write_broken_files(root: Path) -> None:
 def record_manifest(output: Path) -> None:
     items: list[dict[str, Any]] = []
     for path in sorted(output.rglob("*")):
-        if not path.is_file() or path.name == "manifest.json":
+        if not path.is_file() or path.name in {"manifest.json", SENTINEL_NAME}:
             continue
         items.append(
             {
@@ -186,12 +188,29 @@ def write_test_plan(output: Path, xlsx_generated: bool) -> None:
     (output / "TEST_PLAN.md").write_text(text, encoding="utf-8")
 
 
+def _safe_to_clean(output: Path) -> bool:
+    default_output = DEFAULT_OUTPUT.resolve()
+    if output == default_output:
+        return True
+    marker = output / SENTINEL_NAME
+    try:
+        return marker.read_text(encoding="utf-8") == SENTINEL_CONTENT
+    except OSError:
+        return False
+
+
 def build(output: Path, *, clean: bool, large_mb: int, xlsx_rows: int) -> None:
     output = output.resolve()
     if clean and output.exists():
-        if output == REPO_ROOT.resolve():
-            raise RuntimeError("refusing to delete repository root")
+        if not _safe_to_clean(output):
+            raise RuntimeError(
+                "refusing to clean an arbitrary directory; generate it once without "
+                "--clean or use the default manual-test-corpus/generated path"
+            )
         shutil.rmtree(output)
+
+    output.mkdir(parents=True, exist_ok=True)
+    (output / SENTINEL_NAME).write_text(SENTINEL_CONTENT, encoding="utf-8")
 
     for directory in (
         "01-normal",
@@ -270,7 +289,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--clean",
         action="store_true",
-        help="remove the output directory before generating it",
+        help="remove a previously generated corpus before rebuilding it",
     )
     parser.add_argument(
         "--large-mb",
