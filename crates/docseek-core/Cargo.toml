@@ -9,3 +9,5 @@ publish = false
 name = "docseek_core"
 path = "src/lib.rs"
 
+[dependencies]
+dunce = "1.0"

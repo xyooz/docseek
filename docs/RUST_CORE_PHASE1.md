@@ -39,7 +39,10 @@ the session finishes as cancelled. The first adapter slice now lives in
 `src/docseek/scan_backend.py`; it is covered by a Python/Rust parity test but
 is deliberately not wired into the production index loop yet. The remaining
 M5 work will select the Rust controller while keeping the Python path available
-as a fallback.
+as a fallback. The adapter deliberately does not forward `max_file_size` to
+discovery: oversized candidates must still reach `DirectoryIndexer`, where the
+existing lifecycle removes stale rows and records the user-visible
+`file_too_large` issue.
 
 The repository pins the development profile in rust-toolchain.toml:
 stable Rust plus rustfmt and clippy. GitHub Actions runs the same workspace

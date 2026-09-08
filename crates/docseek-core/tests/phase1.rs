@@ -75,6 +75,7 @@ fn scanner_filters_candidates_and_preserves_priority_lanes() {
         !candidate.path.to_string_lossy().contains(".git")
             && !candidate.path.to_string_lossy().ends_with(".tmp")
             && !candidate.path.to_string_lossy().contains("~$")
+            && !candidate.path.to_string_lossy().starts_with("\\\\?\\")
     }));
 
     let snapshot = session.snapshot().expect("snapshot exists");

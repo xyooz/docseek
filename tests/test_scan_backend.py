@@ -19,6 +19,7 @@ from docseek.scan_backend import (  # noqa: E402
     PythonScanBackend,
     RustScanBackend,
     ScanConfig,
+    ScanCancelled,
     iter_scan_candidates,
 )
 
@@ -152,6 +153,7 @@ class PythonScanBackendTests(unittest.TestCase):
                     "modern.docx",
                     "notes.txt",
                     "reporta.txt",
+                    "oversize.txt",
                     "项目资料/说明.txt",
                     "legacy.wps",
                     "book.epub",
@@ -177,8 +179,22 @@ class PythonScanBackendTests(unittest.TestCase):
             )
             self.assertEqual(
                 (python_progress.candidates_emitted, rust_progress.candidates_emitted),
-                (7, 7),
+                (8, 8),
             )
+
+    def test_rust_cancel_translates_to_scan_cancelled(self) -> None:
+        if docseek_rust is None:
+            self.skipTest("docseek_rust wheel is not installed")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "docs"
+            root.mkdir()
+            _write(root / "document.txt")
+
+            session = RustScanBackend().start_scan(root)
+            self.assertTrue(session.cancel())
+            with self.assertRaises(ScanCancelled):
+                session.next_batch()
 
 
 if __name__ == "__main__":

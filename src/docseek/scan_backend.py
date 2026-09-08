@@ -62,6 +62,9 @@ class ScanConfig:
     ignored_dir_names: Iterable[str] | None = None
     excluded_paths: Iterable[Path] | None = None
     excluded_file_patterns: Iterable[str] | None = None
+    # Retained as shared index configuration. Discovery deliberately does not
+    # enforce this limit: DirectoryIndexer must see oversized candidates so it
+    # can remove stale rows and record the user-visible file_too_large issue.
     max_file_size: int | None = DEFAULT_MAX_FILE_SIZE
 
     def __post_init__(self) -> None:
@@ -272,13 +275,6 @@ class PythonScanSession:
                                 path, self._config.excluded_file_patterns
                             ):
                                 continue
-                            metadata = entry.stat(follow_symlinks=True)
-                            if (
-                                self._config.max_file_size is not None
-                                and metadata.st_size > self._config.max_file_size
-                            ):
-                                continue
-
                             self._progress.candidates_discovered += 1
                             yield path
                         except OSError:
@@ -311,7 +307,7 @@ class RustScanSession:
     def next_batch(self, max_items: int = MAX_SCAN_BATCH_SIZE) -> ScanBatch:
         try:
             batch = self._session.next_batch(max_items)
-        except KeyboardInterrupt as exc:
+        except InterruptedError as exc:
             raise ScanCancelled("scan cancelled") from exc
         return ScanBatch(
             candidates=[Path(path) for path in batch.candidates],
@@ -355,7 +351,10 @@ class RustScanBackend:
             sorted(config.ignored_dir_names),
             list(config.excluded_paths),
             list(config.excluded_file_patterns),
-            config.max_file_size,
+            # Keep file-size policy in DirectoryIndexer. If this value is
+            # forwarded, discovery would swallow oversized files before the
+            # indexer can remove stale rows and record file_too_large.
+            None,
         )
         return RustScanSession(session)
 

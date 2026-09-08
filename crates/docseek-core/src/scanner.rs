@@ -30,6 +30,9 @@ pub struct ScannerConfig {
     pub ignored_dir_names: BTreeSet<String>,
     pub excluded_paths: Vec<PathBuf>,
     pub excluded_file_patterns: Vec<String>,
+    /// Optional standalone scanner limit. The Python backend adapter leaves
+    /// this unset so the Python indexer can apply its lifecycle policy and
+    /// record oversized-file issues.
     pub max_file_size: Option<u64>,
 }
 
@@ -43,7 +46,7 @@ impl Default for ScannerConfig {
                 .collect(),
             excluded_paths: Vec::new(),
             excluded_file_patterns: Vec::new(),
-            max_file_size: Some(200 * 1024 * 1024),
+            max_file_size: None,
         }
     }
 }
@@ -181,8 +184,7 @@ impl Scanner {
         progress: Arc<Mutex<ScanProgress>>,
     ) -> Result<DiscoverySession, CoreError> {
         let requested_root = root.as_ref().to_path_buf();
-        let root = requested_root
-            .canonicalize()
+        let root = dunce::canonicalize(&requested_root)
             .map_err(|source| CoreError::io(requested_root.clone(), source))?;
         let metadata = fs::metadata(&root).map_err(|source| CoreError::io(&root, source))?;
         if !metadata.is_dir() {
@@ -314,7 +316,11 @@ impl DiscoverySession {
     }
 
     fn inspect_entry(&mut self, entry: DirEntry) -> Result<Option<Candidate>, CoreError> {
-        let path = entry.path();
+        // Keep the path used for the external candidate contract separate from
+        // canonicalized identity paths. In particular, std::fs::canonicalize
+        // on Windows returns a `\\?\\` verbatim path; that prefix must not
+        // leak into Python or SQLite path strings.
+        let path = external_path(&entry.path());
         self.update_progress(|progress| progress.current_path = Some(path.clone()));
         if self.is_excluded_path(&path) {
             return Ok(None);
@@ -435,15 +441,22 @@ impl DiscoverySession {
 }
 
 fn normalize_path(path: &Path) -> PathBuf {
-    path.canonicalize().unwrap_or_else(|_| {
-        if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            std::env::current_dir()
-                .map(|current| current.join(path))
-                .unwrap_or_else(|_| path.to_path_buf())
-        }
-    })
+    dunce::canonicalize(path)
+        .map(|resolved| external_path(&resolved))
+        .unwrap_or_else(|_| {
+            let absolute = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                std::env::current_dir()
+                    .map(|current| current.join(path))
+                    .unwrap_or_else(|_| path.to_path_buf())
+            };
+            external_path(&absolute)
+        })
+}
+
+fn external_path(path: &Path) -> PathBuf {
+    dunce::simplified(path).to_path_buf()
 }
 
 fn is_under(path: &Path, parent: &Path) -> bool {
