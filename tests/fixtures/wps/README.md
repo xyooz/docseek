@@ -27,4 +27,4 @@ These fixtures prove compatibility only for the represented WPS variants. Templa
 | `DocSeek-DPS-native.dps` | 37,181 B | `0b2e817b2e22c91e1c81e262fdf803b816759bccde68b061df22a6c322a5f537` | `DocSeek DPS native fixture`, `WPS presentation regression sample` |
 | `DocSeek-DPT-native.dpt` | 37,181 B | `2b032a165c4883c5b02009a86c754871c4568d05fde70a136f8cc45c42935518` | same presentation payload; template extension |
 
-WPS 的公开格式列表中常见的是 `.wps/.wpt`、`.et/.ett`、`.dps/.dpt`；`.etx` 和 `.ettx` 不是当前 WPS Office 常规保存格式，因此没有伪造后缀样例。若后续拿到真实脱敏文件，再单独补充。
+WPS 官方公开格式列表中列出了 `.wps/.wpt`、`.et/.ett`、`.dps/.dpt`，但没有列出 `.etx` 或 `.ettx`；因此这里没有把 `.et` 简单改名后冒充真实样例。若后续拿到真实脱敏文件，再单独补充。
