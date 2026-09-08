@@ -36,8 +36,11 @@ without changing parsers, chunk writing, or SQLite ownership. A missing Rust
 module falls back to the Python backend with a warning. The opt-in production
 switch is `DOCSEEK_SCAN_BACKEND=rust`; the default is `python`.
 `JobController.start_scan()` accepts the scanner configuration fields and
-exposes a bounded `ScanSession.next_batch()` API; each batch is capped at 128
-candidates and carries a progress snapshot.
+exposes a bounded `ScanSession.next_batch()` API. Each batch is capped at 128
+candidates, or 2,000 filesystem work items when a sparse tree needs a progress
+pulse. A batch carries both a progress snapshot and drained `ScanIssue` values
+so permission and filesystem failures retain the existing Python index issue
+and `stats.skipped` semantics.
 The terminal batch is empty and marked `finished`, so callers can process every
 candidate batch before stopping.
 Cancellation is idempotent and reports the `cancelling` lifecycle state before

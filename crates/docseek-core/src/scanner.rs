@@ -1,5 +1,6 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::{self, DirEntry, ReadDir};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -7,6 +8,7 @@ use crate::candidate::{known_extensions, normalize_extension};
 use crate::{CancellationToken, Candidate, CoreError};
 
 pub const MAX_SCAN_BATCH_SIZE: usize = 128;
+pub const MAX_SCAN_WORK_ITEMS: usize = 2_000;
 
 const DEFAULT_IGNORED_DIR_NAMES: &[&str] = &[
     ".git",
@@ -87,10 +89,11 @@ pub struct ScanReport {
     pub errors: usize,
     pub finished: bool,
     pub current_path: Option<PathBuf>,
+    pub issues: Vec<ScanIssue>,
 }
 
 impl ScanReport {
-    pub(crate) fn from_progress(progress: &ScanProgress) -> Self {
+    pub(crate) fn from_progress(progress: &ScanProgress, issues: Vec<ScanIssue>) -> Self {
         Self {
             directories_seen: progress.directories_seen,
             files_seen: progress.files_seen,
@@ -100,8 +103,16 @@ impl ScanReport {
             errors: progress.errors,
             finished: true,
             current_path: progress.current_path.clone(),
+            issues,
         }
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScanIssue {
+    pub path: PathBuf,
+    pub error_code: String,
+    pub detail: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -109,6 +120,7 @@ pub struct ScanBatch {
     pub candidates: Vec<Candidate>,
     pub finished: bool,
     pub progress: ScanProgress,
+    pub issues: Vec<ScanIssue>,
 }
 
 #[derive(Clone, Debug)]
@@ -121,6 +133,7 @@ pub(crate) struct DiscoveryBatch {
     pub candidates: Vec<Candidate>,
     pub finished: bool,
     pub progress: ScanProgress,
+    pub issues: Vec<ScanIssue>,
 }
 
 pub(crate) struct DiscoverySession {
@@ -131,8 +144,22 @@ pub(crate) struct DiscoverySession {
     visited_directories: HashSet<PathBuf>,
     cancellation: CancellationToken,
     progress: Arc<Mutex<ScanProgress>>,
+    pending_issues: Vec<ScanIssue>,
+    work_items: usize,
+    current_directory: Option<PathBuf>,
     exhausted: bool,
     finished: bool,
+}
+
+enum NextCandidate {
+    Candidate(Option<Candidate>),
+    WorkBudget,
+}
+
+enum OpenDirectory {
+    Opened,
+    WorkBudget,
+    Exhausted,
 }
 
 impl Scanner {
@@ -172,10 +199,12 @@ impl Scanner {
     ) -> Result<ScanReport, CoreError> {
         let progress = Arc::new(Mutex::new(ScanProgress::default()));
         let mut session = self.start_session_with_progress(root, cancellation.clone(), progress)?;
+        let mut issues = Vec::new();
         loop {
             let batch = session.next_candidates(MAX_SCAN_BATCH_SIZE)?;
+            issues.extend(batch.issues);
             if batch.finished {
-                return Ok(ScanReport::from_progress(&batch.progress));
+                return Ok(ScanReport::from_progress(&batch.progress, issues));
             }
         }
     }
@@ -219,6 +248,9 @@ impl Scanner {
             visited_directories,
             cancellation,
             progress,
+            pending_issues: Vec::new(),
+            work_items: 0,
+            current_directory: None,
             exhausted: root_excluded,
             finished: false,
         })
@@ -249,15 +281,18 @@ impl DiscoverySession {
                 candidates: Vec::new(),
                 finished: true,
                 progress: self.progress_snapshot(),
+                issues: Vec::new(),
             });
         }
 
+        self.work_items = 0;
         let mut candidates = Vec::with_capacity(batch_size);
         while candidates.len() < batch_size && !self.exhausted {
             self.cancellation.checkpoint()?;
             match self.next_candidate()? {
-                Some(candidate) => candidates.push(candidate),
-                None => self.exhausted = true,
+                NextCandidate::Candidate(Some(candidate)) => candidates.push(candidate),
+                NextCandidate::Candidate(None) => self.exhausted = true,
+                NextCandidate::WorkBudget => break,
             }
         }
         if self.exhausted && candidates.is_empty() {
@@ -267,10 +302,12 @@ impl DiscoverySession {
             progress.candidates_emitted =
                 progress.candidates_emitted.saturating_add(candidates.len());
         });
+        let issues = std::mem::take(&mut self.pending_issues);
         Ok(DiscoveryBatch {
             candidates,
             finished: self.finished,
             progress: self.progress_snapshot(),
+            issues,
         })
     }
 
@@ -278,11 +315,20 @@ impl DiscoverySession {
         self.progress_snapshot()
     }
 
-    fn next_candidate(&mut self) -> Result<Option<Candidate>, CoreError> {
+    fn next_candidate(&mut self) -> Result<NextCandidate, CoreError> {
         loop {
             self.cancellation.checkpoint()?;
-            if self.current_entries.is_none() && !self.open_next_directory()? {
-                return Ok(None);
+            if self.work_items >= MAX_SCAN_WORK_ITEMS {
+                return Ok(NextCandidate::WorkBudget);
+            }
+            if self.current_entries.is_none() {
+                match self.open_next_directory()? {
+                    OpenDirectory::Opened => {}
+                    OpenDirectory::WorkBudget => return Ok(NextCandidate::WorkBudget),
+                    OpenDirectory::Exhausted => {
+                        return Ok(NextCandidate::Candidate(None));
+                    }
+                }
             }
 
             let next_entry = self
@@ -291,12 +337,24 @@ impl DiscoverySession {
                 .and_then(|entries| entries.next());
             match next_entry {
                 Some(Ok(entry)) => {
+                    self.work_items += 1;
                     if let Some(candidate) = self.inspect_entry(entry)? {
-                        return Ok(Some(candidate));
+                        return Ok(NextCandidate::Candidate(Some(candidate)));
+                    }
+                    if self.work_items >= MAX_SCAN_WORK_ITEMS {
+                        return Ok(NextCandidate::WorkBudget);
                     }
                 }
-                Some(Err(_)) => {
-                    self.update_progress(|progress| progress.errors += 1);
+                Some(Err(error)) => {
+                    self.work_items += 1;
+                    let path = self
+                        .current_directory
+                        .clone()
+                        .unwrap_or_else(|| PathBuf::from("."));
+                    self.record_issue(path, &error);
+                    if self.work_items >= MAX_SCAN_WORK_ITEMS {
+                        return Ok(NextCandidate::WorkBudget);
+                    }
                 }
                 None => {
                     self.current_entries = None;
@@ -305,21 +363,29 @@ impl DiscoverySession {
         }
     }
 
-    fn open_next_directory(&mut self) -> Result<bool, CoreError> {
+    fn open_next_directory(&mut self) -> Result<OpenDirectory, CoreError> {
         while let Some(directory) = self.pending_directories.pop() {
             self.cancellation.checkpoint()?;
+            if self.work_items >= MAX_SCAN_WORK_ITEMS {
+                return Ok(OpenDirectory::WorkBudget);
+            }
+            self.work_items += 1;
+            self.current_directory = Some(directory.clone());
             self.update_progress(|progress| progress.current_path = Some(directory.clone()));
             match fs::read_dir(&directory) {
                 Ok(entries) => {
                     self.current_entries = Some(entries);
-                    return Ok(true);
+                    return Ok(OpenDirectory::Opened);
                 }
-                Err(_) => {
-                    self.update_progress(|progress| progress.errors += 1);
+                Err(error) => {
+                    self.record_issue(external_path(&directory), &error);
+                    if self.work_items >= MAX_SCAN_WORK_ITEMS {
+                        return Ok(OpenDirectory::WorkBudget);
+                    }
                 }
             }
         }
-        Ok(false)
+        Ok(OpenDirectory::Exhausted)
     }
 
     fn inspect_entry(&mut self, entry: DirEntry) -> Result<Option<Candidate>, CoreError> {
@@ -336,8 +402,8 @@ impl DiscoverySession {
 
         let file_type = match entry.file_type() {
             Ok(file_type) => file_type,
-            Err(_) => {
-                self.update_progress(|progress| progress.errors += 1);
+            Err(error) => {
+                self.record_issue(path, &error);
                 return Ok(None);
             }
         };
@@ -345,8 +411,8 @@ impl DiscoverySession {
         let followed_metadata = if is_symlink {
             match fs::metadata(&path) {
                 Ok(metadata) => Some(metadata),
-                Err(_) => {
-                    self.update_progress(|progress| progress.errors += 1);
+                Err(error) => {
+                    self.record_issue(path, &error);
                     return Ok(None);
                 }
             }
@@ -397,8 +463,8 @@ impl DiscoverySession {
             Some(metadata) => metadata,
             None => match entry.metadata() {
                 Ok(metadata) => metadata,
-                Err(_) => {
-                    self.update_progress(|progress| progress.errors += 1);
+                Err(error) => {
+                    self.record_issue(path, &error);
                     return Ok(None);
                 }
             },
@@ -443,11 +509,28 @@ impl DiscoverySession {
         update(&mut progress);
     }
 
+    fn record_issue(&mut self, path: PathBuf, error: &io::Error) {
+        self.update_progress(|progress| progress.errors += 1);
+        self.pending_issues.push(ScanIssue {
+            path,
+            error_code: io_error_code(error).to_owned(),
+            detail: error.to_string(),
+        });
+    }
+
     fn progress_snapshot(&self) -> ScanProgress {
         self.progress
             .lock()
             .expect("scan progress mutex poisoned")
             .clone()
+    }
+}
+
+fn io_error_code(error: &io::Error) -> &'static str {
+    match error.kind() {
+        io::ErrorKind::PermissionDenied => "permission_denied",
+        io::ErrorKind::NotFound => "file_not_found",
+        _ => "os_error",
     }
 }
 

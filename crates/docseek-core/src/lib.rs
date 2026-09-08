@@ -16,6 +16,7 @@ pub use candidate::{priority_for_extension, Candidate, CandidatePriority};
 pub use controller::{JobController, JobId, JobKind, JobSnapshot, JobState, ScanSession};
 pub use error::CoreError;
 pub use scanner::{
-    ScanBatch, ScanProgress, ScanReport, Scanner, ScannerConfig, MAX_SCAN_BATCH_SIZE,
+    ScanBatch, ScanIssue, ScanProgress, ScanReport, Scanner, ScannerConfig, MAX_SCAN_BATCH_SIZE,
+    MAX_SCAN_WORK_ITEMS,
 };
 pub use scheduler::CandidateScheduler;

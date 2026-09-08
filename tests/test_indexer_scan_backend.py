@@ -25,6 +25,7 @@ from docseek.scan_backend import (
     RustScanBackendUnavailable,
     ScanBatch,
     ScanCancelled,
+    ScanIssue,
     ScanProgress,
     resolve_scan_backend,
 )
@@ -66,6 +67,41 @@ class _BlockingBackend:
         self.session = _BlockingSession()
 
     def start_scan(self, _root: Path, _config):
+        return self.session
+
+
+class _IssueSession:
+    def __init__(self, root: Path) -> None:
+        self._root = root
+        self._returned = False
+
+    def next_batch(self, _max_items: int = 128) -> ScanBatch:
+        if self._returned:
+            return ScanBatch([], True, ScanProgress(current_path=self._root))
+        self._returned = True
+        return ScanBatch(
+            [],
+            True,
+            ScanProgress(current_path=self._root, errors=1),
+            [ScanIssue(self._root / "denied", "permission_denied", "denied by test")],
+        )
+
+    def cancel(self) -> bool:
+        return False
+
+    def snapshot(self) -> ScanProgress:
+        return ScanProgress(current_path=self._root)
+
+    def is_finished(self) -> bool:
+        return self._returned
+
+
+class _IssueBackend:
+    def __init__(self) -> None:
+        self.session: _IssueSession | None = None
+
+    def start_scan(self, root: Path, _config):
+        self.session = _IssueSession(root)
         return self.session
 
 
@@ -199,6 +235,26 @@ class DirectoryIndexerScanControlTests(unittest.TestCase):
 
             self.assertEqual(stats.indexed, 1)
             self.assertIsInstance(indexer.scan_backend, PythonScanBackend)
+
+    def test_discovery_issue_is_recorded_and_counted_as_skipped(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            root = base / "docs"
+            root.mkdir()
+            database = SearchDatabase(base / "index.db")
+            indexer = DirectoryIndexer(
+                database,
+                scan_backend=_IssueBackend(),
+            )
+
+            stats = indexer.scan(root)
+
+            self.assertEqual(stats.skipped, 1)
+            issues = IndexIssueStore(database.db_path).list()
+            self.assertEqual(
+                [(issue.path, issue.error_code, issue.detail) for issue in issues],
+                [(str((root / "denied").resolve()), "permission_denied", "denied by test")],
+            )
 
     def test_backend_resolver_keeps_rust_opt_in(self) -> None:
         self.assertIsInstance(resolve_scan_backend("python"), PythonScanBackend)

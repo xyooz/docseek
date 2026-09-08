@@ -7,8 +7,8 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use docseek_core::{
-    CoreError, JobController, JobSnapshot, JobState, ScanBatch, ScanSession as CoreScanSession,
-    ScannerConfig,
+    CoreError, JobController, JobSnapshot, JobState, ScanBatch, ScanIssue,
+    ScanSession as CoreScanSession, ScannerConfig,
 };
 use pyo3::exceptions::{PyInterruptedError, PyRuntimeError};
 use pyo3::prelude::*;
@@ -146,6 +146,29 @@ pub struct PyScanBatch {
     pub errors: usize,
     #[pyo3(get)]
     pub current_path: Option<String>,
+    #[pyo3(get)]
+    pub issues: Vec<PyScanIssue>,
+}
+
+#[pyclass(name = "ScanIssue")]
+#[derive(Clone)]
+pub struct PyScanIssue {
+    #[pyo3(get)]
+    pub path: String,
+    #[pyo3(get)]
+    pub error_code: String,
+    #[pyo3(get)]
+    pub detail: String,
+}
+
+impl From<ScanIssue> for PyScanIssue {
+    fn from(issue: ScanIssue) -> Self {
+        Self {
+            path: path_to_string(issue.path),
+            error_code: issue.error_code,
+            detail: issue.detail,
+        }
+    }
 }
 
 impl From<ScanBatch> for PyScanBatch {
@@ -165,6 +188,7 @@ impl From<ScanBatch> for PyScanBatch {
             excluded: progress.excluded,
             errors: progress.errors,
             current_path: optional_path_to_string(progress.current_path),
+            issues: batch.issues.into_iter().map(Into::into).collect(),
         }
     }
 }
@@ -258,6 +282,7 @@ fn docseek_rust(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyJobController>()?;
     module.add_class::<PyJobSnapshot>()?;
     module.add_class::<PyScanBatch>()?;
+    module.add_class::<PyScanIssue>()?;
     module.add_class::<PyScanSession>()?;
     Ok(())
 }

@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use docseek_core::{
     Candidate, CandidatePriority, CandidateScheduler, CoreError, JobController, JobState,
-    ScanSession, ScannerConfig, MAX_SCAN_BATCH_SIZE,
+    ScanSession, ScannerConfig, MAX_SCAN_BATCH_SIZE, MAX_SCAN_WORK_ITEMS,
 };
 
 fn temp_root(label: &str) -> PathBuf {
@@ -308,12 +308,50 @@ fn scanner_continues_after_a_broken_directory_entry() {
     let mut session = controller
         .start_scan(&root, ScannerConfig::default())
         .expect("scan starts");
-    let candidates = collect_candidates(&mut session, 128).expect("scan succeeds");
-    assert_eq!(candidates.len(), 1);
+    let batch = session.next_batch(128).expect("scan succeeds");
+    assert_eq!(batch.candidates.len(), 1);
+    assert_eq!(batch.issues.len(), 1);
+    assert_eq!(batch.issues[0].error_code, "file_not_found");
+    assert_eq!(
+        batch.issues[0].path,
+        dunce::canonicalize(&root)
+            .expect("canonical root")
+            .join("broken.txt")
+    );
     assert_eq!(
         controller.last_snapshot().expect("snapshot exists").errors,
         1
     );
+
+    fs::remove_dir_all(root).expect("remove fixture");
+}
+
+#[test]
+fn scanner_returns_a_progress_pulse_for_sparse_directories() {
+    let root = temp_root("sparse");
+    fs::create_dir_all(&root).expect("create root");
+    for index in 0..=MAX_SCAN_WORK_ITEMS {
+        write_file(
+            &root.join(format!("noncandidate-{index:04}.bin")),
+            "content",
+        );
+    }
+
+    let controller = JobController::new();
+    let mut session = controller
+        .start_scan(
+            &root,
+            ScannerConfig {
+                enabled_extensions: [".txt".to_owned()].into_iter().collect(),
+                ..ScannerConfig::default()
+            },
+        )
+        .expect("scan starts");
+    let batch = session.next_batch(1).expect("progress pulse succeeds");
+
+    assert!(batch.candidates.is_empty());
+    assert!(!batch.finished);
+    assert!(batch.progress.files_seen >= MAX_SCAN_WORK_ITEMS - 1);
 
     fs::remove_dir_all(root).expect("remove fixture");
 }

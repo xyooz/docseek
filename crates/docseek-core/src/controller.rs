@@ -267,6 +267,7 @@ impl ScanSession {
                 candidates: Vec::new(),
                 finished: true,
                 progress: self.inner.snapshot(),
+                issues: Vec::new(),
             });
         }
 
@@ -292,6 +293,7 @@ impl ScanSession {
                     candidates,
                     finished: discovery_batch.finished,
                     progress,
+                    issues: discovery_batch.issues,
                 })
             }
             Err(error) => {

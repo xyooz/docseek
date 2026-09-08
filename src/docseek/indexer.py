@@ -45,6 +45,7 @@ from .scan_backend import (
     ScanBackend,
     ScanCancelled,
     ScanConfig,
+    ScanIssue,
     ScanSession,
     iter_scan_candidates,
     resolve_scan_backend,
@@ -995,12 +996,21 @@ class DirectoryIndexer:
             if discovery_callback is not None:
                 discovery_callback(path, count)
 
+        def report_backend_issues(issues: list[ScanIssue]) -> None:
+            for issue in issues:
+                normalized = self._normalize(issue.path)
+                discovery_issue_records.append(
+                    (normalized, issue.error_code, issue.detail)
+                )
+                stats.skipped += 1
+
         scan_session = self._start_scan_session(root)
         discovery = iter_scan_candidates(
             scan_session,
             max_items=MAX_SCAN_BATCH_SIZE,
             on_discovery=report_backend_discovery,
             on_progress=lambda progress: setattr(stats, "excluded", progress.excluded),
+            on_issues=report_backend_issues,
         )
         normalized_directories = {root: self._normalize(root)}
 

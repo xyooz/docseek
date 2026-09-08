@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable, Iterator, Protocol
 
@@ -12,6 +12,10 @@ from .index_priority import prioritize_index_candidates
 
 
 MAX_SCAN_BATCH_SIZE = 128
+# A batch may return before the candidate cap when traversal has done this much
+# filesystem work.  Sparse trees therefore still publish progress and give
+# callers a cancellation boundary even when almost every entry is filtered.
+MAX_SCAN_WORK_ITEMS = 2_000
 DEFAULT_MAX_FILE_SIZE = 200 * 1024 * 1024
 DEFAULT_IGNORED_DIR_NAMES = frozenset(
     {
@@ -38,6 +42,13 @@ class ScanCancelled(RuntimeError):
 
 class RustScanBackendUnavailable(RuntimeError):
     """Raised when the optional PyO3 module is not installed."""
+
+
+@dataclass(slots=True, frozen=True)
+class ScanIssue:
+    path: Path
+    error_code: str
+    detail: str
 
 
 def _safe_resolve(path: Path) -> Path:
@@ -124,6 +135,7 @@ class ScanBatch:
     candidates: list[Path]
     finished: bool
     progress: ScanProgress
+    issues: list[ScanIssue] = field(default_factory=list)
 
 
 class ScanSession(Protocol):
@@ -162,6 +174,19 @@ class _MutableProgress:
         )
 
 
+@dataclass(slots=True, frozen=True)
+class _ScanProgressPulse:
+    """Internal marker for a batch that only advances filesystem progress."""
+
+
+def _scan_error_code(exc: OSError) -> str:
+    if isinstance(exc, PermissionError):
+        return "permission_denied"
+    if isinstance(exc, FileNotFoundError):
+        return "file_not_found"
+    return "os_error"
+
+
 class PythonScanSession:
     def __init__(self, root: Path, config: ScanConfig) -> None:
         self._root = _safe_resolve(Path(root))
@@ -175,6 +200,7 @@ class PythonScanSession:
         )
         self._finished = False
         self._exhausted = False
+        self._pending_issues: list[ScanIssue] = []
         self._candidates = self._iter_candidates()
 
     def next_batch(self, max_items: int = MAX_SCAN_BATCH_SIZE) -> ScanBatch:
@@ -189,9 +215,13 @@ class PythonScanSession:
             while len(candidates) < batch_size and not self._exhausted:
                 self._checkpoint()
                 try:
-                    candidates.append(next(self._candidates))
+                    item = next(self._candidates)
                 except StopIteration:
                     self._exhausted = True
+                    break
+                if isinstance(item, _ScanProgressPulse):
+                    break
+                candidates.append(item)
         except ScanCancelled:
             self._finished = True
             raise
@@ -200,7 +230,9 @@ class PythonScanSession:
             self._finished = True
         self._progress.candidates_emitted += len(candidates)
         ordered = list(prioritize_index_candidates(candidates))
-        return ScanBatch(ordered, self._finished, self._progress.snapshot())
+        issues = self._pending_issues
+        self._pending_issues = []
+        return ScanBatch(ordered, self._finished, self._progress.snapshot(), issues)
 
     def cancel(self) -> bool:
         if self._finished:
@@ -218,6 +250,12 @@ class PythonScanSession:
         if self._cancel.is_set():
             raise ScanCancelled("scan cancelled")
 
+    def _record_issue(self, path: Path, exc: OSError) -> None:
+        self._progress.errors += 1
+        self._pending_issues.append(
+            ScanIssue(path, _scan_error_code(exc), str(exc))
+        )
+
     def _is_excluded(self, path: Path) -> bool:
         if not self._config.excluded_paths:
             return False
@@ -227,14 +265,19 @@ class PythonScanSession:
             for excluded in self._config.excluded_paths
         )
 
-    def _iter_candidates(self) -> Iterator[Path]:
+    def _iter_candidates(self) -> Iterator[Path | _ScanProgressPulse]:
         pending_directories = [self._root]
         visited_directories = {self._root}
+        work_items = 0
         while pending_directories:
             self._checkpoint()
             directory = pending_directories.pop()
+            work_items += 1
             if self._is_excluded(directory):
                 self._progress.excluded += 1
+                if work_items >= MAX_SCAN_WORK_ITEMS:
+                    work_items = 0
+                    yield _ScanProgressPulse()
                 continue
             self._progress.current_path = directory
             try:
@@ -245,17 +288,22 @@ class PythonScanSession:
                             entry = next(entries)
                         except StopIteration:
                             break
-                        except OSError:
-                            self._progress.errors += 1
+                        except OSError as exc:
+                            self._record_issue(directory, exc)
+                            work_items += 1
+                            if work_items >= MAX_SCAN_WORK_ITEMS:
+                                work_items = 0
+                                yield _ScanProgressPulse()
                             break
 
+                        work_items += 1
                         path = Path(entry.path)
                         self._progress.current_path = path
+                        candidate: Path | None = None
                         try:
                             if self._is_excluded(path):
                                 self._progress.excluded += 1
-                                continue
-                            if entry.is_dir():
+                            elif entry.is_dir():
                                 name = entry.name.casefold()
                                 if name not in self._config.ignored_dir_names:
                                     identity = (
@@ -267,26 +315,33 @@ class PythonScanSession:
                                         visited_directories.add(identity)
                                         pending_directories.append(path)
                                         self._progress.directories_seen += 1
-                                continue
-                            if not entry.is_file():
-                                continue
-
-                            self._progress.files_seen += 1
-                            if entry.name.startswith("~$") or entry.name.endswith(".tmp"):
-                                continue
-                            if path.suffix.lower() not in self._config.enabled_extensions:
-                                continue
-                            if matches_file_exclusion(
-                                path, self._config.excluded_file_patterns
-                            ):
-                                self._progress.excluded += 1
-                                continue
-                            self._progress.candidates_discovered += 1
-                            yield path
-                        except OSError:
-                            self._progress.errors += 1
-            except OSError:
-                self._progress.errors += 1
+                            elif entry.is_file():
+                                self._progress.files_seen += 1
+                                if (
+                                    not entry.name.startswith("~$")
+                                    and not entry.name.endswith(".tmp")
+                                    and path.suffix.lower()
+                                    in self._config.enabled_extensions
+                                ):
+                                    if matches_file_exclusion(
+                                        path, self._config.excluded_file_patterns
+                                    ):
+                                        self._progress.excluded += 1
+                                    else:
+                                        self._progress.candidates_discovered += 1
+                                        candidate = path
+                        except OSError as exc:
+                            self._record_issue(path, exc)
+                        if candidate is not None:
+                            yield candidate
+                        if work_items >= MAX_SCAN_WORK_ITEMS:
+                            work_items = 0
+                            yield _ScanProgressPulse()
+            except OSError as exc:
+                self._record_issue(directory, exc)
+                if work_items >= MAX_SCAN_WORK_ITEMS:
+                    work_items = 0
+                    yield _ScanProgressPulse()
 
 
 class PythonScanBackend:
@@ -326,6 +381,14 @@ class RustScanSession:
             candidates=[Path(path) for path in batch.candidates],
             finished=bool(batch.finished),
             progress=_progress_from_rust(batch),
+            issues=[
+                ScanIssue(
+                    Path(issue.path),
+                    str(issue.error_code),
+                    str(issue.detail),
+                )
+                for issue in getattr(batch, "issues", ())
+            ],
         )
 
     def cancel(self) -> bool:
@@ -392,6 +455,7 @@ def iter_scan_candidates(
     max_items: int = MAX_SCAN_BATCH_SIZE,
     on_discovery: Callable[[Path, int], None] | None = None,
     on_progress: Callable[[ScanProgress], None] | None = None,
+    on_issues: Callable[[list[ScanIssue]], None] | None = None,
 ) -> Iterator[Path]:
     """Replay session batches through the existing discovery callback shape."""
 
@@ -409,6 +473,8 @@ def iter_scan_candidates(
         batch = session.next_batch(max_items)
         if on_progress is not None:
             on_progress(batch.progress)
+        if on_issues is not None and batch.issues:
+            on_issues(batch.issues)
         if on_discovery is not None and batch.progress.current_path is not None:
             on_discovery(
                 batch.progress.current_path,
@@ -423,6 +489,7 @@ __all__ = [
     "DEFAULT_IGNORED_DIR_NAMES",
     "DEFAULT_MAX_FILE_SIZE",
     "MAX_SCAN_BATCH_SIZE",
+    "MAX_SCAN_WORK_ITEMS",
     "PythonScanBackend",
     "PythonScanSession",
     "RustScanBackend",
@@ -434,6 +501,7 @@ __all__ = [
     "ScanConfig",
     "ScanProgress",
     "ScanSession",
+    "ScanIssue",
     "resolve_scan_backend",
     "iter_scan_candidates",
 ]

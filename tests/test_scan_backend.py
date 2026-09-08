@@ -6,6 +6,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
@@ -18,10 +19,12 @@ except ImportError:
 from docseek.scan_backend import (  # noqa: E402
     DEFAULT_IGNORED_DIR_NAMES,
     MAX_SCAN_BATCH_SIZE,
+    MAX_SCAN_WORK_ITEMS,
     PythonScanBackend,
     RustScanBackend,
     ScanConfig,
     ScanCancelled,
+    ScanIssue,
     iter_scan_candidates,
 )
 from docseek.index_priority import prioritize_index_candidates  # noqa: E402
@@ -84,6 +87,60 @@ class PythonScanBackendTests(unittest.TestCase):
             )
             self.assertEqual(batches[-1].finished, True)
             self.assertEqual(batches[-1].progress.candidates_emitted, 300)
+
+    def test_sparse_scan_returns_progress_pulses_before_candidates(self) -> None:
+        backends = [PythonScanBackend()]
+        if docseek_rust is not None:
+            backends.append(RustScanBackend())
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            for backend in backends:
+                root = Path(temp_dir) / backend.__class__.__name__
+                root.mkdir()
+                for index in range(MAX_SCAN_WORK_ITEMS + 1):
+                    (root / f"noncandidate-{index:04d}.bin").touch()
+
+                progress_events = []
+                paths = list(
+                    iter_scan_candidates(
+                        backend.start_scan(root, ScanConfig(enabled_extensions=[".txt"])),
+                        on_progress=progress_events.append,
+                    )
+                )
+
+                self.assertEqual(paths, [])
+                self.assertGreaterEqual(len(progress_events), 3)
+                self.assertTrue(
+                    any(
+                        MAX_SCAN_WORK_ITEMS - 1 <= progress.files_seen < MAX_SCAN_WORK_ITEMS + 1
+                        for progress in progress_events
+                    )
+                )
+
+    def test_scan_issues_are_drained_with_the_batch(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "docs"
+            root.mkdir()
+            backend = PythonScanBackend()
+            session = backend.start_scan(root)
+            issues: list[ScanIssue] = []
+
+            with patch(
+                "docseek.scan_backend.os.scandir",
+                side_effect=PermissionError("denied by test"),
+            ):
+                paths = list(
+                    iter_scan_candidates(
+                        session,
+                        on_issues=issues.extend,
+                    )
+                )
+
+            self.assertEqual(paths, [])
+            self.assertEqual(
+                [(issue.path, issue.error_code, issue.detail) for issue in issues],
+                [(root.resolve(), "permission_denied", "denied by test")],
+            )
 
     def test_discovery_callback_replay_matches_existing_shape(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
