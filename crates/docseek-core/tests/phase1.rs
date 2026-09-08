@@ -342,3 +342,25 @@ fn scanner_follows_file_symlinks_like_the_python_baseline() {
 
     fs::remove_dir_all(root).expect("remove fixture");
 }
+
+#[cfg(unix)]
+#[test]
+fn scanner_applies_size_limit_to_symlink_targets() {
+    use std::os::unix::fs::symlink;
+
+    let root = temp_root("symlink-size");
+    fs::create_dir_all(&root).expect("create root");
+    write_file(&root.join("target.txt"), &"x".repeat(64));
+    symlink(root.join("target.txt"), root.join("alias.txt")).expect("create symlink");
+
+    let controller = JobController::new();
+    let config = ScannerConfig {
+        max_file_size: Some(32),
+        ..ScannerConfig::default()
+    };
+    let mut session = controller.start_scan(&root, config).expect("scan starts");
+    let candidates = collect_candidates(&mut session, 128).expect("scan succeeds");
+    assert!(candidates.is_empty());
+
+    fs::remove_dir_all(root).expect("remove fixture");
+}

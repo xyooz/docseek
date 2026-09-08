@@ -328,16 +328,20 @@ impl DiscoverySession {
             }
         };
         let is_symlink = file_type.is_symlink();
-        let (is_directory, is_file) = if is_symlink {
+        let followed_metadata = if is_symlink {
             match fs::metadata(&path) {
-                Ok(metadata) => (metadata.is_dir(), metadata.is_file()),
+                Ok(metadata) => Some(metadata),
                 Err(_) => {
                     self.update_progress(|progress| progress.errors += 1);
                     return Ok(None);
                 }
             }
         } else {
-            (file_type.is_dir(), file_type.is_file())
+            None
+        };
+        let (is_directory, is_file) = match followed_metadata.as_ref() {
+            Some(metadata) => (metadata.is_dir(), metadata.is_file()),
+            None => (file_type.is_dir(), file_type.is_file()),
         };
 
         if is_directory {
@@ -372,12 +376,15 @@ impl DiscoverySession {
             return Ok(None);
         }
 
-        let metadata = match entry.metadata() {
-            Ok(metadata) => metadata,
-            Err(_) => {
-                self.update_progress(|progress| progress.errors += 1);
-                return Ok(None);
-            }
+        let metadata = match followed_metadata {
+            Some(metadata) => metadata,
+            None => match entry.metadata() {
+                Ok(metadata) => metadata,
+                Err(_) => {
+                    self.update_progress(|progress| progress.errors += 1);
+                    return Ok(None);
+                }
+            },
         };
         if self
             .config

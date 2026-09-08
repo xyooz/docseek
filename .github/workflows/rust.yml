@@ -11,6 +11,8 @@ on:
       - "Cargo.lock"
       - "rust-toolchain.toml"
       - "crates/**"
+      - "src/docseek/scan_backend.py"
+      - "tests/test_scan_backend.py"
       - ".github/workflows/rust.yml"
   workflow_dispatch:
 
@@ -53,3 +55,5 @@ jobs:
         run: |
           python -c "import glob, subprocess, sys; wheels=glob.glob('target/wheels/*.whl'); assert wheels, 'no maturin wheel'; subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--force-reinstall', '--no-deps', wheels[0]])"
           python -c "import docseek_rust; controller=docseek_rust.JobController(); print(controller.last_snapshot())"
+      - name: Python scan backend parity
+        run: python -m unittest tests.test_scan_backend -v

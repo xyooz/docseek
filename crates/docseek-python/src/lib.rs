@@ -3,6 +3,7 @@
 // remains checked with -D warnings without this allowance.
 #![allow(clippy::useless_conversion)]
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use docseek_core::{
@@ -25,6 +26,32 @@ fn path_to_string(path: PathBuf) -> String {
 
 fn optional_path_to_string(path: Option<PathBuf>) -> Option<String> {
     path.map(path_to_string)
+}
+
+fn scanner_config_from_options(
+    enabled_extensions: Option<Vec<String>>,
+    ignored_dir_names: Option<Vec<String>>,
+    excluded_paths: Option<Vec<PathBuf>>,
+    excluded_file_patterns: Option<Vec<String>>,
+    max_file_size: Option<u64>,
+) -> ScannerConfig {
+    let mut config = ScannerConfig::default();
+    if let Some(extensions) = enabled_extensions {
+        config.enabled_extensions = extensions.into_iter().collect::<BTreeSet<_>>();
+    }
+    if let Some(names) = ignored_dir_names {
+        config.ignored_dir_names = names.into_iter().collect::<BTreeSet<_>>();
+    }
+    if let Some(paths) = excluded_paths {
+        config.excluded_paths = paths;
+    }
+    if let Some(patterns) = excluded_file_patterns {
+        config.excluded_file_patterns = patterns;
+    }
+    if let Some(limit) = max_file_size {
+        config.max_file_size = Some(limit);
+    }
+    config
 }
 
 #[pyclass(name = "CancellationToken")]
@@ -176,9 +203,32 @@ impl PyJobController {
         }
     }
 
-    fn start_scan(&self, root: PathBuf) -> PyResult<PyScanSession> {
+    #[pyo3(signature = (
+        root,
+        enabled_extensions = None,
+        ignored_dir_names = None,
+        excluded_paths = None,
+        excluded_file_patterns = None,
+        max_file_size = None,
+    ))]
+    fn start_scan(
+        &self,
+        root: PathBuf,
+        enabled_extensions: Option<Vec<String>>,
+        ignored_dir_names: Option<Vec<String>>,
+        excluded_paths: Option<Vec<PathBuf>>,
+        excluded_file_patterns: Option<Vec<String>>,
+        max_file_size: Option<u64>,
+    ) -> PyResult<PyScanSession> {
+        let config = scanner_config_from_options(
+            enabled_extensions,
+            ignored_dir_names,
+            excluded_paths,
+            excluded_file_patterns,
+            max_file_size,
+        );
         self.inner
-            .start_scan(root, ScannerConfig::default())
+            .start_scan(root, config)
             .map(|inner| PyScanSession { inner })
             .map_err(to_python_error)
     }

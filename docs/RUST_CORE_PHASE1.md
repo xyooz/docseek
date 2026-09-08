@@ -21,21 +21,25 @@ contract is exercised against the existing Python behavior.
     cargo test --workspace
     cargo clippy --workspace --all-targets --all-features -- -D warnings
     cargo fmt --all -- --check
+    python -m unittest tests.test_scan_backend -v
 
 To build the optional Python extension from the crate directory:
 
     maturin develop --interpreter python --manifest-path crates/docseek-python/Cargo.toml
     python -c "import docseek_rust; print(docseek_rust.JobController())"
 
-The Python extension is intentionally opt-in through M4.5. The core exposes
-`JobController.start_scan()` and a bounded `ScanSession.next_batch()` API;
-each batch is capped at 128 candidates and carries a progress snapshot.
+The Python extension remains opt-in and is not selected by `DirectoryIndexer`
+yet. `JobController.start_scan()` accepts the scanner configuration fields and
+exposes a bounded `ScanSession.next_batch()` API; each batch is capped at 128
+candidates and carries a progress snapshot.
 The terminal batch is empty and marked `finished`, so callers can process every
 candidate batch before stopping.
 Cancellation is idempotent and reports the `cancelling` lifecycle state before
-the session finishes as cancelled. M5 will add the adapter that lets the
-existing Python application select the Rust controller while keeping the
-current implementation available as a fallback.
+the session finishes as cancelled. The first adapter slice now lives in
+`src/docseek/scan_backend.py`; it is covered by a Python/Rust parity test but
+is deliberately not wired into the production index loop yet. The remaining
+M5 work will select the Rust controller while keeping the Python path available
+as a fallback.
 
 The repository pins the development profile in rust-toolchain.toml:
 stable Rust plus rustfmt and clippy. GitHub Actions runs the same workspace
