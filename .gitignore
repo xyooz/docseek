@@ -5,3 +5,4 @@ __pycache__/
 .bench/
 build/
 dist/
+manual-test-corpus/generated/
