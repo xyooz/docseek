@@ -28,13 +28,14 @@ TERMINAL_SUCCESS_STATUSES = frozenset(
     }
 )
 FAILURE_STATUSES = frozenset({ExtractionStatus.FAILED, ExtractionStatus.TIMEOUT})
-DEFERRED_STATUSES = FAILURE_STATUSES | frozenset(
+MANUAL_DEFERRED_STATUSES = frozenset(
     {
         ExtractionStatus.SKIPPED,
         ExtractionStatus.INTERRUPTED,
         ExtractionStatus.QUARANTINED,
     }
 )
+DEFERRED_STATUSES = FAILURE_STATUSES | MANUAL_DEFERRED_STATUSES
 
 # Full reconciliation scans should not hammer a permanently broken document.
 # Precise watcher/manual retries bypass this policy in DirectoryIndexer.
@@ -115,6 +116,11 @@ def failed_state_is_deferred(
         return False
     if int(source_size) != int(current_size):
         return False
+    # These states are an explicit user/recovery decision, not a timed retry.
+    # Keep the unchanged file deferred indefinitely until its metadata changes
+    # or a precise manual retry path clears the state.
+    if value in MANUAL_DEFERRED_STATUSES:
+        return True
     current_time = time.time() if now is None else float(now)
     return current_time < float(retry_after)
 

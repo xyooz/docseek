@@ -67,7 +67,6 @@ FULL_SCAN_BATCH_TEXT_CHARS = 8_000_000
 FULL_SCAN_EARLY_COMMIT_COUNTS = frozenset({16, 64})
 DISCOVERY_PROGRESS_INTERVAL_SECONDS = 0.15
 DISCOVERY_PROGRESS_CANDIDATE_STEP = 250
-INTERRUPTED_RETRY_DELAY_SECONDS = 365 * 24 * 60 * 60
 MAX_INTERRUPTED_ATTEMPTS_BEFORE_QUARANTINE = 3
 LEGACY_EXTRACTING_STALE_SECONDS = 5.0
 PARSER_LEASE_EXTENSIONS = frozenset(
@@ -495,7 +494,7 @@ class DirectoryIndexer:
                         str(status),
                         now,
                         attempts,
-                        now + INTERRUPTED_RETRY_DELAY_SECONDS,
+                        0,
                         stored_path,
                         str(ExtractionStatus.EXTRACTING),
                     ),
@@ -552,7 +551,9 @@ class DirectoryIndexer:
                 ExtractionStatus.INTERRUPTED,
                 ExtractionStatus.QUARANTINED,
             }:
-                retry_after = now + INTERRUPTED_RETRY_DELAY_SECONDS
+                # Explicitly deferred states are governed by their status and
+                # source metadata, not by a fake one-year timer.
+                retry_after = 0
             else:
                 retry_after = now + retry_delay_seconds(status, failure_count)
             conn.execute(
@@ -586,16 +587,40 @@ class DirectoryIndexer:
                 ),
             )
 
-    def _record_parser_cancelled(self, path: str) -> None:
-        """Mark only a file that actually entered parser code as skipped."""
+    def _record_parser_job_cancelled(self, path: str) -> None:
+        """Return an actively parsed file to PENDING after a user stop.
+
+        Stopping the index job is deliberately different from asking DocSeek
+        to skip a file.  No failure count or deferred retry is added, and a
+        later scan may process the unchanged file normally.
+        """
+        now = time.time()
         with self.chunk_store.connect() as conn:
             row = conn.execute(
                 "SELECT status FROM extraction_state WHERE path = ?",
                 (path,),
             ).fetchone()
         if row is not None and str(row["status"]) == str(ExtractionStatus.EXTRACTING):
-            self._record_failure_state(path, "ParserCancelled")
-            self.issues.record(path, "ParserCancelled", "用户停止了当前索引任务")
+            with self.chunk_store.connect() as conn:
+                conn.execute(
+                    """
+                    UPDATE extraction_state
+                    SET status = ?, updated_at = ?, retry_after = 0,
+                        owner_pid = NULL, started_at = NULL
+                    WHERE path = ? AND status = ?
+                    """,
+                    (
+                        str(ExtractionStatus.PENDING),
+                        now,
+                        path,
+                        str(ExtractionStatus.EXTRACTING),
+                    ),
+                )
+            self.issues.clear(path)
+
+    # Compatibility alias for embedders that used the old private helper.
+    def _record_parser_cancelled(self, path: str) -> None:
+        self._record_parser_job_cancelled(path)
 
     def _remove_indexed_path(self, path: str, stats: IndexStats) -> None:
         if self._has_file_record(path):
@@ -740,6 +765,13 @@ class DirectoryIndexer:
         # if the parser process or the host dies, the next launch can see that
         # extraction was in progress even though no document rows were saved.
         if extension in PARSER_LEASE_EXTENSIONS:
+            if self._cancel.is_set():
+                raise IndexCancelled()
+            # The lease is written through a separate metadata connection. Do
+            # not let a preceding lightweight text batch hold SQLite's single
+            # writer slot while that durable parser marker is recorded.
+            if writer is not None:
+                writer.flush()
             self._record_extraction_started(normalized, extraction_revision, stat)
 
         common_args = {
@@ -832,7 +864,7 @@ class DirectoryIndexer:
                     on_detail=on_detail,
                 )
             except IndexCancelled:
-                self._record_parser_cancelled(normalized)
+                self._record_parser_job_cancelled(normalized)
                 raise
             except SourceChangedDuringExtraction as exc:
                 stats.skipped += 1
@@ -846,6 +878,9 @@ class DirectoryIndexer:
                 self._remove_indexed_path(normalized, stats)
                 self.issues.clear(normalized)
             except Exception as exc:
+                if type(exc).__name__ == "LegacyExtractionCancelled":
+                    self._record_parser_job_cancelled(normalized)
+                    raise IndexCancelled() from exc
                 stats.skipped += 1
                 error_code = self._error_code(exc)
                 self._record_failure_state(normalized, error_code)
@@ -896,6 +931,9 @@ class DirectoryIndexer:
         def candidate_batches():
             discovered = 0
             while True:
+                if self._cancel.is_set():
+                    writer.abort()
+                    raise IndexCancelled()
                 # Finish the previous write transaction before more filesystem
                 # discovery; issue metadata remains buffered until the end.
                 writer.flush()
@@ -929,7 +967,7 @@ class DirectoryIndexer:
             for path in candidate_batches():
                 last_path = path
                 if self._cancel.is_set():
-                    writer.flush()
+                    writer.abort()
                     raise IndexCancelled()
 
                 stats.scanned += 1
@@ -959,8 +997,8 @@ class DirectoryIndexer:
                     if on_progress and stats.scanned % 250 == 0:
                         on_progress(path, stats)
                 except IndexCancelled:
-                    self._record_parser_cancelled(normalized)
-                    writer.flush()
+                    writer.abort()
+                    self._record_parser_job_cancelled(normalized)
                     raise
                 except SourceChangedDuringExtraction as exc:
                     writer.flush()
@@ -976,6 +1014,10 @@ class DirectoryIndexer:
                     self._remove_indexed_path(normalized, stats)
                     self.issues.clear(normalized)
                 except Exception as exc:
+                    if type(exc).__name__ == "LegacyExtractionCancelled":
+                        writer.abort()
+                        self._record_parser_job_cancelled(normalized)
+                        raise IndexCancelled() from exc
                     writer.flush()
                     stats.skipped += 1
                     error_code = self._error_code(exc)

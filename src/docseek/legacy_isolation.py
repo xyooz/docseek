@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import os
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -14,8 +14,9 @@ from .document_adapters import DEFAULT_ADAPTER_REGISTRY
 from .legacy_worker import iter_chunk_file
 
 
-LEGACY_PARSE_TIMEOUT_SECONDS = 120.0
-LEGACY_ADAPTER_TIMEOUT_SECONDS = 45.0
+LEGACY_PARSE_TIMEOUT_SECONDS = 300.0
+LEGACY_ADAPTER_TIMEOUT_SECONDS = 300.0
+LEGACY_ADAPTER_STALL_TIMEOUT_SECONDS = 45.0
 LEGACY_WORKER_POLL_SECONDS = 0.10
 
 
@@ -91,32 +92,51 @@ def wait_for_worker(
     process: subprocess.Popen[bytes],
     *,
     timeout_seconds: float,
+    stall_timeout_seconds: float | None = None,
     cancelled: Callable[[], bool] | None = None,
     progress_path: Path | None = None,
     on_progress: Callable[[str, int], None] | None = None,
 ) -> int:
-    deadline = time.monotonic() + max(0.01, float(timeout_seconds))
+    started_at = time.monotonic()
+    deadline = started_at + max(0.01, float(timeout_seconds))
+    stall_limit = (
+        None
+        if stall_timeout_seconds is None
+        else max(0.01, min(float(stall_timeout_seconds), float(timeout_seconds)))
+    )
+    last_progress_at = started_at
     progress_offset = 0
 
-    def drain_progress() -> None:
+    def drain_progress() -> bool:
         nonlocal progress_offset
-        if progress_path is None or on_progress is None or not progress_path.exists():
-            return
+        if progress_path is None or not progress_path.exists():
+            return False
         try:
             data = progress_path.read_bytes()
         except OSError:
-            return
+            return False
         pending = data[progress_offset:]
-        progress_offset = len(data)
-        for line in pending.splitlines():
+        lines = pending.splitlines(keepends=True)
+        if lines and not lines[-1].endswith((b"\n", b"\r")):
+            complete_lines = lines[:-1]
+            progress_offset = len(data) - len(lines[-1])
+        else:
+            complete_lines = lines
+            progress_offset = len(data)
+        received = False
+        for line in complete_lines:
             try:
                 location, current = json.loads(line.decode("ascii"))
-                on_progress(str(location), int(current))
+                if on_progress is not None:
+                    on_progress(str(location), int(current))
+                received = True
             except (ValueError, TypeError, UnicodeDecodeError):
                 continue
+        return received
 
     while True:
-        drain_progress()
+        if drain_progress():
+            last_progress_at = time.monotonic()
         code = process.poll()
         if code is not None:
             drain_progress()
@@ -124,7 +144,13 @@ def wait_for_worker(
         if cancelled is not None and cancelled():
             _terminate_process(process)
             raise LegacyExtractionCancelled("兼容格式解析已取消")
-        if time.monotonic() >= deadline:
+        now = time.monotonic()
+        if stall_limit is not None and now - last_progress_at >= stall_limit:
+            _terminate_process(process)
+            raise LegacyExtractionTimeout(
+                f"兼容格式解析连续 {stall_limit:g} 秒没有进展，已终止该解析进程"
+            )
+        if now >= deadline:
             _terminate_process(process)
             raise LegacyExtractionTimeout(
                 f"兼容格式解析超过 {timeout_seconds:g} 秒，已终止该解析进程"
@@ -156,6 +182,7 @@ def iter_legacy_chunks_isolated(
     *,
     timeout_seconds: float = LEGACY_PARSE_TIMEOUT_SECONDS,
     adapter_timeout_seconds: float = LEGACY_ADAPTER_TIMEOUT_SECONDS,
+    stall_timeout_seconds: float | None = LEGACY_ADAPTER_STALL_TIMEOUT_SECONDS,
     cancelled: Callable[[], bool] | None = None,
     on_progress: Callable[[str, int], None] | None = None,
 ) -> Iterator[DocumentChunk]:
@@ -217,6 +244,11 @@ def iter_legacy_chunks_isolated(
                     code = wait_for_worker(
                         process,
                         timeout_seconds=attempt_timeout,
+                        stall_timeout_seconds=(
+                            min(float(stall_timeout_seconds), attempt_timeout)
+                            if stall_timeout_seconds is not None and on_progress is not None
+                            else None
+                        ),
                         cancelled=cancelled,
                         progress_path=progress,
                         on_progress=on_progress,

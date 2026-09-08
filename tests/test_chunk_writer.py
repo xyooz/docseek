@@ -191,6 +191,41 @@ class ChunkBatchWriterTests(unittest.TestCase):
                 ).fetchone()
             self.assertIsNotNone(visible)
 
+    def test_discard_pending_rolls_back_only_uncommitted_batch(self) -> None:
+        committed = r"C:\docs\committed.txt"
+        pending = r"C:\docs\pending.txt"
+        with ChunkBatchWriter(self.store, batch_size=32) as writer:
+            writer.replace_document(
+                path=committed,
+                filename="committed.txt",
+                extension=".txt",
+                modified_time=1.0,
+                size=10,
+                chunks=[DocumentChunk(0, "行 1", "已经提交的内容")],
+            )
+            writer.flush()
+            writer.replace_document(
+                path=pending,
+                filename="pending.txt",
+                extension=".txt",
+                modified_time=2.0,
+                size=10,
+                chunks=[DocumentChunk(0, "行 1", "停止前尚未提交")],
+            )
+            self.assertTrue(writer._transaction_open)
+            writer.abort()
+
+        self.assertEqual(
+            [row.filename for row in self.store.search("已经提交")],
+            ["committed.txt"],
+        )
+        self.assertEqual(self.store.search("停止前尚未提交"), [])
+        with self.store.connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM files WHERE path = ? LIMIT 1", (pending,)
+            ).fetchone()
+        self.assertIsNone(row)
+
     def test_legacy_parser_runs_without_sqlite_writer_transaction(self) -> None:
         parser_transaction_states: list[bool] = []
 
