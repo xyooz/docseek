@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt
+from PySide6.QtGui import QFont, QColor
 
 from .chunk_store import ChunkSearchResult
 
@@ -40,8 +41,14 @@ class SearchResultsModel(QAbstractTableModel):
 
         if role == Qt.UserRole:
             return row.path
+        if role == Qt.FontRole and index.column() == 0:
+            font = QFont()
+            font.setWeight(QFont.Weight.DemiBold)
+            return font
+        if role == Qt.ForegroundRole and index.column() == 5:
+            return QColor("#64748B")
         if role == Qt.ToolTipRole:
-            if index.column() == 0:
+            if index.column() in (0, 5):
                 return row.path
             if index.column() == 1 and row.location:
                 return row.location

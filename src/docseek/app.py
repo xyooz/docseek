@@ -127,6 +127,8 @@ class MainWindow(app_base.MainWindow):
     def _install_search_state_controls(self) -> None:
         self.history_button = QToolButton()
         self.history_button.setText("搜索记录")
+        self.history_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.history_button.setAccessibleName("搜索记录")
         self.history_button.setIcon(line_icon("history"))
         self.history_button.setMinimumHeight(38)
         self.history_button.setMinimumWidth(72)
@@ -184,6 +186,11 @@ class MainWindow(app_base.MainWindow):
             # interactive so restored widths remain user-adjustable.
             for section in range(header.count()):
                 header.setSectionResizeMode(section, QHeaderView.Interactive)
+        else:
+            # Keep details available from the column menu without forcing a
+            # horizontal scroll bar in the initial results pane.
+            header.setSectionHidden(3, True)
+            header.setSectionHidden(5, True)
 
         # The filename column is the one invariant: a result table without it
         # is too easy to make unusable by accident.

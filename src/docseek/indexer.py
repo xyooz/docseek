@@ -4,6 +4,7 @@ import json
 import os
 import threading
 import time
+from itertools import islice
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
@@ -259,6 +260,7 @@ class DirectoryIndexer:
 
     def _load_index_state(
         self,
+        root: Path | None = None,
     ) -> dict[
         str,
         tuple[
@@ -273,6 +275,13 @@ class DirectoryIndexer:
         ],
     ]:
         """Load committed and failure-only state once for reconciliation."""
+        prefix = self._normalize(root).rstrip("/\\") + os.sep if root is not None else None
+        # Directory boundaries exclude siblings such as docs-backup. A range
+        # keeps the existing path indexes usable and treats %/_ literally.
+        upper = prefix[:-1] + chr(ord(prefix[-1]) + 1) if prefix else None
+        parameters = (prefix, upper) if prefix else ()
+        file_scope = " WHERE f.path >= ? AND f.path < ?" if prefix else ""
+        failure_scope = " AND s.path >= ? AND s.path < ?" if prefix else ""
         with self.chunk_store.connect() as conn:
             file_rows = conn.execute(
                 """
@@ -292,6 +301,7 @@ class DirectoryIndexer:
                 FROM files f
                 LEFT JOIN extraction_state s ON s.path = f.path
                 """
+                + file_scope, parameters
             ).fetchall()
             failure_only_rows = conn.execute(
                 """
@@ -306,6 +316,7 @@ class DirectoryIndexer:
                 LEFT JOIN files f ON f.path = s.path
                 WHERE f.path IS NULL
                 """
+                + failure_scope, parameters
             ).fetchall()
 
         state = {
@@ -683,7 +694,7 @@ class DirectoryIndexer:
         stats = IndexStats()
         seen_paths: set[str] = set()
         successful_paths: set[str] = set()
-        index_state = self._load_index_state()
+        index_state = self._load_index_state(root)
 
         discovery_issue_clears: set[str] = set()
         discovery_issue_records: list[tuple[str, str, str]] = []
@@ -700,25 +711,34 @@ class DirectoryIndexer:
                     stats,
                 )
 
-        candidates = list(
-            prioritize_index_candidates(
-                self._iter_supported_files(
+        discovery = iter(self._iter_supported_files(
                     root,
                     stats,
                     issue_clears=discovery_issue_clears,
                     issue_records=discovery_issue_records,
                     on_discovery=discovery_callback,
                     normalized_candidates=normalized_candidates,
-                )
-            )
-        )
-        if on_candidates_ready:
-            on_candidates_ready(len(candidates))
-        elif on_progress:
-            on_progress(
-                Path(f"扫描完成 · 共发现 {len(candidates):,} 个候选文件"),
-                stats,
-            )
+                ))
+
+        def candidate_batches():
+            discovered = 0
+            while True:
+                # Finish the previous write transaction before more filesystem
+                # discovery; issue metadata remains buffered until the end.
+                writer.flush()
+                batch = list(islice(discovery, 128))
+                discovered += len(batch)
+                finished = len(batch) < 128
+                if finished:
+                    if on_candidates_ready:
+                        on_candidates_ready(discovered)
+                    elif on_progress:
+                        on_progress(
+                            Path(f"扫描完成 · 共发现 {discovered:,} 个候选文件"), stats
+                        )
+                yield from prioritize_index_candidates(batch)
+                if finished:
+                    break
 
         # Discovery stays outside the batched chunk writer. Healthy directory
         # traversal therefore performs no SQLite writes, while issue cleanup is
@@ -726,15 +746,15 @@ class DirectoryIndexer:
         # indexing starts. This preserves the single-writer invariant that fixed
         # the real Windows ``database is locked`` reports without paying one
         # connection/commit per visited directory.
-        self.issues.clear_many(discovery_issue_clears)
-        self.issues.record_many(discovery_issue_records)
+        last_path = None
 
         with ChunkBatchWriter(
             self.chunk_store,
             batch_size=FULL_SCAN_BATCH_SIZE,
             max_batch_text_chars=FULL_SCAN_BATCH_TEXT_CHARS,
         ) as writer:
-            for path in candidates:
+            for path in candidate_batches():
+                last_path = path
                 if self._cancel.is_set():
                     writer.flush()
                     raise IndexCancelled()
@@ -788,11 +808,13 @@ class DirectoryIndexer:
                     self._record_failure_state(normalized, error_code)
                     self.issues.record(normalized, error_code, str(exc))
 
-        if on_progress and candidates:
+        self.issues.clear_many(discovery_issue_clears)
+        self.issues.record_many(discovery_issue_records)
+        if on_progress and last_path is not None:
             # Always publish the terminal count. Unchanged files deliberately
             # report in coarse batches, so without this event a short refresh
             # could disappear while its progress bar still showed 0%.
-            on_progress(candidates[-1], stats)
+            on_progress(last_path, stats)
 
         self.issues.clear_many(successful_paths)
         stats.removed += remove_missing_under_root(self.chunk_store, str(root), seen_paths)

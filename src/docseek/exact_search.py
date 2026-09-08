@@ -173,24 +173,36 @@ class ExactGroupedSearchEngine:
         where = "WHERE " + " AND ".join(clauses) if clauses else ""
         sql = f"""
             SELECT
-                f.path, f.filename, f.extension, f.modified_time, f.size,
-                COUNT(*) OVER() AS total_count
+                f.path, f.filename, f.extension, f.modified_time, f.size
             FROM files f
             {where}
             ORDER BY {order_clause}
             LIMIT :limit OFFSET :offset
         """
         with self.store.connect() as conn:
-            rows = conn.execute(sql, params).fetchall()
-            total_count = int(rows[0]["total_count"]) if rows else 0
-            if not rows and int(params["offset"]) > 0:
-                count_sql = f"SELECT COUNT(*) AS n FROM files f {where}"
-                count_params = {
-                    key: value
-                    for key, value in params.items()
-                    if key not in {"limit", "offset"}
-                }
-                total_count = int(conn.execute(count_sql, count_params).fetchone()["n"])
+            # A read snapshot keeps the page and exact count consistent while
+            # indexing continues. Separate SQL lets the page use LIMIT early.
+            conn.execute("SAVEPOINT browse_snapshot")
+            try:
+                rows = conn.execute(sql, params).fetchall()
+                offset_value = int(params["offset"])
+                limit_value = int(params["limit"])
+                if rows and len(rows) < limit_value:
+                    # A short non-empty page proves that this is the final
+                    # page, so avoid scanning the filtered table a second time.
+                    total_count = offset_value + len(rows)
+                elif not rows and offset_value == 0:
+                    total_count = 0
+                else:
+                    count_sql = f"SELECT COUNT(*) AS n FROM files f {where}"
+                    count_params = {
+                        key: value
+                        for key, value in params.items()
+                        if key not in {"limit", "offset"}
+                    }
+                    total_count = int(conn.execute(count_sql, count_params).fetchone()["n"])
+            finally:
+                conn.execute("RELEASE browse_snapshot")
 
         return SearchPage(
             items=[

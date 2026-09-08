@@ -187,7 +187,7 @@ class IndexSettingsDialog(QDialog):
             "会删除其本地索引，绝不删除源文件。"
         )
         format_hint.setWordWrap(True)
-        format_hint.setStyleSheet("color: palette(mid); font-size: 11px;")
+        format_hint.setStyleSheet("color: #64748B; font-size: 12px;")
 
         format_group = QGroupBox("索引文件格式")
         format_layout = QVBoxLayout()
@@ -216,7 +216,7 @@ class IndexSettingsDialog(QDialog):
         )
         self.storage_pending_label = QLabel()
         self.storage_pending_label.setWordWrap(True)
-        self.storage_pending_label.setStyleSheet("color: palette(mid); font-size: 11px;")
+        self.storage_pending_label.setStyleSheet("color: #64748B; font-size: 12px;")
         self.storage_move_button = QPushButton("更改位置…")
         self.storage_move_button.clicked.connect(self._change_storage_location)
 
@@ -229,7 +229,7 @@ class IndexSettingsDialog(QDialog):
             "建议使用本地固定磁盘，不要放在网络共享或同步目录。迁移会在下次启动前完成。"
         )
         storage_hint.setWordWrap(True)
-        storage_hint.setStyleSheet("color: palette(mid); font-size: 11px;")
+        storage_hint.setStyleSheet("color: #64748B; font-size: 12px;")
 
         storage_group = QGroupBox("索引数据位置")
         storage_layout = QVBoxLayout()
@@ -359,6 +359,9 @@ class IndexSettingsDialog(QDialog):
 
     def _sync_format_preset_from_checks(self) -> None:
         if self._applying_format_preset:
+            return
+        if self.format_preset_combo.currentData() == "custom":
+            self._refresh_format_presentation()
             return
         key = self._format_preset_key(self._enabled_extensions_from_ui())
         index = self.format_preset_combo.findData(key)
