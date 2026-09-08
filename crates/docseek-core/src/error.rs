@@ -7,6 +7,7 @@ use std::path::PathBuf;
 pub enum CoreError {
     Cancelled,
     Busy,
+    InvalidBatchSize,
     RootNotDirectory(PathBuf),
     Io { path: PathBuf, source: io::Error },
 }
@@ -25,6 +26,9 @@ impl fmt::Display for CoreError {
         match self {
             Self::Cancelled => formatter.write_str("job cancelled"),
             Self::Busy => formatter.write_str("another job is already running"),
+            Self::InvalidBatchSize => {
+                formatter.write_str("scan batch size must be greater than zero")
+            }
             Self::RootNotDirectory(path) => {
                 write!(
                     formatter,

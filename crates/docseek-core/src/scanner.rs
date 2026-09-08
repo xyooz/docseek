@@ -1,9 +1,12 @@
-use std::collections::BTreeSet;
-use std::fs;
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::fs::{self, DirEntry, ReadDir};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use crate::candidate::{known_extensions, normalize_extension};
 use crate::{CancellationToken, Candidate, CoreError};
+
+pub const MAX_SCAN_BATCH_SIZE: usize = 128;
 
 const DEFAULT_IGNORED_DIR_NAMES: &[&str] = &[
     ".git",
@@ -36,7 +39,7 @@ impl Default for ScannerConfig {
             enabled_extensions: known_extensions().map(normalize_extension).collect(),
             ignored_dir_names: DEFAULT_IGNORED_DIR_NAMES
                 .iter()
-                .map(|name| name.to_ascii_lowercase())
+                .map(|name| name.to_lowercase())
                 .collect(),
             excluded_paths: Vec::new(),
             excluded_file_patterns: Vec::new(),
@@ -61,17 +64,69 @@ impl ScannerConfig {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct ScanReport {
-    pub files_seen: usize,
+pub struct ScanProgress {
     pub directories_seen: usize,
+    pub files_seen: usize,
+    pub candidates_discovered: usize,
+    pub candidates_emitted: usize,
     pub errors: usize,
+    pub current_path: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ScanReport {
+    pub directories_seen: usize,
+    pub files_seen: usize,
+    pub candidates_discovered: usize,
+    pub candidates_emitted: usize,
+    pub errors: usize,
+    pub finished: bool,
+    pub current_path: Option<PathBuf>,
+}
+
+impl ScanReport {
+    pub(crate) fn from_progress(progress: &ScanProgress) -> Self {
+        Self {
+            directories_seen: progress.directories_seen,
+            files_seen: progress.files_seen,
+            candidates_discovered: progress.candidates_discovered,
+            candidates_emitted: progress.candidates_emitted,
+            errors: progress.errors,
+            finished: true,
+            current_path: progress.current_path.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScanBatch {
     pub candidates: Vec<Candidate>,
+    pub finished: bool,
+    pub progress: ScanProgress,
 }
 
 #[derive(Clone, Debug)]
 pub struct Scanner {
     config: ScannerConfig,
     excluded_paths: Vec<PathBuf>,
+}
+
+pub(crate) struct DiscoveryBatch {
+    pub candidates: Vec<Candidate>,
+    pub finished: bool,
+    pub progress: ScanProgress,
+}
+
+pub(crate) struct DiscoverySession {
+    config: ScannerConfig,
+    excluded_paths: Vec<PathBuf>,
+    pending_directories: Vec<PathBuf>,
+    current_entries: Option<ReadDir>,
+    visited_directories: HashSet<PathBuf>,
+    cancellation: CancellationToken,
+    progress: Arc<Mutex<ScanProgress>>,
+    exhausted: bool,
+    finished: bool,
 }
 
 impl Scanner {
@@ -85,7 +140,7 @@ impl Scanner {
         config.ignored_dir_names = config
             .ignored_dir_names
             .iter()
-            .map(|name| name.to_ascii_lowercase())
+            .map(|name| name.to_lowercase())
             .collect();
         config.excluded_file_patterns = config
             .excluded_file_patterns
@@ -109,6 +164,22 @@ impl Scanner {
         root: impl AsRef<Path>,
         cancellation: &CancellationToken,
     ) -> Result<ScanReport, CoreError> {
+        let progress = Arc::new(Mutex::new(ScanProgress::default()));
+        let mut session = self.start_session_with_progress(root, cancellation.clone(), progress)?;
+        loop {
+            let batch = session.next_candidates(MAX_SCAN_BATCH_SIZE)?;
+            if batch.finished {
+                return Ok(ScanReport::from_progress(&batch.progress));
+            }
+        }
+    }
+
+    pub(crate) fn start_session_with_progress(
+        &self,
+        root: impl AsRef<Path>,
+        cancellation: CancellationToken,
+        progress: Arc<Mutex<ScanProgress>>,
+    ) -> Result<DiscoverySession, CoreError> {
         let requested_root = root.as_ref().to_path_buf();
         let root = requested_root
             .canonicalize()
@@ -118,93 +189,213 @@ impl Scanner {
             return Err(CoreError::RootNotDirectory(root));
         }
 
-        let mut report = ScanReport {
-            directories_seen: 1,
-            ..ScanReport::default()
-        };
-        let mut pending = vec![root];
-
-        while let Some(directory) = pending.pop() {
-            cancellation.checkpoint()?;
-            let entries = match fs::read_dir(&directory) {
-                Ok(entries) => entries.collect::<Result<Vec<_>, _>>(),
-                Err(_) => {
-                    report.errors += 1;
-                    continue;
-                }
-            };
-            let mut entries = match entries {
-                Ok(entries) => entries,
-                Err(_) => {
-                    report.errors += 1;
-                    continue;
-                }
-            };
-            entries.sort_by_key(|entry| entry.path());
-
-            for entry in entries {
-                cancellation.checkpoint()?;
-                let path = entry.path();
-                if self.is_excluded_path(&path) {
-                    continue;
-                }
-                let file_type = match entry.file_type() {
-                    Ok(file_type) => file_type,
-                    Err(_) => {
-                        report.errors += 1;
-                        continue;
-                    }
-                };
-                // Phase 1 does not follow symlinks. This keeps a scan bounded
-                // and avoids directory cycles; symlink policy can be added to
-                // ScannerConfig when Python parity is implemented.
-                if file_type.is_symlink() {
-                    continue;
-                }
-                if file_type.is_dir() {
-                    let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
-                    if !self.config.ignored_dir_names.contains(&name) {
-                        pending.push(path);
-                        report.directories_seen += 1;
-                    }
-                    continue;
-                }
-                if !file_type.is_file() {
-                    continue;
-                }
-
-                report.files_seen += 1;
-                let metadata = match entry.metadata() {
-                    Ok(metadata) => metadata,
-                    Err(_) => {
-                        report.errors += 1;
-                        continue;
-                    }
-                };
-                if self
-                    .config
-                    .max_file_size
-                    .is_some_and(|limit| metadata.len() > limit)
-                {
-                    continue;
-                }
-
-                let extension = Candidate::extension_for_path(&path);
-                if !self.config.enabled_extensions.contains(&extension)
-                    || self.matches_file_pattern(&path)
-                {
-                    continue;
-                }
-                report
-                    .candidates
-                    .push(Candidate::from_metadata(path, metadata.len()));
-            }
+        {
+            let mut current = progress.lock().expect("scan progress mutex poisoned");
+            current.directories_seen = 1;
+            current.current_path = Some(root.clone());
         }
 
-        Ok(report)
+        let mut visited_directories = HashSet::new();
+        visited_directories.insert(root.clone());
+        let root_excluded = self.is_excluded_path(&root);
+        Ok(DiscoverySession {
+            config: self.config.clone(),
+            excluded_paths: self.excluded_paths.clone(),
+            pending_directories: if root_excluded {
+                Vec::new()
+            } else {
+                vec![root]
+            },
+            current_entries: None,
+            visited_directories,
+            cancellation,
+            progress,
+            exhausted: root_excluded,
+            finished: false,
+        })
     }
 
     fn is_excluded_path(&self, path: &Path) -> bool {
+        if self.excluded_paths.is_empty() {
+            return false;
+        }
+        let normalized = normalize_path(path);
+        self.excluded_paths
+            .iter()
+            .any(|excluded| is_under(&normalized, excluded))
+    }
+}
+
+impl DiscoverySession {
+    pub(crate) fn next_candidates(
+        &mut self,
+        requested_size: usize,
+    ) -> Result<DiscoveryBatch, CoreError> {
+        if requested_size == 0 {
+            return Err(CoreError::InvalidBatchSize);
+        }
+        let batch_size = requested_size.min(MAX_SCAN_BATCH_SIZE);
+        if self.finished {
+            return Ok(DiscoveryBatch {
+                candidates: Vec::new(),
+                finished: true,
+                progress: self.progress_snapshot(),
+            });
+        }
+
+        let mut candidates = Vec::with_capacity(batch_size);
+        while candidates.len() < batch_size && !self.exhausted {
+            self.cancellation.checkpoint()?;
+            match self.next_candidate()? {
+                Some(candidate) => candidates.push(candidate),
+                None => self.exhausted = true,
+            }
+        }
+        if self.exhausted && candidates.is_empty() {
+            self.finished = true;
+        }
+        self.update_progress(|progress| {
+            progress.candidates_emitted =
+                progress.candidates_emitted.saturating_add(candidates.len());
+        });
+        Ok(DiscoveryBatch {
+            candidates,
+            finished: self.finished,
+            progress: self.progress_snapshot(),
+        })
+    }
+
+    pub(crate) fn snapshot(&self) -> ScanProgress {
+        self.progress_snapshot()
+    }
+
+    fn next_candidate(&mut self) -> Result<Option<Candidate>, CoreError> {
+        loop {
+            self.cancellation.checkpoint()?;
+            if self.current_entries.is_none() && !self.open_next_directory()? {
+                return Ok(None);
+            }
+
+            let next_entry = self
+                .current_entries
+                .as_mut()
+                .and_then(|entries| entries.next());
+            match next_entry {
+                Some(Ok(entry)) => {
+                    if let Some(candidate) = self.inspect_entry(entry)? {
+                        return Ok(Some(candidate));
+                    }
+                }
+                Some(Err(_)) => {
+                    self.update_progress(|progress| progress.errors += 1);
+                }
+                None => {
+                    self.current_entries = None;
+                }
+            }
+        }
+    }
+
+    fn open_next_directory(&mut self) -> Result<bool, CoreError> {
+        while let Some(directory) = self.pending_directories.pop() {
+            self.cancellation.checkpoint()?;
+            self.update_progress(|progress| progress.current_path = Some(directory.clone()));
+            match fs::read_dir(&directory) {
+                Ok(entries) => {
+                    self.current_entries = Some(entries);
+                    return Ok(true);
+                }
+                Err(_) => {
+                    self.update_progress(|progress| progress.errors += 1);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    fn inspect_entry(&mut self, entry: DirEntry) -> Result<Option<Candidate>, CoreError> {
+        let path = entry.path();
+        self.update_progress(|progress| progress.current_path = Some(path.clone()));
+        if self.is_excluded_path(&path) {
+            return Ok(None);
+        }
+
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(_) => {
+                self.update_progress(|progress| progress.errors += 1);
+                return Ok(None);
+            }
+        };
+        let is_symlink = file_type.is_symlink();
+        let (is_directory, is_file) = if is_symlink {
+            match fs::metadata(&path) {
+                Ok(metadata) => (metadata.is_dir(), metadata.is_file()),
+                Err(_) => {
+                    self.update_progress(|progress| progress.errors += 1);
+                    return Ok(None);
+                }
+            }
+        } else {
+            (file_type.is_dir(), file_type.is_file())
+        };
+
+        if is_directory {
+            let name = entry.file_name().to_string_lossy().to_lowercase();
+            if !self.config.ignored_dir_names.contains(&name) {
+                let identity = if is_symlink {
+                    normalize_path(&path)
+                } else {
+                    path.clone()
+                };
+                if self.visited_directories.insert(identity) {
+                    self.pending_directories.push(path);
+                    self.update_progress(|progress| progress.directories_seen += 1);
+                }
+            }
+            return Ok(None);
+        }
+        if !is_file {
+            return Ok(None);
+        }
+
+        self.update_progress(|progress| progress.files_seen += 1);
+        let file_name = entry.file_name();
+        let name = file_name.to_string_lossy();
+        if name.starts_with("~$") || name.ends_with(".tmp") {
+            return Ok(None);
+        }
+
+        let extension = Candidate::extension_for_path(&path);
+        if !self.config.enabled_extensions.contains(&extension) || self.matches_file_pattern(&path)
+        {
+            return Ok(None);
+        }
+
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(_) => {
+                self.update_progress(|progress| progress.errors += 1);
+                return Ok(None);
+            }
+        };
+        if self
+            .config
+            .max_file_size
+            .is_some_and(|limit| metadata.len() > limit)
+        {
+            return Ok(None);
+        }
+
+        let candidate = Candidate::from_metadata(path, metadata.len());
+        self.update_progress(|progress| progress.candidates_discovered += 1);
+        Ok(Some(candidate))
+    }
+
+    fn is_excluded_path(&self, path: &Path) -> bool {
+        if self.excluded_paths.is_empty() {
+            return false;
+        }
         let normalized = normalize_path(path);
         self.excluded_paths
             .iter()
@@ -216,12 +407,23 @@ impl Scanner {
             .file_name()
             .and_then(|value| value.to_str())
             .unwrap_or_default()
-            .to_ascii_lowercase();
+            .to_lowercase();
         self.config
             .excluded_file_patterns
             .iter()
-            .map(|pattern| pattern.to_ascii_lowercase())
-            .any(|pattern| glob_matches(&pattern, &name))
+            .any(|pattern| glob_matches(pattern, &name))
+    }
+
+    fn update_progress(&self, update: impl FnOnce(&mut ScanProgress)) {
+        let mut progress = self.progress.lock().expect("scan progress mutex poisoned");
+        update(&mut progress);
+    }
+
+    fn progress_snapshot(&self) -> ScanProgress {
+        self.progress
+            .lock()
+            .expect("scan progress mutex poisoned")
+            .clone()
     }
 }
 
@@ -242,7 +444,7 @@ fn is_under(path: &Path, parent: &Path) -> bool {
 }
 
 fn normalize_file_pattern(pattern: &str) -> String {
-    let pattern = pattern.trim().to_ascii_lowercase();
+    let pattern = pattern.trim().to_lowercase();
     if pattern.starts_with('.')
         && !pattern
             .chars()
@@ -255,31 +457,91 @@ fn normalize_file_pattern(pattern: &str) -> String {
 }
 
 fn glob_matches(pattern: &str, value: &str) -> bool {
-    let pattern = pattern.as_bytes();
-    let value = value.as_bytes();
-    let mut states = vec![vec![false; value.len() + 1]; pattern.len() + 1];
-    states[0][0] = true;
-    for pattern_index in 0..pattern.len() {
-        for value_index in 0..=value.len() {
-            if !states[pattern_index][value_index] {
-                continue;
-            }
-            match pattern[pattern_index] {
-                b'*' => {
-                    states[pattern_index + 1][value_index] = true;
-                    if value_index < value.len() {
-                        states[pattern_index][value_index + 1] = true;
-                    }
-                }
-                b'?' if value_index < value.len() => {
-                    states[pattern_index + 1][value_index + 1] = true;
-                }
-                character if value_index < value.len() && character == value[value_index] => {
-                    states[pattern_index + 1][value_index + 1] = true;
-                }
-                _ => {}
-            }
-        }
+    let pattern: Vec<char> = pattern.chars().collect();
+    let value: Vec<char> = value.chars().collect();
+    let mut memo = HashMap::new();
+    glob_matches_from(&pattern, 0, &value, 0, &mut memo)
+}
+
+fn glob_matches_from(
+    pattern: &[char],
+    pattern_index: usize,
+    value: &[char],
+    value_index: usize,
+    memo: &mut HashMap<(usize, usize), bool>,
+) -> bool {
+    if let Some(result) = memo.get(&(pattern_index, value_index)) {
+        return *result;
     }
-    states[pattern.len()][value.len()]
+    let result = if pattern_index == pattern.len() {
+        value_index == value.len()
+    } else {
+        match pattern[pattern_index] {
+            '*' => {
+                glob_matches_from(pattern, pattern_index + 1, value, value_index, memo)
+                    || (value_index < value.len()
+                        && glob_matches_from(pattern, pattern_index, value, value_index + 1, memo))
+            }
+            '?' if value_index < value.len() => {
+                glob_matches_from(pattern, pattern_index + 1, value, value_index + 1, memo)
+            }
+            '[' if value_index < value.len() => {
+                if let Some((matched, next_index)) =
+                    match_character_class(pattern, pattern_index, value[value_index])
+                {
+                    matched && glob_matches_from(pattern, next_index, value, value_index + 1, memo)
+                } else {
+                    pattern[pattern_index] == value[value_index]
+                        && glob_matches_from(
+                            pattern,
+                            pattern_index + 1,
+                            value,
+                            value_index + 1,
+                            memo,
+                        )
+                }
+            }
+            character if value_index < value.len() && character == value[value_index] => {
+                glob_matches_from(pattern, pattern_index + 1, value, value_index + 1, memo)
+            }
+            _ => false,
+        }
+    };
+    memo.insert((pattern_index, value_index), result);
+    result
+}
+
+fn match_character_class(pattern: &[char], start: usize, value: char) -> Option<(bool, usize)> {
+    let mut index = start + 1;
+    if index >= pattern.len() {
+        return None;
+    }
+    let negated = matches!(pattern[index], '!' | '^');
+    if negated {
+        index += 1;
+    }
+
+    let mut matched = false;
+    let mut saw_character = false;
+    while index < pattern.len() {
+        if pattern[index] == ']' && saw_character {
+            let result = if negated { !matched } else { matched };
+            return Some((result, index + 1));
+        }
+        if index + 2 < pattern.len() && pattern[index + 1] == '-' && pattern[index + 2] != ']' {
+            let first = pattern[index];
+            let last = pattern[index + 2];
+            if first <= value && value <= last {
+                matched = true;
+            }
+            index += 3;
+        } else {
+            if pattern[index] == value {
+                matched = true;
+            }
+            index += 1;
+        }
+        saw_character = true;
+    }
+    None
 }

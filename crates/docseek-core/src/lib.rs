@@ -13,7 +13,9 @@ mod scheduler;
 
 pub use cancellation::CancellationToken;
 pub use candidate::{priority_for_extension, Candidate, CandidatePriority};
-pub use controller::{JobController, JobId, JobKind, JobSnapshot, JobState, ScanOutcome};
+pub use controller::{JobController, JobId, JobKind, JobSnapshot, JobState, ScanSession};
 pub use error::CoreError;
-pub use scanner::{ScanReport, Scanner, ScannerConfig};
+pub use scanner::{
+    ScanBatch, ScanProgress, ScanReport, Scanner, ScannerConfig, MAX_SCAN_BATCH_SIZE,
+};
 pub use scheduler::CandidateScheduler;

@@ -16,8 +16,7 @@ const DIRECT_EXTENSIONS: &[&str] = &[
 ];
 const OFFICE_COMPATIBILITY_EXTENSIONS: &[&str] = &[
     ".doc", ".dot", ".rtf", ".odt", ".ppt", ".pps", ".odp", ".xls", ".xlsb", ".ods", ".wps",
-    ".wpt", ".et", ".ett", ".etx", ".ettx", ".xlt", ".dps", ".dpt", ".epub", ".eml", ".msg",
-    ".mbox", ".pst", ".pages", ".numbers", ".key",
+    ".wpt", ".et", ".ett", ".etx", ".ettx", ".xlt", ".dps", ".dpt",
 ];
 
 pub fn normalize_extension(extension: &str) -> String {

@@ -1,8 +1,9 @@
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use crate::{CancellationToken, CandidateScheduler, CoreError, ScanReport, Scanner, ScannerConfig};
+use crate::scanner::{DiscoverySession, ScanBatch, ScanProgress, Scanner, ScannerConfig};
+use crate::{CancellationToken, CandidateScheduler, CoreError};
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct JobId(u64);
@@ -22,6 +23,7 @@ pub enum JobKind {
 pub enum JobState {
     Queued,
     Running,
+    Cancelling,
     Succeeded,
     Cancelled,
     Failed,
@@ -32,9 +34,23 @@ pub struct JobSnapshot {
     pub id: JobId,
     pub kind: JobKind,
     pub state: JobState,
+    pub directories_seen: usize,
     pub files_seen: usize,
-    pub candidates: usize,
+    pub candidates_discovered: usize,
+    pub candidates_emitted: usize,
     pub errors: usize,
+    pub current_path: Option<PathBuf>,
+}
+
+impl JobSnapshot {
+    fn apply_progress(&mut self, progress: &ScanProgress) {
+        self.directories_seen = progress.directories_seen;
+        self.files_seen = progress.files_seen;
+        self.candidates_discovered = progress.candidates_discovered;
+        self.candidates_emitted = progress.candidates_emitted;
+        self.errors = progress.errors;
+        self.current_path = progress.current_path.clone();
+    }
 }
 
 #[derive(Debug)]
@@ -50,11 +66,12 @@ pub struct JobController {
     state: Arc<Mutex<ControllerState>>,
 }
 
-#[derive(Debug)]
-pub struct ScanOutcome {
-    pub job_id: JobId,
-    pub report: ScanReport,
-    pub scheduler: CandidateScheduler,
+/// Pull-based, bounded scan interface owned by one controller job.
+pub struct ScanSession {
+    inner: DiscoverySession,
+    controller: JobController,
+    job_id: JobId,
+    completed: bool,
 }
 
 impl Default for JobController {
@@ -74,14 +91,47 @@ impl JobController {
         }
     }
 
-    pub fn cancel(&self) -> bool {
-        let state = self.state.lock().expect("job controller mutex poisoned");
-        if let Some((_, token)) = &state.active {
-            token.cancel();
-            true
-        } else {
-            false
+    pub fn start_scan(
+        &self,
+        root: impl AsRef<Path>,
+        config: ScannerConfig,
+    ) -> Result<ScanSession, CoreError> {
+        let (job_id, token) = self.begin(JobKind::FullScan)?;
+        let progress = Arc::new(Mutex::new(ScanProgress::default()));
+        match Scanner::new(config).start_session_with_progress(root, token, progress) {
+            Ok(inner) => {
+                self.update_progress(job_id, &inner.snapshot());
+                Ok(ScanSession {
+                    inner,
+                    controller: self.clone(),
+                    job_id,
+                    completed: false,
+                })
+            }
+            Err(error) => {
+                let state = if matches!(error, CoreError::Cancelled) {
+                    JobState::Cancelled
+                } else {
+                    JobState::Failed
+                };
+                self.finish_empty(job_id, state);
+                Err(error)
+            }
         }
+    }
+
+    pub fn cancel(&self) -> bool {
+        let mut state = self.state.lock().expect("job controller mutex poisoned");
+        let Some((job_id, token)) = state.active.clone() else {
+            return false;
+        };
+        token.cancel();
+        if let Some(snapshot) = state.jobs.get_mut(&job_id) {
+            if matches!(snapshot.state, JobState::Queued | JobState::Running) {
+                snapshot.state = JobState::Cancelling;
+            }
+        }
+        true
     }
 
     pub fn is_cancelled(&self) -> bool {
@@ -102,35 +152,6 @@ impl JobController {
         state.jobs.values().next_back().cloned()
     }
 
-    pub fn run_scan(
-        &self,
-        root: impl AsRef<Path>,
-        config: ScannerConfig,
-    ) -> Result<ScanOutcome, CoreError> {
-        let (job_id, token) = self.begin(JobKind::FullScan)?;
-        let result = Scanner::new(config).scan(root, &token);
-        match result {
-            Ok(report) => {
-                let scheduler = CandidateScheduler::from_candidates(report.candidates.clone());
-                self.finish(job_id, JobState::Succeeded, &report);
-                Ok(ScanOutcome {
-                    job_id,
-                    report,
-                    scheduler,
-                })
-            }
-            Err(error) => {
-                let state = if matches!(error, CoreError::Cancelled) {
-                    JobState::Cancelled
-                } else {
-                    JobState::Failed
-                };
-                self.finish_empty(job_id, state);
-                Err(error)
-            }
-        }
-    }
-
     fn begin(&self, kind: JobKind) -> Result<(JobId, CancellationToken), CoreError> {
         let mut state = self.state.lock().expect("job controller mutex poisoned");
         if state.active.is_some() {
@@ -145,9 +166,12 @@ impl JobController {
                 id,
                 kind,
                 state: JobState::Queued,
+                directories_seen: 0,
                 files_seen: 0,
-                candidates: 0,
+                candidates_discovered: 0,
+                candidates_emitted: 0,
                 errors: 0,
+                current_path: None,
             },
         );
         state.active = Some((id, token.clone()));
@@ -159,15 +183,34 @@ impl JobController {
         Ok((id, token))
     }
 
-    fn finish(&self, job_id: JobId, job_state: JobState, report: &ScanReport) {
+    fn is_cancelling(&self, job_id: JobId) -> bool {
+        let state = self.state.lock().expect("job controller mutex poisoned");
+        state
+            .jobs
+            .get(&job_id)
+            .is_some_and(|snapshot| snapshot.state == JobState::Cancelling)
+    }
+
+    fn update_progress(&self, job_id: JobId, progress: &ScanProgress) {
+        let mut state = self.state.lock().expect("job controller mutex poisoned");
+        if let Some(snapshot) = state.jobs.get_mut(&job_id) {
+            snapshot.apply_progress(progress);
+        }
+    }
+
+    fn finish(&self, job_id: JobId, job_state: JobState, progress: &ScanProgress) {
         let mut state = self.state.lock().expect("job controller mutex poisoned");
         if let Some(snapshot) = state.jobs.get_mut(&job_id) {
             snapshot.state = job_state;
-            snapshot.files_seen = report.files_seen;
-            snapshot.candidates = report.candidates.len();
-            snapshot.errors = report.errors;
+            snapshot.apply_progress(progress);
         }
-        state.active = None;
+        if state
+            .active
+            .as_ref()
+            .is_some_and(|(active_id, _)| *active_id == job_id)
+        {
+            state.active = None;
+        }
     }
 
     fn finish_empty(&self, job_id: JobId, job_state: JobState) {
@@ -175,6 +218,87 @@ impl JobController {
         if let Some(snapshot) = state.jobs.get_mut(&job_id) {
             snapshot.state = job_state;
         }
-        state.active = None;
+        if state
+            .active
+            .as_ref()
+            .is_some_and(|(active_id, _)| *active_id == job_id)
+        {
+            state.active = None;
+        }
+    }
+}
+
+impl ScanSession {
+    pub fn next_batch(&mut self, requested_size: usize) -> Result<ScanBatch, CoreError> {
+        if self.completed {
+            return Ok(ScanBatch {
+                candidates: Vec::new(),
+                finished: true,
+                progress: self.inner.snapshot(),
+            });
+        }
+
+        match self.inner.next_candidates(requested_size) {
+            Ok(discovery_batch) => {
+                let mut scheduler = CandidateScheduler::new();
+                scheduler.extend(discovery_batch.candidates);
+                let candidates = scheduler.into_sorted_vec();
+                let progress = discovery_batch.progress;
+                self.controller.update_progress(self.job_id, &progress);
+
+                if discovery_batch.finished {
+                    let state = if self.controller.is_cancelling(self.job_id) {
+                        JobState::Cancelled
+                    } else {
+                        JobState::Succeeded
+                    };
+                    self.controller.finish(self.job_id, state, &progress);
+                    self.completed = true;
+                }
+
+                Ok(ScanBatch {
+                    candidates,
+                    finished: discovery_batch.finished,
+                    progress,
+                })
+            }
+            Err(error) => {
+                if matches!(error, CoreError::InvalidBatchSize) {
+                    return Err(error);
+                }
+                let progress = self.inner.snapshot();
+                let state = if matches!(error, CoreError::Cancelled) {
+                    JobState::Cancelled
+                } else {
+                    JobState::Failed
+                };
+                self.controller.finish(self.job_id, state, &progress);
+                self.completed = true;
+                Err(error)
+            }
+        }
+    }
+
+    pub fn cancel(&self) -> bool {
+        self.controller.cancel()
+    }
+
+    pub fn snapshot(&self) -> Option<JobSnapshot> {
+        self.controller.snapshot(self.job_id)
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.completed
+    }
+}
+
+impl Drop for ScanSession {
+    fn drop(&mut self) {
+        if !self.completed {
+            let progress = self.inner.snapshot();
+            self.controller
+                .finish(self.job_id, JobState::Cancelled, &progress);
+            self.completed = true;
+        }
     }
 }
