@@ -71,7 +71,7 @@ TXT + XLS + XLSX + WPS/ET 混合目录，重点验证：
 
 ### 05-wps
 
-从 `tests/fixtures/wps/` 复用或重建真实脱敏 WPS 样例，包括 OLE/CFB WPS、ET、DPS，以及仓库已有的 WPS Office 生成样例。
+从 `tests/fixtures/wps/manifest.json` 重建三个经过 size、SHA-256 和 OLE/CFB magic 校验的可信样例：`sample_writer.wps`、`sample_sheet.et`、`sample_slides.dps`。不再复制未经完整性验证的 WPS Office 生成文件。
 
 ## 推荐人工验收流程
 

@@ -1,64 +1,35 @@
 from __future__ import annotations
 
-import base64
-import gzip
-import hashlib
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
 
 from docseek.chunk_store import ChunkStore
 from docseek.document_adapters import TikaNativeAdapter
 from docseek.document_types import SupportMode, get_format_capability
 from docseek.indexer import DirectoryIndexer
 from docseek.search_db import SearchDatabase
+from tools.wps_fixtures import (
+    fixture_bytes as reconstruct_fixture,
+    load_manifest,
+    materialize_fixture as materialize_wps_fixture,
+)
 
 
-FIXTURE_ROOT = Path(__file__).parent / "fixtures" / "wps"
 CFB_MAGIC = bytes.fromhex("D0CF11E0A1B11AE1")
-
-FIXTURES = {
-    "sample_writer.wps": {
-        "payload": "sample_writer.wps.gz.b64",
-        "size": 10_240,
-        "sha256": "882b16b7a5e97a06e37b100457eb3141d9fb6f8ef751a88da52a99144ab17bd1",
-    },
-    "sample_sheet.et": {
-        "payload_parts": "sample_sheet.et.gz.b64.part*",
-        "size": 19_968,
-        "sha256": "d9fb29635a52a02776a270d4f4407201ecf7c70f646f9f2c0a6969dbf071dcea",
-    },
-    "sample_slides.dps": {
-        "payload_parts": "sample_slides.dps.gz.b64.part*",
-        "size": 50_176,
-        "sha256": "5ccaa90fd0b472f8c8e2474cc9ea89ce1b6da10d7571b8338ffa9940ce4fbd35",
-    },
-}
+FIXTURES = load_manifest()
 
 
 def fixture_bytes(name: str) -> bytes:
-    spec = FIXTURES[name]
-    if "payload" in spec:
-        encoded = (FIXTURE_ROOT / str(spec["payload"])).read_text(encoding="ascii")
-    else:
-        parts = sorted(FIXTURE_ROOT.glob(str(spec["payload_parts"])))
-        if not parts:
-            raise AssertionError(f"missing fixture payload parts for {name}")
-        encoded = "".join(part.read_text(encoding="ascii") for part in parts)
-
-    data = gzip.decompress(base64.b64decode(encoded))
-    if len(data) != int(spec["size"]):
-        raise AssertionError(f"fixture size mismatch for {name}: {len(data)}")
-    digest = hashlib.sha256(data).hexdigest()
-    if digest != spec["sha256"]:
-        raise AssertionError(f"fixture SHA-256 mismatch for {name}: {digest}")
-    return data
+    return reconstruct_fixture(name, manifest=FIXTURES)
 
 
 def materialize_fixture(name: str, directory: Path) -> Path:
-    target = directory / name
-    target.write_bytes(fixture_bytes(name))
-    return target
+    return materialize_wps_fixture(name, directory / name, manifest=FIXTURES)
 
 
 class WpsNativeFormatTests(unittest.TestCase):
@@ -89,8 +60,8 @@ class WpsNativeFormatTests(unittest.TestCase):
                 with self.subTest(name=name):
                     path = materialize_fixture(name, root)
                     content = "\n".join(chunk.content for chunk in adapter.iter_chunks(path))
-                    self.assertIn("测试测试", content)
-                    self.assertIn("xingyu", content)
+                    for expected in FIXTURES[name]["expected_text"]:
+                        self.assertIn(str(expected), content)
 
     def test_tika_accepts_et_container_through_template_and_2007_suffixes(self) -> None:
         """Prove suffix routing does not block Tika while real fixtures are pending.
@@ -113,8 +84,8 @@ class WpsNativeFormatTests(unittest.TestCase):
                     content = "\n".join(
                         chunk.content for chunk in adapter.iter_chunks(path)
                     )
-                    self.assertIn("测试测试", content)
-                    self.assertIn("xingyu", content)
+                    for expected in FIXTURES["sample_sheet.et"]["expected_text"]:
+                        self.assertIn(str(expected), content)
 
     def test_directory_indexer_makes_each_real_wps_fixture_searchable(self) -> None:
         for name in FIXTURES:
@@ -130,7 +101,7 @@ class WpsNativeFormatTests(unittest.TestCase):
 
                 self.assertEqual(stats.indexed, 1, name)
                 self.assertEqual(stats.skipped, 0, name)
-                matches = store.search("测试测试")
+                matches = store.search(str(FIXTURES[name]["expected_text"][0]))
                 self.assertIn(name, [match.filename for match in matches])
 
                 # The source also contains the mixed token "郑xingyu". Direct

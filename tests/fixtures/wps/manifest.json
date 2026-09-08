@@ -1,0 +1,26 @@
+{
+  "sample_writer.wps": {
+    "payload": "sample_writer.wps.gz.b64",
+    "size": 10240,
+    "sha256": "882b16b7a5e97a06e37b100457eb3141d9fb6f8ef751a88da52a99144ab17bd1",
+    "magic": "D0CF11E0A1B11AE1",
+    "expected_text": ["测试测试", "xingyu"],
+    "backend": "tika-native"
+  },
+  "sample_sheet.et": {
+    "payload_parts": "sample_sheet.et.gz.b64.part*",
+    "size": 19968,
+    "sha256": "d9fb29635a52a02776a270d4f4407201ecf7c70f646f9f2c0a6969dbf071dcea",
+    "magic": "D0CF11E0A1B11AE1",
+    "expected_text": ["测试测试", "xingyu"],
+    "backend": "tika-native"
+  },
+  "sample_slides.dps": {
+    "payload_parts": "sample_slides.dps.gz.b64.part*",
+    "size": 50176,
+    "sha256": "5ccaa90fd0b472f8c8e2474cc9ea89ce1b6da10d7571b8338ffa9940ce4fbd35",
+    "magic": "D0CF11E0A1B11AE1",
+    "expected_text": ["测试测试", "xingyu"],
+    "backend": "tika-native"
+  }
+}
