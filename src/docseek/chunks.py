@@ -36,6 +36,7 @@ def iter_document_chunks(
     target_chars: int = 12_000,
     xlsx_rows_per_chunk: int = 200,
     on_progress: ChunkProgressCallback | None = None,
+    cancelled: Callable[[], bool] | None = None,
 ) -> Iterator[DocumentChunk]:
     """Public extraction entrypoint used by the production indexer.
 
@@ -47,12 +48,14 @@ def iter_document_chunks(
     """
     from .extraction_broker import DEFAULT_EXTRACTION_BROKER
 
-    yield from DEFAULT_EXTRACTION_BROKER.iter_chunks(
-        path,
-        target_chars=target_chars,
-        spreadsheet_rows_per_chunk=xlsx_rows_per_chunk,
-        on_progress=on_progress,
-    )
+    kwargs = {
+        "target_chars": target_chars,
+        "spreadsheet_rows_per_chunk": xlsx_rows_per_chunk,
+        "on_progress": on_progress,
+    }
+    if cancelled is not None:
+        kwargs["cancelled"] = cancelled
+    yield from DEFAULT_EXTRACTION_BROKER.iter_chunks(path, **kwargs)
 
 
 def _iter_direct_document_chunks(

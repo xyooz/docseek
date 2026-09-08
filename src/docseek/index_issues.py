@@ -37,6 +37,9 @@ ERROR_LABELS = {
     "AdapterUnavailable": "缺少可用的本地解析组件",
     "LegacyExtractionTimeout": "兼容格式解析超时",
     "LegacyExtractionError": "兼容格式解析失败",
+    "ParserInterrupted": "上次解析被异常中断，已暂停自动重试",
+    "ParserCancelled": "解析已跳过",
+    "ParserQuarantined": "文件多次异常，已隔离并停止自动重试",
     "os_error": "系统访问错误",
 }
 

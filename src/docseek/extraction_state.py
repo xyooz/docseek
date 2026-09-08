@@ -15,6 +15,9 @@ class ExtractionStatus(StrEnum):
     OCR_REQUIRED = "OCR_REQUIRED"
     FAILED = "FAILED"
     TIMEOUT = "TIMEOUT"
+    SKIPPED = "SKIPPED"
+    INTERRUPTED = "INTERRUPTED"
+    QUARANTINED = "QUARANTINED"
 
 
 TERMINAL_SUCCESS_STATUSES = frozenset(
@@ -25,6 +28,13 @@ TERMINAL_SUCCESS_STATUSES = frozenset(
     }
 )
 FAILURE_STATUSES = frozenset({ExtractionStatus.FAILED, ExtractionStatus.TIMEOUT})
+DEFERRED_STATUSES = FAILURE_STATUSES | frozenset(
+    {
+        ExtractionStatus.SKIPPED,
+        ExtractionStatus.INTERRUPTED,
+        ExtractionStatus.QUARANTINED,
+    }
+)
 
 # Full reconciliation scans should not hammer a permanently broken document.
 # Precise watcher/manual retries bypass this policy in DirectoryIndexer.
@@ -45,6 +55,10 @@ def status_for_extraction_result(extension: str, chunk_count: int) -> Extraction
 def status_for_error_code(error_code: str) -> ExtractionStatus:
     if error_code == "LegacyExtractionTimeout":
         return ExtractionStatus.TIMEOUT
+    if error_code == "ParserInterrupted":
+        return ExtractionStatus.INTERRUPTED
+    if error_code == "ParserCancelled":
+        return ExtractionStatus.SKIPPED
     return ExtractionStatus.FAILED
 
 
@@ -91,7 +105,7 @@ def failed_state_is_deferred(
         value = ExtractionStatus(str(status))
     except (TypeError, ValueError):
         return False
-    if value not in FAILURE_STATUSES:
+    if value not in DEFERRED_STATUSES:
         return False
     if int(stored_revision) < int(current_revision):
         return False

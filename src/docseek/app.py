@@ -505,6 +505,21 @@ class MainWindow(app_base.MainWindow):
             self._start_index([root])
 
     def _open_index_settings(self) -> None:
+        if self.current_worker is not None:
+            # Settings may be requested while a parser is stuck. Stop the
+            # current job first, then reopen the dialog automatically once its
+            # worker has unwound; this keeps SQLite mutations out of a live
+            # indexing transaction without trapping the user behind a modal
+            # "please wait" message.
+            self._open_settings_after_index_stops = True
+            self.pending_watch_paths.clear()
+            self.watch_full_rescan_pending = False
+            self.current_worker.cancel()
+            self.statusBar().showMessage(
+                "正在停止当前索引，停止后将打开索引设置…",
+                6000,
+            )
+            return
         dialog = PausableIndexSettingsDialog(self.database, self)
         if not dialog.exec():
             return
@@ -530,6 +545,28 @@ class MainWindow(app_base.MainWindow):
             )
         else:
             self.results_model.clear()
+
+    def _open_settings_when_index_stops(self) -> None:
+        if (
+            not getattr(self, "_open_settings_after_index_stops", False)
+            or self._close_when_index_stops
+        ):
+            self._open_settings_after_index_stops = False
+            return
+        self._open_settings_after_index_stops = False
+        QTimer.singleShot(0, self._open_index_settings)
+
+    def _index_finished(self, stats) -> None:
+        super()._index_finished(stats)
+        self._open_settings_when_index_stops()
+
+    def _index_cancelled(self) -> None:
+        super()._index_cancelled()
+        self._open_settings_when_index_stops()
+
+    def _index_failed(self, message: str) -> None:
+        super()._index_failed(message)
+        self._open_settings_when_index_stops()
 
     def _refresh_all_roots(self) -> None:
         roots = self.database.get_index_roots()

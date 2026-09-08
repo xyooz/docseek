@@ -226,12 +226,17 @@ class ChunkBatchWriter:
                     status = status_for_extraction_result(extension, count)
                     conn.execute(
                         """
-                        INSERT INTO extraction_state(path, revision, status, updated_at)
-                        VALUES (?, ?, ?, ?)
+                        INSERT INTO extraction_state(
+                            path, revision, status, updated_at, owner_pid, started_at
+                        )
+                        VALUES (?, ?, ?, ?, NULL, NULL)
                         ON CONFLICT(path) DO UPDATE SET
                             revision=excluded.revision,
                             status=excluded.status,
-                            updated_at=excluded.updated_at
+                            updated_at=excluded.updated_at,
+                            owner_pid=NULL,
+                            started_at=NULL,
+                            retry_after=0
                         """,
                         (path, int(extraction_revision), str(status), time.time()),
                     )

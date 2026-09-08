@@ -54,14 +54,25 @@ class ContentExtractionBroker:
     def adapter_for(self, path: Path) -> DocumentAdapter:
         return self.registry.adapter_for(path)
 
-    def _should_isolate(self, path: Path) -> bool:
+    def _should_isolate(self, path: Path, *, force: bool = False) -> bool:
         if os.environ.get("DOCSEEK_LEGACY_WORKER") == "1":
             return False
-        if path.suffix.lower() not in DIRECT_SUPPORTED_EXTENSIONS:
+        extension = path.suffix.lower()
+        if extension not in DIRECT_SUPPORTED_EXTENSIONS:
             return True
+        adapter = self.registry.adapter_for(path)
+        # Office/PDF readers can spend an unbounded amount of time inside a
+        # native or C-extension call. Keep these formats in the same killable
+        # process lane as legacy compatibility formats so cancellation and
+        # timeouts do not depend on cooperative checks inside the parser.
+        if extension in {".docx", ".xlsx", ".pptx", ".pdf"}:
+            return adapter.name in {"tika-native", "wps-local"} or (
+                force
+                and adapter.name in {"direct", "calamine-xlsx-fast"}
+            )
         # A direct extension can still select a compatibility adapter after
         # container sniffing, notably an OLE presentation named *.pptx.
-        return self.registry.adapter_for(path).name in {"tika-native", "wps-local"}
+        return adapter.name in {"tika-native", "wps-local"}
 
     def iter_blocks(
         self,
@@ -87,13 +98,19 @@ class ContentExtractionBroker:
         target_chars: int = 12_000,
         spreadsheet_rows_per_chunk: int = 200,
         on_progress: ChunkProgressCallback | None = None,
+        cancelled=None,
     ) -> Iterator[DocumentChunk]:
         """Return chunks through the direct lane or isolated compatibility lane."""
         path = Path(path)
-        if self._should_isolate(path):
+        if self._should_isolate(path, force=cancelled is not None):
             from .legacy_isolation import iter_legacy_chunks_isolated
 
-            yield from iter_legacy_chunks_isolated(path)
+            isolation_kwargs = {}
+            if cancelled is not None:
+                isolation_kwargs["cancelled"] = cancelled
+            if on_progress is not None:
+                isolation_kwargs["on_progress"] = on_progress
+            yield from iter_legacy_chunks_isolated(path, **isolation_kwargs)
             return
 
         adapter = self.registry.adapter_for(path)
