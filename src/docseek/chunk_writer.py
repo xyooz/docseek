@@ -105,6 +105,25 @@ class ChunkBatchWriter:
         self.pending_documents = 0
         self.pending_text_chars = 0
 
+    def discard_pending(self) -> None:
+        """Rollback the current in-memory batch without touching committed work.
+
+        Cancellation is a control-flow decision, not a successful end of a
+        scan.  Committing here can make a stop request wait on a large SQLite
+        flush and can expose a half-finished batch.  The next scan can safely
+        rebuild anything that was not committed before cancellation.
+        """
+        conn = self._require_connection()
+        if self._transaction_open:
+            conn.rollback()
+            self._transaction_open = False
+        self.pending_documents = 0
+        self.pending_text_chars = 0
+
+    # Short internal spelling for call sites handling a cancellation path.
+    def abort(self) -> None:
+        self.discard_pending()
+
     def replace_document(
         self,
         *,
@@ -226,12 +245,17 @@ class ChunkBatchWriter:
                     status = status_for_extraction_result(extension, count)
                     conn.execute(
                         """
-                        INSERT INTO extraction_state(path, revision, status, updated_at)
-                        VALUES (?, ?, ?, ?)
+                        INSERT INTO extraction_state(
+                            path, revision, status, updated_at, owner_pid, started_at
+                        )
+                        VALUES (?, ?, ?, ?, NULL, NULL)
                         ON CONFLICT(path) DO UPDATE SET
                             revision=excluded.revision,
                             status=excluded.status,
-                            updated_at=excluded.updated_at
+                            updated_at=excluded.updated_at,
+                            owner_pid=NULL,
+                            started_at=NULL,
+                            retry_after=0
                         """,
                         (path, int(extraction_revision), str(status), time.time()),
                     )

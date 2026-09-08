@@ -4,13 +4,14 @@ import json
 import os
 import threading
 import time
+from itertools import islice
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
 
 from .chunk_store import ChunkStore
 from .chunk_writer import ChunkBatchWriter
-from .chunks import iter_document_chunks
+from .chunks import HTML_EXTENSIONS, TEXT_EXTENSIONS, iter_document_chunks
 from .extraction_revision import current_extraction_revision
 from .extraction_state import (
     ExtractionStatus,
@@ -35,6 +36,7 @@ from .index_formats import (
     normalize_enabled_extensions,
 )
 from .index_priority import prioritize_index_candidates
+from .document_types import KNOWN_DOCUMENT_EXTENSIONS
 from .search_db import SearchDatabase
 
 
@@ -42,8 +44,14 @@ DEFAULT_IGNORED_DIR_NAMES = {
     ".git",
     ".svn",
     ".hg",
+    ".idea",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".tox",
+    ".venv",
     "__pycache__",
     "node_modules",
+    "venv",
     "$recycle.bin",
     "system volume information",
 }
@@ -59,6 +67,11 @@ FULL_SCAN_BATCH_TEXT_CHARS = 8_000_000
 FULL_SCAN_EARLY_COMMIT_COUNTS = frozenset({16, 64})
 DISCOVERY_PROGRESS_INTERVAL_SECONDS = 0.15
 DISCOVERY_PROGRESS_CANDIDATE_STEP = 250
+MAX_INTERRUPTED_ATTEMPTS_BEFORE_QUARANTINE = 3
+LEGACY_EXTRACTING_STALE_SECONDS = 5.0
+PARSER_LEASE_EXTENSIONS = frozenset(
+    KNOWN_DOCUMENT_EXTENSIONS - TEXT_EXTENSIONS - HTML_EXTENSIONS - {".xml"}
+)
 
 
 @dataclass(slots=True)
@@ -253,6 +266,7 @@ class DirectoryIndexer:
 
     def _load_index_state(
         self,
+        root: Path | None = None,
     ) -> dict[
         str,
         tuple[
@@ -267,6 +281,13 @@ class DirectoryIndexer:
         ],
     ]:
         """Load committed and failure-only state once for reconciliation."""
+        prefix = self._normalize(root).rstrip("/\\") + os.sep if root is not None else None
+        # Directory boundaries exclude siblings such as docs-backup. A range
+        # keeps the existing path indexes usable and treats %/_ literally.
+        upper = prefix[:-1] + chr(ord(prefix[-1]) + 1) if prefix else None
+        parameters = (prefix, upper) if prefix else ()
+        file_scope = " WHERE f.path >= ? AND f.path < ?" if prefix else ""
+        failure_scope = " AND s.path >= ? AND s.path < ?" if prefix else ""
         with self.chunk_store.connect() as conn:
             file_rows = conn.execute(
                 """
@@ -286,6 +307,7 @@ class DirectoryIndexer:
                 FROM files f
                 LEFT JOIN extraction_state s ON s.path = f.path
                 """
+                + file_scope, parameters
             ).fetchall()
             failure_only_rows = conn.execute(
                 """
@@ -300,6 +322,7 @@ class DirectoryIndexer:
                 LEFT JOIN files f ON f.path = s.path
                 WHERE f.path IS NULL
                 """
+                + failure_scope, parameters
             ).fetchall()
 
         state = {
@@ -341,15 +364,145 @@ class DirectoryIndexer:
         with self.chunk_store.connect() as conn:
             conn.execute(
                 """
-                INSERT INTO extraction_state(path, revision, status, updated_at)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO extraction_state(
+                    path, revision, status, updated_at, owner_pid, started_at
+                )
+                VALUES (?, ?, ?, ?, NULL, NULL)
                 ON CONFLICT(path) DO UPDATE SET
                     revision=excluded.revision,
                     status=excluded.status,
-                    updated_at=excluded.updated_at
+                    updated_at=excluded.updated_at,
+                    owner_pid=NULL,
+                    started_at=NULL
                 """,
                 (path, int(revision), str(status), time.time()),
             )
+
+    def _record_extraction_started(
+        self,
+        path: str,
+        revision: int,
+        stat,
+    ) -> None:
+        """Persist a parser lease before entering third-party extraction code."""
+        now = time.time()
+        with self.chunk_store.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO extraction_state(
+                    path, revision, status, updated_at,
+                    source_modified_time, source_size, retry_after,
+                    owner_pid, started_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)
+                ON CONFLICT(path) DO UPDATE SET
+                    revision=excluded.revision,
+                    status=excluded.status,
+                    updated_at=excluded.updated_at,
+                    source_modified_time=excluded.source_modified_time,
+                    source_size=excluded.source_size,
+                    retry_after=0,
+                    owner_pid=excluded.owner_pid,
+                    started_at=excluded.started_at
+                """,
+                (
+                    path,
+                    int(revision),
+                    str(ExtractionStatus.EXTRACTING),
+                    now,
+                    float(stat.st_mtime),
+                    int(stat.st_size),
+                    os.getpid(),
+                    now,
+                ),
+            )
+
+    @staticmethod
+    def _process_is_alive(pid: int | None) -> bool:
+        if pid is None or int(pid) <= 0:
+            return False
+        try:
+            os.kill(int(pid), 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            return False
+        return True
+
+    def _recover_interrupted_states(self, root: Path) -> None:
+        """Quarantine parser leases left by a process that no longer exists."""
+        resolved_root = root.resolve()
+        with self.chunk_store.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT path, owner_pid, started_at, updated_at, failure_count
+                FROM extraction_state
+                WHERE status = ?
+                """,
+                (str(ExtractionStatus.EXTRACTING),),
+            ).fetchall()
+
+        recovered: list[tuple[str, str, str]] = []
+        now = time.time()
+        for row in rows:
+            stored_path = str(row["path"])
+            candidate = Path(stored_path)
+            try:
+                candidate.resolve().relative_to(resolved_root)
+            except ValueError:
+                continue
+
+            owner_pid = row["owner_pid"]
+            started_at = row["started_at"]
+            # Rows written before v12 have no owner. Treat them as abandoned;
+            # new rows are safe to identify by the owning process ID.
+            if owner_pid is None:
+                # v11 had no owner PID. Give a just-written legacy row a short
+                # grace period so an in-process repair can finish; older rows
+                # are treated as abandoned on the next reconciliation.
+                marker_time = started_at or row["updated_at"] or 0
+                abandoned = now - float(marker_time) > LEGACY_EXTRACTING_STALE_SECONDS
+            else:
+                abandoned = not self._process_is_alive(int(owner_pid))
+            if not abandoned:
+                continue
+
+            attempts = int(row["failure_count"] or 0) + 1
+            quarantined = attempts >= MAX_INTERRUPTED_ATTEMPTS_BEFORE_QUARANTINE
+            status = (
+                ExtractionStatus.QUARANTINED
+                if quarantined
+                else ExtractionStatus.INTERRUPTED
+            )
+            error_code = "ParserQuarantined" if quarantined else "ParserInterrupted"
+            detail = (
+                "文件解析进程在上次运行中异常中断，已隔离；请在问题文件中手动重试。"
+                if quarantined
+                else "文件解析进程在上次运行中异常中断，已暂停自动重试；请手动重试。"
+            )
+            with self.chunk_store.connect() as conn:
+                conn.execute(
+                    """
+                    UPDATE extraction_state
+                    SET status = ?, updated_at = ?, failure_count = ?,
+                        retry_after = ?, owner_pid = NULL, started_at = NULL
+                    WHERE path = ? AND status = ?
+                    """,
+                    (
+                        str(status),
+                        now,
+                        attempts,
+                        0,
+                        stored_path,
+                        str(ExtractionStatus.EXTRACTING),
+                    ),
+                )
+            recovered.append((stored_path, error_code, detail))
+
+        if recovered:
+            self.issues.record_many(recovered)
 
     def _record_failure_state(self, path: str, error_code: str) -> None:
         revision = current_extraction_revision(Path(path).suffix)
@@ -377,6 +530,10 @@ class DirectoryIndexer:
                 and str(previous["status"]) in {
                     str(ExtractionStatus.FAILED),
                     str(ExtractionStatus.TIMEOUT),
+                    str(ExtractionStatus.EXTRACTING),
+                    str(ExtractionStatus.SKIPPED),
+                    str(ExtractionStatus.INTERRUPTED),
+                    str(ExtractionStatus.QUARANTINED),
                 }
                 and int(previous["revision"]) == int(revision)
                 and previous["source_modified_time"] is not None
@@ -389,14 +546,24 @@ class DirectoryIndexer:
             failure_count = (
                 int(previous["failure_count"]) + 1 if same_failed_source else 1
             )
-            retry_after = now + retry_delay_seconds(status, failure_count)
+            if status in {
+                ExtractionStatus.SKIPPED,
+                ExtractionStatus.INTERRUPTED,
+                ExtractionStatus.QUARANTINED,
+            }:
+                # Explicitly deferred states are governed by their status and
+                # source metadata, not by a fake one-year timer.
+                retry_after = 0
+            else:
+                retry_after = now + retry_delay_seconds(status, failure_count)
             conn.execute(
                 """
                 INSERT INTO extraction_state(
                     path, revision, status, updated_at,
-                    source_modified_time, source_size, failure_count, retry_after
+                    source_modified_time, source_size, failure_count, retry_after,
+                    owner_pid, started_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)
                 ON CONFLICT(path) DO UPDATE SET
                     revision=excluded.revision,
                     status=excluded.status,
@@ -404,7 +571,9 @@ class DirectoryIndexer:
                     source_modified_time=excluded.source_modified_time,
                     source_size=excluded.source_size,
                     failure_count=excluded.failure_count,
-                    retry_after=excluded.retry_after
+                    retry_after=excluded.retry_after,
+                    owner_pid=NULL,
+                    started_at=NULL
                 """,
                 (
                     path,
@@ -417,6 +586,41 @@ class DirectoryIndexer:
                     retry_after,
                 ),
             )
+
+    def _record_parser_job_cancelled(self, path: str) -> None:
+        """Return an actively parsed file to PENDING after a user stop.
+
+        Stopping the index job is deliberately different from asking DocSeek
+        to skip a file.  No failure count or deferred retry is added, and a
+        later scan may process the unchanged file normally.
+        """
+        now = time.time()
+        with self.chunk_store.connect() as conn:
+            row = conn.execute(
+                "SELECT status FROM extraction_state WHERE path = ?",
+                (path,),
+            ).fetchone()
+        if row is not None and str(row["status"]) == str(ExtractionStatus.EXTRACTING):
+            with self.chunk_store.connect() as conn:
+                conn.execute(
+                    """
+                    UPDATE extraction_state
+                    SET status = ?, updated_at = ?, retry_after = 0,
+                        owner_pid = NULL, started_at = NULL
+                    WHERE path = ? AND status = ?
+                    """,
+                    (
+                        str(ExtractionStatus.PENDING),
+                        now,
+                        path,
+                        str(ExtractionStatus.EXTRACTING),
+                    ),
+                )
+            self.issues.clear(path)
+
+    # Compatibility alias for embedders that used the old private helper.
+    def _record_parser_cancelled(self, path: str) -> None:
+        self._record_parser_job_cancelled(path)
 
     def _remove_indexed_path(self, path: str, stats: IndexStats) -> None:
         if self._has_file_record(path):
@@ -432,6 +636,8 @@ class DirectoryIndexer:
         # distinguish a killable parser timeout from a filesystem failure.
         if type(exc).__name__ == "LegacyExtractionTimeout":
             return "LegacyExtractionTimeout"
+        if type(exc).__name__ == "LegacyExtractionCancelled":
+            return "ParserCancelled"
         if isinstance(exc, PermissionError):
             return "permission_denied"
         if isinstance(exc, FileNotFoundError):
@@ -555,6 +761,19 @@ class DirectoryIndexer:
             if (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns) != expected_source:
                 raise SourceChangedDuringExtraction("文件在解析期间发生变化，已放弃本次结果，等待重新索引。")
 
+        # This commit is intentionally separate from the chunk transaction:
+        # if the parser process or the host dies, the next launch can see that
+        # extraction was in progress even though no document rows were saved.
+        if extension in PARSER_LEASE_EXTENSIONS:
+            if self._cancel.is_set():
+                raise IndexCancelled()
+            # The lease is written through a separate metadata connection. Do
+            # not let a preceding lightweight text batch hold SQLite's single
+            # writer slot while that durable parser marker is recorded.
+            if writer is not None:
+                writer.flush()
+            self._record_extraction_started(normalized, extraction_revision, stat)
+
         common_args = {
             "path": normalized,
             "filename": path.name,
@@ -567,6 +786,7 @@ class DirectoryIndexer:
                 on_progress=report_detail
                 if on_detail or on_progress or extension == ".xlsx"
                 else None,
+                cancelled=self._cancel.is_set,
             ),
         }
         if writer is not None:
@@ -644,6 +864,7 @@ class DirectoryIndexer:
                     on_detail=on_detail,
                 )
             except IndexCancelled:
+                self._record_parser_job_cancelled(normalized)
                 raise
             except SourceChangedDuringExtraction as exc:
                 stats.skipped += 1
@@ -657,6 +878,9 @@ class DirectoryIndexer:
                 self._remove_indexed_path(normalized, stats)
                 self.issues.clear(normalized)
             except Exception as exc:
+                if type(exc).__name__ == "LegacyExtractionCancelled":
+                    self._record_parser_job_cancelled(normalized)
+                    raise IndexCancelled() from exc
                 stats.skipped += 1
                 error_code = self._error_code(exc)
                 self._record_failure_state(normalized, error_code)
@@ -677,7 +901,8 @@ class DirectoryIndexer:
         stats = IndexStats()
         seen_paths: set[str] = set()
         successful_paths: set[str] = set()
-        index_state = self._load_index_state()
+        self._recover_interrupted_states(root)
+        index_state = self._load_index_state(root)
 
         discovery_issue_clears: set[str] = set()
         discovery_issue_records: list[tuple[str, str, str]] = []
@@ -694,25 +919,37 @@ class DirectoryIndexer:
                     stats,
                 )
 
-        candidates = list(
-            prioritize_index_candidates(
-                self._iter_supported_files(
+        discovery = iter(self._iter_supported_files(
                     root,
                     stats,
                     issue_clears=discovery_issue_clears,
                     issue_records=discovery_issue_records,
                     on_discovery=discovery_callback,
                     normalized_candidates=normalized_candidates,
-                )
-            )
-        )
-        if on_candidates_ready:
-            on_candidates_ready(len(candidates))
-        elif on_progress:
-            on_progress(
-                Path(f"扫描完成 · 共发现 {len(candidates):,} 个候选文件"),
-                stats,
-            )
+                ))
+
+        def candidate_batches():
+            discovered = 0
+            while True:
+                if self._cancel.is_set():
+                    writer.abort()
+                    raise IndexCancelled()
+                # Finish the previous write transaction before more filesystem
+                # discovery; issue metadata remains buffered until the end.
+                writer.flush()
+                batch = list(islice(discovery, 128))
+                discovered += len(batch)
+                finished = len(batch) < 128
+                if finished:
+                    if on_candidates_ready:
+                        on_candidates_ready(discovered)
+                    elif on_progress:
+                        on_progress(
+                            Path(f"扫描完成 · 共发现 {discovered:,} 个候选文件"), stats
+                        )
+                yield from prioritize_index_candidates(batch)
+                if finished:
+                    break
 
         # Discovery stays outside the batched chunk writer. Healthy directory
         # traversal therefore performs no SQLite writes, while issue cleanup is
@@ -720,17 +957,17 @@ class DirectoryIndexer:
         # indexing starts. This preserves the single-writer invariant that fixed
         # the real Windows ``database is locked`` reports without paying one
         # connection/commit per visited directory.
-        self.issues.clear_many(discovery_issue_clears)
-        self.issues.record_many(discovery_issue_records)
+        last_path = None
 
         with ChunkBatchWriter(
             self.chunk_store,
             batch_size=FULL_SCAN_BATCH_SIZE,
             max_batch_text_chars=FULL_SCAN_BATCH_TEXT_CHARS,
         ) as writer:
-            for path in candidates:
+            for path in candidate_batches():
+                last_path = path
                 if self._cancel.is_set():
-                    writer.flush()
+                    writer.abort()
                     raise IndexCancelled()
 
                 stats.scanned += 1
@@ -760,7 +997,8 @@ class DirectoryIndexer:
                     if on_progress and stats.scanned % 250 == 0:
                         on_progress(path, stats)
                 except IndexCancelled:
-                    writer.flush()
+                    writer.abort()
+                    self._record_parser_job_cancelled(normalized)
                     raise
                 except SourceChangedDuringExtraction as exc:
                     writer.flush()
@@ -776,17 +1014,23 @@ class DirectoryIndexer:
                     self._remove_indexed_path(normalized, stats)
                     self.issues.clear(normalized)
                 except Exception as exc:
+                    if type(exc).__name__ == "LegacyExtractionCancelled":
+                        writer.abort()
+                        self._record_parser_job_cancelled(normalized)
+                        raise IndexCancelled() from exc
                     writer.flush()
                     stats.skipped += 1
                     error_code = self._error_code(exc)
                     self._record_failure_state(normalized, error_code)
                     self.issues.record(normalized, error_code, str(exc))
 
-        if on_progress and candidates:
+        self.issues.clear_many(discovery_issue_clears)
+        self.issues.record_many(discovery_issue_records)
+        if on_progress and last_path is not None:
             # Always publish the terminal count. Unchanged files deliberately
             # report in coarse batches, so without this event a short refresh
             # could disappear while its progress bar still showed 0%.
-            on_progress(candidates[-1], stats)
+            on_progress(last_path, stats)
 
         self.issues.clear_many(successful_paths)
         stats.removed += remove_missing_under_root(self.chunk_store, str(root), seen_paths)

@@ -8,9 +8,10 @@ from unittest import mock
 import fitz
 
 from docseek.chunk_store import ChunkStore
-from docseek.extraction_state import ExtractionStatus
-from docseek.indexer import DirectoryIndexer
-from docseek.legacy_isolation import LegacyExtractionTimeout
+from docseek.chunks import DocumentChunk
+from docseek.extraction_state import ExtractionStatus, failed_state_is_deferred
+from docseek.indexer import DirectoryIndexer, IndexCancelled
+from docseek.legacy_isolation import LegacyExtractionCancelled, LegacyExtractionTimeout
 from docseek.schema import CURRENT_SCHEMA_VERSION
 from docseek.search_db import SearchDatabase
 
@@ -161,6 +162,77 @@ class ExtractionStateTests(unittest.TestCase):
         self.assertEqual(str(self._state(target)["status"]), ExtractionStatus.TIMEOUT)
         issue = DirectoryIndexer(self.database).issues.list(limit=1)[0]
         self.assertEqual(issue.error_code, "LegacyExtractionTimeout")
+
+    def test_manual_deferred_states_do_not_depend_on_a_fake_retry_date(self) -> None:
+        common = dict(
+            stored_revision=1,
+            current_revision=1,
+            source_modified_time=12.0,
+            source_size=42,
+            current_modified_time=12.0,
+            current_size=42,
+            retry_after=0,
+            now=10_000_000_000,
+        )
+        for status in (
+            ExtractionStatus.INTERRUPTED,
+            ExtractionStatus.SKIPPED,
+            ExtractionStatus.QUARANTINED,
+        ):
+            with self.subTest(status=status):
+                self.assertTrue(failed_state_is_deferred(status, **common))
+
+        self.assertFalse(
+            failed_state_is_deferred(
+                ExtractionStatus.INTERRUPTED,
+                **{**common, "current_size": 43},
+            )
+        )
+
+    def test_stopping_parser_returns_extracting_file_to_pending(self) -> None:
+        target = self.root / "large.xlsx"
+        target.write_bytes(b"placeholder")
+        indexer = DirectoryIndexer(self.database)
+        normalized = str(target.resolve())
+        revision = 1
+        indexer._record_extraction_started(normalized, revision, target.stat())
+        indexer._record_parser_job_cancelled(normalized)
+
+        with self.store.connect() as conn:
+            state = conn.execute(
+                """
+                SELECT status, retry_after, failure_count, owner_pid, started_at
+                FROM extraction_state WHERE path = ?
+                """,
+                (normalized,),
+            ).fetchone()
+        self.assertEqual(str(state["status"]), ExtractionStatus.PENDING)
+        self.assertEqual(float(state["retry_after"]), 0.0)
+        self.assertEqual(int(state["failure_count"]), 0)
+        self.assertIsNone(state["owner_pid"])
+        self.assertIsNone(state["started_at"])
+
+        # PENDING is deliberately retryable on the next explicit/full scan.
+        with mock.patch(
+            "docseek.indexer.iter_document_chunks",
+            return_value=iter([DocumentChunk(0, "工作表 Sheet1 · 行 1", "恢复内容")]),
+        ):
+            stats = indexer.update_paths([target])
+        self.assertEqual(stats.indexed, 1)
+
+    def test_isolated_cancel_exception_uses_pending_state_not_skipped(self) -> None:
+        target = self.root / "cancelled.xlsx"
+        target.write_bytes(b"placeholder")
+        indexer = DirectoryIndexer(self.database)
+
+        with mock.patch(
+            "docseek.indexer.iter_document_chunks",
+            side_effect=LegacyExtractionCancelled("user stop"),
+        ):
+            with self.assertRaises(IndexCancelled):
+                indexer.update_paths([target])
+
+        self.assertEqual(str(self._state(target)["status"]), ExtractionStatus.PENDING)
 
 
 if __name__ == "__main__":

@@ -3,7 +3,7 @@ from __future__ import annotations
 import sqlite3
 
 
-CURRENT_SCHEMA_VERSION = 11
+CURRENT_SCHEMA_VERSION = 12
 LEGACY_EXTRACTION_REVISION = 1
 
 
@@ -32,8 +32,9 @@ def _ensure_extraction_state(conn: sqlite3.Connection) -> None:
     """Create/upgrade the lightweight per-file extraction-state sidecar.
 
     v8 introduced ``revision``. v9 added durable lifecycle status and a
-    timestamp. v10 adds only failure retry metadata so repeatedly broken files
-    can be deferred without touching the files/chunks/FTS tables.
+    timestamp. v10 adds failure retry metadata. v12 adds the owning process
+    and extraction start time so a later launch can distinguish a live parser
+    from a parser abandoned by a crashed process.
 
     Existing v8 rows intentionally default to INDEXED. The indexer still
     requires an actual chunk for INDEXED, so historical zero-chunk rows are
@@ -82,6 +83,14 @@ def _ensure_extraction_state(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE extraction_state "
             "ADD COLUMN retry_after REAL NOT NULL DEFAULT 0"
+        )
+    if "owner_pid" not in columns:
+        conn.execute(
+            "ALTER TABLE extraction_state ADD COLUMN owner_pid INTEGER"
+        )
+    if "started_at" not in columns:
+        conn.execute(
+            "ALTER TABLE extraction_state ADD COLUMN started_at REAL"
         )
 
     if previous_version < 8:

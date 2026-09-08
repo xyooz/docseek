@@ -574,8 +574,14 @@ class ChunkStore:
         max_size: int | None,
     ) -> None:
         if extension:
-            clauses.append("f.extension = :extension")
-            params["extension"] = extension
+            from .format_filters import filter_extensions
+            extensions = filter_extensions(extension)
+            placeholders = []
+            for index, value in enumerate(extensions):
+                key = f"extension_{index}"
+                placeholders.append(":" + key)
+                params[key] = value
+            clauses.append("f.extension IN (" + ",".join(placeholders) + ")")
         if path_contains:
             clauses.append("LOWER(f.path) LIKE :path_contains")
             params["path_contains"] = f"%{path_contains.casefold()}%"

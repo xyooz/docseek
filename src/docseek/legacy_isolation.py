@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -13,8 +14,9 @@ from .document_adapters import DEFAULT_ADAPTER_REGISTRY
 from .legacy_worker import iter_chunk_file
 
 
-LEGACY_PARSE_TIMEOUT_SECONDS = 120.0
-LEGACY_ADAPTER_TIMEOUT_SECONDS = 45.0
+LEGACY_PARSE_TIMEOUT_SECONDS = 300.0
+LEGACY_ADAPTER_TIMEOUT_SECONDS = 300.0
+LEGACY_ADAPTER_STALL_TIMEOUT_SECONDS = 45.0
 LEGACY_WORKER_POLL_SECONDS = 0.10
 
 
@@ -55,12 +57,15 @@ def legacy_worker_command(
     output: Path,
     *,
     adapter_name: str | None = None,
+    progress: Path | None = None,
 ) -> list[str]:
     """Build the worker command for source and PyInstaller-frozen executions."""
     worker_args: list[str] = []
     if adapter_name:
         worker_args.extend(["--adapter", adapter_name])
     worker_args.extend([str(source), str(output)])
+    if progress is not None:
+        worker_args.extend(["--progress", str(progress)])
 
     if getattr(sys, "frozen", False):
         return [sys.executable, "--docseek-extract-worker", *worker_args]
@@ -87,20 +92,68 @@ def wait_for_worker(
     process: subprocess.Popen[bytes],
     *,
     timeout_seconds: float,
+    stall_timeout_seconds: float | None = None,
     cancelled: Callable[[], bool] | None = None,
+    progress_path: Path | None = None,
+    on_progress: Callable[[str, int], None] | None = None,
 ) -> int:
-    deadline = time.monotonic() + max(0.01, float(timeout_seconds))
+    started_at = time.monotonic()
+    deadline = started_at + max(0.01, float(timeout_seconds))
+    stall_limit = (
+        None
+        if stall_timeout_seconds is None
+        else max(0.01, min(float(stall_timeout_seconds), float(timeout_seconds)))
+    )
+    last_progress_at = started_at
+    progress_offset = 0
+
+    def drain_progress() -> bool:
+        nonlocal progress_offset
+        if progress_path is None or not progress_path.exists():
+            return False
+        try:
+            data = progress_path.read_bytes()
+        except OSError:
+            return False
+        pending = data[progress_offset:]
+        lines = pending.splitlines(keepends=True)
+        if lines and not lines[-1].endswith((b"\n", b"\r")):
+            complete_lines = lines[:-1]
+            progress_offset = len(data) - len(lines[-1])
+        else:
+            complete_lines = lines
+            progress_offset = len(data)
+        received = False
+        for line in complete_lines:
+            try:
+                location, current = json.loads(line.decode("ascii"))
+                if on_progress is not None:
+                    on_progress(str(location), int(current))
+                received = True
+            except (ValueError, TypeError, UnicodeDecodeError):
+                continue
+        return received
+
     while True:
+        if drain_progress():
+            last_progress_at = time.monotonic()
         code = process.poll()
         if code is not None:
+            drain_progress()
             return int(code)
         if cancelled is not None and cancelled():
             _terminate_process(process)
-            raise LegacyExtractionCancelled("旧格式解析已取消")
-        if time.monotonic() >= deadline:
+            raise LegacyExtractionCancelled("兼容格式解析已取消")
+        now = time.monotonic()
+        if stall_limit is not None and now - last_progress_at >= stall_limit:
             _terminate_process(process)
             raise LegacyExtractionTimeout(
-                f"旧格式解析超过 {timeout_seconds:g} 秒，已终止该解析进程"
+                f"兼容格式解析连续 {stall_limit:g} 秒没有进展，已终止该解析进程"
+            )
+        if now >= deadline:
+            _terminate_process(process)
+            raise LegacyExtractionTimeout(
+                f"兼容格式解析超过 {timeout_seconds:g} 秒，已终止该解析进程"
             )
         time.sleep(LEGACY_WORKER_POLL_SECONDS)
 
@@ -129,7 +182,9 @@ def iter_legacy_chunks_isolated(
     *,
     timeout_seconds: float = LEGACY_PARSE_TIMEOUT_SECONDS,
     adapter_timeout_seconds: float = LEGACY_ADAPTER_TIMEOUT_SECONDS,
+    stall_timeout_seconds: float | None = LEGACY_ADAPTER_STALL_TIMEOUT_SECONDS,
     cancelled: Callable[[], bool] | None = None,
+    on_progress: Callable[[str, int], None] | None = None,
 ) -> Iterator[DocumentChunk]:
     """Extract one compatibility document through a bounded parser cascade."""
     source = Path(source)
@@ -147,14 +202,14 @@ def iter_legacy_chunks_isolated(
 
         for attempt_no, adapter_name in enumerate(adapter_names, start=1):
             if cancelled is not None and cancelled():
-                raise LegacyExtractionCancelled("旧格式解析已取消")
+                raise LegacyExtractionCancelled("兼容格式解析已取消")
 
             elapsed = time.monotonic() - started
             remaining = float(timeout_seconds) - elapsed
             if remaining <= 0:
                 summary = "；".join(attempts) if attempts else "尚未完成任何解析器"
                 raise LegacyExtractionTimeout(
-                    f"旧格式解析总时限 {timeout_seconds:g} 秒已用尽：{summary}"
+                    f"兼容格式解析总时限 {timeout_seconds:g} 秒已用尽：{summary}"
                 )
 
             attempt_timeout = min(
@@ -163,11 +218,17 @@ def iter_legacy_chunks_isolated(
             )
             output = temp_root / f"chunks-{attempt_no}.bin"
             error_path = output.with_name(output.name + ".error.txt")
-            command = legacy_worker_command(
-                source,
-                output,
-                adapter_name=adapter_name,
-            )
+            progress = temp_root / f"progress-{attempt_no}.jsonl"
+            progress.unlink(missing_ok=True)
+            command_kwargs: dict[str, object] = {
+                "adapter_name": adapter_name,
+            }
+            # Preserve the historical call signature when no progress channel
+            # is requested.  This keeps embedders that replace the command
+            # factory backwards-compatible with the isolation API.
+            if on_progress is not None:
+                command_kwargs["progress"] = progress
+            command = legacy_worker_command(source, output, **command_kwargs)
 
             kwargs: dict[str, object] = {
                 "stdin": subprocess.DEVNULL,
@@ -183,7 +244,14 @@ def iter_legacy_chunks_isolated(
                     code = wait_for_worker(
                         process,
                         timeout_seconds=attempt_timeout,
+                        stall_timeout_seconds=(
+                            min(float(stall_timeout_seconds), attempt_timeout)
+                            if stall_timeout_seconds is not None and on_progress is not None
+                            else None
+                        ),
                         cancelled=cancelled,
+                        progress_path=progress,
+                        on_progress=on_progress,
                     )
                 except LegacyExtractionTimeout:
                     attempts.append(f"{adapter_name}: 超时")

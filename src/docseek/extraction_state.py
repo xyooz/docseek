@@ -15,6 +15,9 @@ class ExtractionStatus(StrEnum):
     OCR_REQUIRED = "OCR_REQUIRED"
     FAILED = "FAILED"
     TIMEOUT = "TIMEOUT"
+    SKIPPED = "SKIPPED"
+    INTERRUPTED = "INTERRUPTED"
+    QUARANTINED = "QUARANTINED"
 
 
 TERMINAL_SUCCESS_STATUSES = frozenset(
@@ -25,6 +28,14 @@ TERMINAL_SUCCESS_STATUSES = frozenset(
     }
 )
 FAILURE_STATUSES = frozenset({ExtractionStatus.FAILED, ExtractionStatus.TIMEOUT})
+MANUAL_DEFERRED_STATUSES = frozenset(
+    {
+        ExtractionStatus.SKIPPED,
+        ExtractionStatus.INTERRUPTED,
+        ExtractionStatus.QUARANTINED,
+    }
+)
+DEFERRED_STATUSES = FAILURE_STATUSES | MANUAL_DEFERRED_STATUSES
 
 # Full reconciliation scans should not hammer a permanently broken document.
 # Precise watcher/manual retries bypass this policy in DirectoryIndexer.
@@ -45,6 +56,10 @@ def status_for_extraction_result(extension: str, chunk_count: int) -> Extraction
 def status_for_error_code(error_code: str) -> ExtractionStatus:
     if error_code == "LegacyExtractionTimeout":
         return ExtractionStatus.TIMEOUT
+    if error_code == "ParserInterrupted":
+        return ExtractionStatus.INTERRUPTED
+    if error_code == "ParserCancelled":
+        return ExtractionStatus.SKIPPED
     return ExtractionStatus.FAILED
 
 
@@ -91,7 +106,7 @@ def failed_state_is_deferred(
         value = ExtractionStatus(str(status))
     except (TypeError, ValueError):
         return False
-    if value not in FAILURE_STATUSES:
+    if value not in DEFERRED_STATUSES:
         return False
     if int(stored_revision) < int(current_revision):
         return False
@@ -101,6 +116,11 @@ def failed_state_is_deferred(
         return False
     if int(source_size) != int(current_size):
         return False
+    # These states are an explicit user/recovery decision, not a timed retry.
+    # Keep the unchanged file deferred indefinitely until its metadata changes
+    # or a precise manual retry path clears the state.
+    if value in MANUAL_DEFERRED_STATUSES:
+        return True
     current_time = time.time() if now is None else float(now)
     return current_time < float(retry_after)
 

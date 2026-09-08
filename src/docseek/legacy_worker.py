@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import pickle
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import Iterable
 
@@ -69,6 +70,7 @@ def extract_to_file(
     output: Path,
     *,
     adapter_name: str | None = None,
+    on_progress: Callable[[str, int], None] | None = None,
 ) -> int:
     """Extract one document inside the killable worker process.
 
@@ -83,9 +85,12 @@ def extract_to_file(
     try:
         if adapter_name:
             adapter = _adapter_for_name(source, adapter_name)
-            chunks = adapter.iter_chunks(source)
+            chunks = adapter.iter_chunks(source, on_progress=on_progress)
         else:
-            chunks = DEFAULT_EXTRACTION_BROKER.iter_chunks(source)
+            chunks = DEFAULT_EXTRACTION_BROKER.iter_chunks(
+                source,
+                on_progress=on_progress,
+            )
         return write_chunk_file(output, chunks)
     finally:
         if previous is None:
@@ -97,10 +102,20 @@ def extract_to_file(
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     adapter_name: str | None = None
+    progress_path: Path | None = None
     if len(args) == 4 and args[0] == "--adapter":
         adapter_name = args[1]
         source = Path(args[2])
         output = Path(args[3])
+    elif len(args) == 6 and args[0] == "--adapter" and args[4] == "--progress":
+        adapter_name = args[1]
+        source = Path(args[2])
+        output = Path(args[3])
+        progress_path = Path(args[5])
+    elif len(args) == 4 and args[2] == "--progress":
+        source = Path(args[0])
+        output = Path(args[1])
+        progress_path = Path(args[3])
     elif len(args) == 2:
         source = Path(args[0])
         output = Path(args[1])
@@ -109,8 +124,26 @@ def main(argv: list[str] | None = None) -> int:
 
     error_path = output.with_name(output.name + ".error.txt")
     error_path.unlink(missing_ok=True)
+    progress_handle = None
+    progress_callback = None
+    if progress_path is not None:
+        progress_path.parent.mkdir(parents=True, exist_ok=True)
+        progress_handle = progress_path.open("a", encoding="ascii")
+
+        def progress_callback(location: str, current: int) -> None:
+            import json
+
+            progress_handle.write(
+                json.dumps([str(location), int(current)], ensure_ascii=True) + "\n"
+            )
+            progress_handle.flush()
     try:
-        extract_to_file(source, output, adapter_name=adapter_name)
+        extract_to_file(
+            source,
+            output,
+            adapter_name=adapter_name,
+            on_progress=progress_callback,
+        )
     except BaseException as exc:  # worker boundary: persist failures for windowed builds
         try:
             error_path.write_text(
@@ -120,6 +153,9 @@ def main(argv: list[str] | None = None) -> int:
         except OSError:
             pass
         return 1
+    finally:
+        if progress_handle is not None:
+            progress_handle.close()
     return 0
 
 

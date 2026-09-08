@@ -32,8 +32,14 @@ ERROR_LABELS = {
     "BadZipFile": "Office 文件损坏或格式异常",
     "FileDataError": "文件数据异常",
     "EmptyFileError": "空文件或无法解析",
-    "LegacyExtractionTimeout": "旧格式解析超时",
-    "LegacyExtractionError": "旧格式解析失败",
+    "PackageNotFoundError": "Office 文件损坏、加密或格式与扩展名不一致",
+    "ParseError": "XML 文件损坏或结构异常",
+    "AdapterUnavailable": "缺少可用的本地解析组件",
+    "LegacyExtractionTimeout": "兼容格式解析超时",
+    "LegacyExtractionError": "兼容格式解析失败",
+    "ParserInterrupted": "上次解析被异常中断，已暂停自动重试",
+    "ParserCancelled": "解析已跳过",
+    "ParserQuarantined": "文件多次异常，已隔离并停止自动重试",
     "os_error": "系统访问错误",
 }
 

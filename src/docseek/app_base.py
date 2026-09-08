@@ -6,7 +6,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QObject, QRunnable, Qt, QThreadPool, QTimer, Signal
+from PySide6.QtCore import QEvent, QObject, QRunnable, QSize, Qt, QThreadPool, QTimer, Signal
 from PySide6.QtGui import QAction, QGuiApplication
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -42,9 +42,11 @@ from .query_parser import parse_query, query_filter_chips, remove_query_filter
 from .results_model import SearchResultsModel
 from .search_db import SearchDatabase
 from .search_sort import SORT_FILENAME, SORT_MODIFIED, SORT_RELEVANCE
-from .search_worker import SearchRequest, SearchResponse, SearchWorker
+from .search_worker import SearchRequest, SearchResponse, SearchWorker, _publish_generation
 from .settings_dialog import IndexSettingsDialog
 from .ui_theme import APPLICATION_STYLESHEET
+from .ui_icons import line_icon
+from .format_filters import filter_extensions
 from .watcher import WatchBatch, WatchManager
 
 
@@ -54,10 +56,16 @@ PAGE_SIZE = 100
 
 FILE_FILTERS = [
     ("全部类型", None),
+    ("文字 · Office / WPS", "@writer"),
+    ("表格 · Office / WPS", "@sheet"),
+    ("演示 · Office / WPS", "@slides"),
     ("PDF", ".pdf"),
-    ("Word", ".docx"),
-    ("Excel", ".xlsx"),
-    ("PowerPoint", ".pptx"),
+    ("仅 DOCX", ".docx"),
+    ("仅 XLSX", ".xlsx"),
+    ("仅 PPTX", ".pptx"),
+    ("仅 DOC", ".doc"),
+    ("仅 XLS", ".xls"),
+    ("PowerPoint 97-2003", ".ppt"),
     ("WPS 文字", ".wps"),
     ("WPS 表格", ".et"),
     ("WPS 表格模板", ".ett"),
@@ -65,6 +73,7 @@ FILE_FILTERS = [
     ("WPS 表格模板 2007/2010", ".ettx"),
     ("WPS 演示", ".dps"),
     ("HTML", ".html"),
+    ("XML", ".xml"),
     ("Markdown", ".md"),
     ("文本", ".txt"),
 ]
@@ -94,7 +103,7 @@ def result_entry_row(row_count: int, *, move_down: bool) -> int | None:
 
 def empty_result_html(*, filter_only: bool, has_filters: bool = False,
                       indexing: bool = False, issue_count: int = 0,
-                      paused_roots: int = 0) -> str:
+                      paused_roots: int = 0, disabled_format: bool = False) -> str:
     """Return actionable empty-result guidance for the preview pane."""
     if filter_only:
         message = (
@@ -110,6 +119,8 @@ def empty_result_html(*, filter_only: bool, has_filters: bool = False,
         message += '<p><a href="docseek:relax">保留关键词，移除元数据筛选</a></p>'
     if indexing:
         message += "<p>索引任务正在运行，部分新内容可能尚不可搜索。</p>"
+    if disabled_format:
+        message += "<p>当前筛选的文件格式未启用索引，可在“索引设置 → 文件规则”中开启。</p>"
     if issue_count:
         message += f"<p>索引中有 {issue_count} 个问题文件，可能影响搜索覆盖。</p>"
     if paused_roots:
@@ -272,7 +283,7 @@ class MainWindow(QMainWindow):
         self.search_input.setObjectName("searchInput")
         self.search_input.setClearButtonEnabled(True)
         self.search_input.setPlaceholderText(
-            '搜索正文或直接筛选，例如：信贷 ext:pdf，或 ext:pdf after:2026-01-01'
+            "搜索文件名或正文关键词"
         )
         self.search_input.setToolTip(
             "支持：ext:pdf 类型 · path:制度 路径 · after:2026-01-01 / before:2026-09-01 日期 · "
@@ -282,6 +293,8 @@ class MainWindow(QMainWindow):
         self.search_input.setMinimumHeight(44)
 
         self.search_button = QPushButton("搜索")
+        self.search_button.setIcon(line_icon("search", color="#FFFFFF"))
+        self.search_button.setIconSize(QSize(18, 18))
         self.search_button.setProperty("primary", True)
         self.search_button.setMinimumHeight(44)
         self.search_button.setMinimumWidth(76)
@@ -309,21 +322,40 @@ class MainWindow(QMainWindow):
         self.filter_chip_layout.setContentsMargins(0, 0, 0, 0)
         self.filter_chip_layout.setSpacing(6)
         self.filter_chip_label = QLabel("当前筛选：")
-        self.filter_chip_label.setStyleSheet("color: palette(mid);")
+        self.filter_chip_label.setStyleSheet("color: #64748B;")
         self.filter_chip_layout.addWidget(self.filter_chip_label)
         self.filter_chip_layout.addStretch(1)
         self.filter_chip_buttons: list[QToolButton] = []
 
         self.choose_button = QPushButton("添加目录")
+        self.choose_button.setIcon(line_icon("folder-plus"))
         self.refresh_button = QPushButton("刷新索引")
         self.settings_button = QPushButton("索引设置")
-        self.cancel_button = QPushButton("停止")
+        self.settings_button.setIcon(line_icon("settings"))
+        self.more_button = QToolButton()
+        self.more_button.setText("更多")
+        self.more_button.setIcon(line_icon("more"))
+        self.more_button.setIconSize(QSize(18, 18))
+        self.more_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        workspace_menu = QMenu(self.more_button)
+        refresh_action = workspace_menu.addAction("重新扫描全部目录")
+        refresh_action.setIcon(line_icon("refresh"))
+        refresh_action.triggered.connect(self._refresh_all_roots)
+        self.more_button.setMenu(workspace_menu)
+        self.more_button.setToolTip("不常用的索引操作")
+        self.refresh_button.setVisible(False)
+        self.cancel_button = QPushButton("停止本次索引")
+        self.cancel_button.setToolTip(
+            "结束当前扫描，保留已完成的索引；自动监测继续运行。"
+            "如需暂停目录更新，请在索引设置中取消勾选该目录。"
+        )
         self.cancel_button.setProperty("danger", True)
         for button in (
             self.choose_button,
             self.refresh_button,
             self.settings_button,
             self.cancel_button,
+            self.more_button,
         ):
             button.setMinimumHeight(38)
         self.cancel_button.setVisible(False)
@@ -353,7 +385,7 @@ class MainWindow(QMainWindow):
         progress_text.setSpacing(2)
         self.index_file_label = QLabel("准备建立索引…")
         self.index_detail_label = QLabel("")
-        self.index_detail_label.setStyleSheet("color: palette(mid); font-size: 11px;")
+        self.index_detail_label.setStyleSheet("color: #64748B; font-size: 12px;")
         progress_text.addWidget(self.index_file_label)
         progress_text.addWidget(self.index_detail_label)
 
@@ -374,6 +406,7 @@ class MainWindow(QMainWindow):
         self.results.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.results.setSortingEnabled(False)
         self.results.setWordWrap(False)
+        self.results.setTextElideMode(Qt.ElideMiddle)
         self.results.verticalHeader().setVisible(False)
         self.results.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         self.results.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
@@ -455,8 +488,8 @@ class MainWindow(QMainWindow):
         self.workspace_bar_layout.setSpacing(6)
         self.workspace_bar_layout.addWidget(self.scope_label, 1)
         self.workspace_bar_layout.addWidget(self.choose_button)
-        self.workspace_bar_layout.addWidget(self.refresh_button)
         self.workspace_bar_layout.addWidget(self.settings_button)
+        self.workspace_bar_layout.addWidget(self.more_button)
         self.workspace_bar_layout.addWidget(self.cancel_button)
 
         layout = QVBoxLayout()
@@ -557,6 +590,7 @@ class MainWindow(QMainWindow):
         if self._defer_close_until_index_stops(event):
             return
         self.search_generation += 1
+        _publish_generation(self.chunk_store, self.search_generation)
         self.search_thread_pool.clear()
         self.thread_pool.clear()
         self.watch_manager.stop()
@@ -965,6 +999,11 @@ class MainWindow(QMainWindow):
                 has_filters=parse_query(self.search_input.text()).has_filters or self.type_filter.currentData() is not None,
                 indexing=self.current_worker is not None,
                 issue_count=issues, paused_roots=paused,
+                disabled_format=bool(
+                    request.extension and not set(
+                        filter_extensions(request.extension)
+                    ).intersection(IndexFormatStore(self.database).enabled_extensions())
+                ),
             ))
         elif request.select_first and displayed:
             index = self.results_model.index(0, 0)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import re
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from pathlib import Path
@@ -35,6 +36,7 @@ def iter_document_chunks(
     target_chars: int = 12_000,
     xlsx_rows_per_chunk: int = 200,
     on_progress: ChunkProgressCallback | None = None,
+    cancelled: Callable[[], bool] | None = None,
 ) -> Iterator[DocumentChunk]:
     """Public extraction entrypoint used by the production indexer.
 
@@ -46,12 +48,14 @@ def iter_document_chunks(
     """
     from .extraction_broker import DEFAULT_EXTRACTION_BROKER
 
-    yield from DEFAULT_EXTRACTION_BROKER.iter_chunks(
-        path,
-        target_chars=target_chars,
-        spreadsheet_rows_per_chunk=xlsx_rows_per_chunk,
-        on_progress=on_progress,
-    )
+    kwargs = {
+        "target_chars": target_chars,
+        "spreadsheet_rows_per_chunk": xlsx_rows_per_chunk,
+        "on_progress": on_progress,
+    }
+    if cancelled is not None:
+        kwargs["cancelled"] = cancelled
+    yield from DEFAULT_EXTRACTION_BROKER.iter_chunks(path, **kwargs)
 
 
 def _iter_direct_document_chunks(
@@ -72,6 +76,8 @@ def _iter_direct_document_chunks(
         yield from _iter_text_chunks(path, target_chars=target_chars)
     elif suffix in HTML_EXTENSIONS:
         yield from _iter_html_chunks(path, target_chars=target_chars)
+    elif suffix == ".xml":
+        yield from _iter_xml_chunks(path, target_chars=target_chars)
     elif suffix == ".docx":
         yield from _iter_docx_chunks(path, target_chars=target_chars)
     elif suffix == ".xlsx":
@@ -294,6 +300,124 @@ def _iter_html_chunks(path: Path, *, target_chars: int) -> Iterator[DocumentChun
         location = f"网页内容 {ordinal + 1}"
         if chunk_heading:
             location += f" · 标题 {chunk_heading}"
+        yield DocumentChunk(ordinal, location, "\n".join(buffer))
+
+
+class _TolerantXmlTextParser(HTMLParser):
+    """Collect searchable XML text without requiring a single strict root.
+
+    Real developer and office trees contain XML fragments, vendor entities and
+    occasionally truncated metadata files. HTMLParser gives us a bounded,
+    non-executing markup tokenizer that still extracts useful text from those
+    files instead of classifying every non-canonical document as corrupt.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=False)
+        self.elements: list[str] = []
+        self.lines: list[tuple[str, str]] = []
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        element = tag.rsplit(":", 1)[-1][:80]
+        self.elements.append(element)
+        values = [" ".join(str(value).split()) for _name, value in attrs if value]
+        text = " ".join(value for value in values if value)
+        if text:
+            self.lines.append((element, text))
+
+    def handle_startendtag(self, tag: str, attrs) -> None:
+        element = tag.rsplit(":", 1)[-1][:80]
+        values = [" ".join(str(value).split()) for _name, value in attrs if value]
+        text = " ".join(value for value in values if value)
+        if text:
+            self.lines.append((element, text))
+
+    def handle_endtag(self, tag: str) -> None:
+        target = tag.rsplit(":", 1)[-1]
+        for index in range(len(self.elements) - 1, -1, -1):
+            if self.elements[index].casefold() == target.casefold():
+                del self.elements[index:]
+                return
+
+    def handle_data(self, data: str) -> None:
+        text = " ".join(data.split())
+        if text:
+            self.lines.append((self.elements[-1] if self.elements else "", text))
+
+    def handle_entityref(self, name: str) -> None:
+        # Keep custom entity names searchable without attempting expansion.
+        if name:
+            self.lines.append((self.elements[-1] if self.elements else "", name))
+
+    def handle_charref(self, name: str) -> None:
+        if name:
+            self.lines.append((self.elements[-1] if self.elements else "", name))
+
+    def drain_lines(self) -> list[tuple[str, str]]:
+        lines, self.lines = self.lines, []
+        return lines
+
+
+def _markup_encoding(sample: bytes) -> str:
+    if sample.startswith(b"\xef\xbb\xbf"):
+        return "utf-8-sig"
+    if sample.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return "utf-16"
+    declaration = sample[:512].decode("ascii", errors="ignore")
+    match = re.search(
+        r"<\?xml\b[^>]*\bencoding\s*=\s*(['\"])([^'\"]+)\1",
+        declaration,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        candidate = match.group(2).strip()
+        if candidate:
+            try:
+                "".encode(candidate)
+                return candidate
+            except LookupError:
+                pass
+    return _detect_text_encoding_sample(sample)
+
+
+def _iter_xml_chunks(path: Path, *, target_chars: int) -> Iterator[DocumentChunk]:
+    """Stream useful text from strict XML, fragments and vendor XML variants."""
+    parser = _TolerantXmlTextParser()
+    ordinal = 0
+    buffer: list[str] = []
+    char_count = 0
+    current_element = ""
+
+    def ready_chunks() -> Iterator[DocumentChunk]:
+        nonlocal ordinal, buffer, char_count, current_element
+        for element, text in parser.drain_lines():
+            current_element = element or current_element
+            buffer.append(text)
+            char_count += len(text)
+            if char_count >= target_chars:
+                location = f"XML 内容 {ordinal + 1}"
+                if current_element:
+                    location += f" · 元素 {current_element}"
+                yield DocumentChunk(ordinal, location, "\n".join(buffer))
+                ordinal += 1
+                buffer = []
+                char_count = 0
+
+    with path.open("rb") as raw:
+        sample = raw.read(TEXT_ENCODING_SAMPLE_BYTES)
+        encoding = _markup_encoding(sample)
+        raw.seek(0)
+        with io.TextIOWrapper(raw, encoding=encoding, errors="ignore", newline=None) as text:
+            while data := text.read(TEXT_ENCODING_SAMPLE_BYTES):
+                parser.feed(data)
+                yield from ready_chunks()
+    parser.close()
+    yield from ready_chunks()
+
+    if buffer:
+        location = f"XML 内容 {ordinal + 1}"
+        if current_element:
+            location += f" · 元素 {current_element}"
         yield DocumentChunk(ordinal, location, "\n".join(buffer))
 
 

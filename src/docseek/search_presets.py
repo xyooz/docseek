@@ -29,7 +29,7 @@ class SearchState:
 
     def normalized(self) -> SearchState:
         extension = self.extension.strip().lower() if self.extension else None
-        if extension and not extension.startswith("."):
+        if extension and not extension.startswith((".", "@")):
             extension = f".{extension}"
         return SearchState(
             query=self.query.strip(),
@@ -65,7 +65,9 @@ def search_state_label(state: SearchState, *, max_query_chars: int = 44) -> str:
 
     details: list[str] = []
     if state.extension:
-        details.append(state.extension.lstrip(".").upper())
+        from .format_filters import FORMAT_FAMILIES
+        family = FORMAT_FAMILIES.get(state.extension)
+        details.append(family[0] if family else state.extension.lstrip(".").upper())
     if state.sort_mode == SORT_MODIFIED:
         details.append("最近修改")
     elif state.sort_mode == SORT_FILENAME:

@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -117,6 +118,51 @@ class LegacyIsolationTests(unittest.TestCase):
         with self.assertRaises(LegacyExtractionTimeout):
             wait_for_worker(process, timeout_seconds=0.10)
         self.assertIsNotNone(process.poll())
+
+    def test_stall_timeout_terminates_worker_before_hard_limit(self) -> None:
+        process = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(10)"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        started = time.monotonic()
+        with self.assertRaises(LegacyExtractionTimeout):
+            wait_for_worker(
+                process,
+                timeout_seconds=2,
+                stall_timeout_seconds=0.10,
+            )
+        self.assertIsNotNone(process.poll())
+        self.assertLess(time.monotonic() - started, 1.0)
+
+    def test_progress_keeps_worker_alive_until_hard_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            progress = Path(temp_dir) / "progress.jsonl"
+            code = (
+                "import json,sys,time; "
+                "p=open(sys.argv[1], 'a', encoding='ascii'); "
+                "[(p.write(json.dumps(['Sheet1', i])+'\\n'), p.flush(), time.sleep(.03)) "
+                "for i in range(1, 6)]; p.close()"
+            )
+            process = subprocess.Popen(
+                [sys.executable, "-c", code, str(progress)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            events: list[tuple[str, int]] = []
+            self.assertEqual(
+                wait_for_worker(
+                    process,
+                    timeout_seconds=1,
+                    stall_timeout_seconds=0.12,
+                    progress_path=progress,
+                    on_progress=lambda location, current: events.append(
+                        (location, current)
+                    ),
+                ),
+                0,
+            )
+            self.assertEqual(events[-1], ("Sheet1", 5))
 
     def test_cancel_terminates_worker(self) -> None:
         process = subprocess.Popen(

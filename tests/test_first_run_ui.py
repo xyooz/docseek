@@ -67,7 +67,19 @@ class FirstRunUiTests(unittest.TestCase):
                     self.assertFalse(window.workspace_bar_panel.isHidden())
                     self.assertFalse(window.type_filter.isHidden())
                     self.assertFalse(window.settings_button.isHidden())
-                    for extension in (".wps", ".et", ".dps"):
+                    self.assertTrue(window.refresh_button.isHidden())
+                    self.assertFalse(window.more_button.isHidden())
+                    self.assertTrue(window.favorite_button.isHidden())
+                    self.assertFalse(window.search_button.icon().isNull())
+                    self.assertFalse(window.history_button.icon().isNull())
+                    self.assertFalse(window.choose_button.icon().isNull())
+                    self.assertFalse(window.settings_button.icon().isNull())
+                    self.assertIsNotNone(window.more_button.menu())
+                    self.assertIn(
+                        "重新扫描全部目录",
+                        [action.text() for action in window.more_button.menu().actions()],
+                    )
+                    for extension in (".wps", ".et", ".dps", ".ppt", ".xml"):
                         self.assertGreaterEqual(window.type_filter.findData(extension), 0)
                 finally:
                     window.close()

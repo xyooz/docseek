@@ -107,6 +107,11 @@ class SearchWorker(QRunnable):
 
             try:
                 search_store = get_thread_search_store(self.store.db_path)
+                with search_store.connect() as connection:
+                    connection.set_progress_handler(
+                        lambda: int(_is_stale(self.store, self.request.generation)),
+                        1000,
+                    )
                 engine = ExactGroupedSearchEngine(search_store)
                 page = engine.search_page(
                     self.request.query,
@@ -121,8 +126,14 @@ class SearchWorker(QRunnable):
                     sort_mode=self.request.sort_mode,
                 )
             except Exception as exc:
+                if _is_stale(self.store, self.request.generation):
+                    self._emit_stale(started)
+                    return
                 self.signals.failed.emit(self.request.generation, str(exc))
                 return
+            finally:
+                if "connection" in locals():
+                    connection.set_progress_handler(None, 0)
 
         elapsed_ms = (time.perf_counter() - started) * 1000.0
         self.signals.finished.emit(

@@ -46,7 +46,9 @@ _FORMATS = (
         ".xlsx", DocumentFamily.SPREADSHEET, (SupportMode.DIRECT,), "Excel / WPS Spreadsheet"
     ),
     FormatCapability(
-        ".pptx", DocumentFamily.PRESENTATION, (SupportMode.DIRECT,), "PowerPoint / WPS Presentation"
+        ".pptx", DocumentFamily.PRESENTATION,
+        (SupportMode.DIRECT, SupportMode.TIKA_NATIVE, SupportMode.WPS_LOCAL),
+        "PowerPoint / WPS Presentation"
     ),
     FormatCapability(".pdf", DocumentFamily.PDF, (SupportMode.DIRECT,), "PDF"),
 
@@ -129,7 +131,10 @@ _FORMATS = (
         ".xhtml", DocumentFamily.TEXT,
         (SupportMode.DIRECT, SupportMode.TIKA_NATIVE), "XHTML"
     ),
-    FormatCapability(".xml", DocumentFamily.TEXT, (SupportMode.TIKA_NATIVE,), "XML"),
+    FormatCapability(
+        ".xml", DocumentFamily.TEXT,
+        (SupportMode.DIRECT, SupportMode.TIKA_NATIVE), "XML"
+    ),
     FormatCapability(".epub", DocumentFamily.WRITER, (SupportMode.TIKA_NATIVE,), "EPUB"),
     FormatCapability(".eml", DocumentFamily.WRITER, (SupportMode.TIKA_NATIVE,), "E-mail Message"),
     FormatCapability(".msg", DocumentFamily.WRITER, (SupportMode.TIKA_NATIVE,), "Outlook Message"),

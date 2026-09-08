@@ -26,6 +26,18 @@ from .document_types import (
 from .wps_adapter import can_convert_extension, converted_openxml
 
 
+OLE_COMPOUND_MAGIC = bytes.fromhex("D0CF11E0A1B11AE1")
+
+
+def _has_ole_compound_header(path: Path) -> bool:
+    """Detect a legacy/renamed Office container with one bounded read."""
+    try:
+        with Path(path).open("rb") as handle:
+            return handle.read(len(OLE_COMPOUND_MAGIC)) == OLE_COMPOUND_MAGIC
+    except OSError:
+        return False
+
+
 class AdapterUnavailable(RuntimeError):
     """A known document format has no usable local parser on this machine."""
 
@@ -224,6 +236,14 @@ class DirectDocumentAdapter:
 
     def is_available(self) -> bool:
         return True
+
+    def supports_path(self, path: Path) -> bool:
+        # Some WPS/Office files carry a .pptx suffix while retaining the old
+        # OLE/CFB container. python-pptx cannot read that container, so let the
+        # isolated Tika/WPS compatibility cascade inspect it instead.
+        return not (
+            path.suffix.lower() == ".pptx" and _has_ole_compound_header(path)
+        )
 
     def iter_chunks(
         self,

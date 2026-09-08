@@ -41,10 +41,24 @@ OFFICE_WPS_EXTENSIONS = frozenset(
     }
 )
 
+COMMON_LOCAL_EXTENSIONS = frozenset(
+    {
+        ".pdf",
+        ".txt",
+        ".md",
+        ".log",
+        ".csv",
+        ".tsv",
+        ".html",
+        ".htm",
+        ".xhtml",
+    }
+)
+
 # A new DocSeek index starts with the formats most office users actually need.
 # Existing databases without this setting retain the historical all-format
 # behaviour; SearchDatabase writes this explicit default only for a new index.
-DEFAULT_ENABLED_INDEX_EXTENSIONS = OFFICE_WPS_EXTENSIONS
+DEFAULT_ENABLED_INDEX_EXTENSIONS = OFFICE_WPS_EXTENSIONS | COMMON_LOCAL_EXTENSIONS
 
 INDEX_FORMAT_GROUPS = (
     IndexFormatGroup(

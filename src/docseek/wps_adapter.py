@@ -3,7 +3,9 @@ from __future__ import annotations
 import contextlib
 import importlib.util
 import platform
+import shutil
 import tempfile
+import time
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -158,11 +160,36 @@ def convert_with_wps(source: Path, target: Path) -> None:
         pythoncom.CoUninitialize()
 
 
+def _cleanup_conversion_directory(directory: Path, *, timeout: float = 5.0) -> None:
+    """Remove WPS output after its out-of-process file handle is released.
+
+    WPS can return from Quit() a moment before its presentation process closes
+    the converted PPTX. Cleanup must not turn an otherwise successful extraction
+    into a parser failure, so retry sharing violations and make the final cleanup
+    best-effort.
+    """
+    deadline = time.monotonic() + max(0.0, timeout)
+    while True:
+        try:
+            shutil.rmtree(directory)
+            return
+        except FileNotFoundError:
+            return
+        except PermissionError:
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.1)
+    shutil.rmtree(directory, ignore_errors=True)
+
+
 @contextlib.contextmanager
 def converted_openxml(source: Path) -> Iterator[Path]:
     """Yield a temporary OOXML copy without modifying the user's source file."""
     component = _component_for(source)
-    with tempfile.TemporaryDirectory(prefix="docseek-wps-") as directory:
-        target = Path(directory) / f"{source.stem}{component.target_extension}"
+    directory = Path(tempfile.mkdtemp(prefix="docseek-wps-"))
+    try:
+        target = directory / f"{source.stem}{component.target_extension}"
         convert_with_wps(source, target)
         yield target
+    finally:
+        _cleanup_conversion_directory(directory)

@@ -88,7 +88,7 @@ class PausableIndexSettingsDialog(IndexSettingsDialog):
             "勾选 = 正常监测和刷新；取消勾选 = 暂停更新，但保留现有索引和搜索结果。"
         )
         note.setWordWrap(True)
-        note.setStyleSheet("color: palette(mid);")
+        note.setStyleSheet("color: #64748B;")
         self.layout().insertWidget(0, note)
         self.settings_note = note
 
@@ -99,7 +99,8 @@ class PausableIndexSettingsDialog(IndexSettingsDialog):
             self._make_checkable(item, checked=self._item_path(item) not in paused)
 
         self.root_list.setToolTip(
-            "取消勾选目录可暂停 watcher 和手动刷新；重新勾选并保存后会自动进行增量校准。"
+            "取消勾选并保存后，暂停该目录的自动监测和手动刷新，已有内容仍可搜索。"
+            "重新勾选并保存后恢复更新。"
         )
 
         patterns = self.file_exclusion_store.patterns()
@@ -117,7 +118,7 @@ class PausableIndexSettingsDialog(IndexSettingsDialog):
             "只匹配文件名，不支持路径或正则；保存后会校准活动目录并清理已有匹配索引。"
         )
         pattern_hint.setWordWrap(True)
-        pattern_hint.setStyleSheet("color: palette(mid); font-size: 11px;")
+        pattern_hint.setStyleSheet("color: #64748B; font-size: 12px;")
 
         pattern_group = QGroupBox("排除文件规则")
         pattern_layout = QVBoxLayout()
@@ -131,12 +132,12 @@ class PausableIndexSettingsDialog(IndexSettingsDialog):
         self.health_summary_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.reconcile_time_label = QLabel()
         self.reconcile_time_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        self.reconcile_time_label.setStyleSheet("color: palette(mid);")
+        self.reconcile_time_label.setStyleSheet("color: #64748B;")
         self.health_hint_label = QLabel(
             "占用包含 SQLite 主库及当前 WAL/SHM 文件；暂停目录的现有索引仍计入文件数和空间占用。"
         )
         self.health_hint_label.setWordWrap(True)
-        self.health_hint_label.setStyleSheet("color: palette(mid); font-size: 11px;")
+        self.health_hint_label.setStyleSheet("color: #64748B; font-size: 12px;")
         self.diagnostic_button = QPushButton("导出脱敏诊断…")
         self.diagnostic_button.setToolTip(
             "导出版本、运行环境和索引健康统计；不包含目录路径、文件名、正文、问题详情或搜索记录。"
@@ -146,7 +147,7 @@ class PausableIndexSettingsDialog(IndexSettingsDialog):
             "诊断文件只包含聚合状态，不包含索引目录路径、问题文件路径、文件名、正文或搜索记录。"
         )
         self.diagnostic_hint_label.setWordWrap(True)
-        self.diagnostic_hint_label.setStyleSheet("color: palette(mid); font-size: 11px;")
+        self.diagnostic_hint_label.setStyleSheet("color: #64748B; font-size: 12px;")
 
         health_group = QGroupBox("索引概况")
         health_layout = QVBoxLayout()
@@ -176,14 +177,14 @@ class PausableIndexSettingsDialog(IndexSettingsDialog):
 
         self.maintenance_status_label = QLabel("")
         self.maintenance_status_label.setWordWrap(True)
-        self.maintenance_status_label.setStyleSheet("color: palette(mid);")
+        self.maintenance_status_label.setStyleSheet("color: #64748B;")
         maintenance_hint = QLabel(
             "备份包含完整索引正文，应按敏感文件保护。重建会先自动备份再重新建立索引；"
             "清空会先自动备份，再删除本地索引和索引范围配置，但绝不会删除源文件。"
             "恢复采用下次启动前替换，避免运行中覆盖正在使用的数据库。"
         )
         maintenance_hint.setWordWrap(True)
-        maintenance_hint.setStyleSheet("color: palette(mid); font-size: 11px;")
+        maintenance_hint.setStyleSheet("color: #64748B; font-size: 12px;")
 
         maintenance_group = QGroupBox("维护与恢复")
         maintenance_layout = QVBoxLayout()
@@ -234,28 +235,26 @@ class PausableIndexSettingsDialog(IndexSettingsDialog):
         rules_layout.setContentsMargins(10, 12, 10, 10)
         rules_layout.setSpacing(12)
         rules_left = QVBoxLayout()
-        rules_left.addWidget(self.format_group, 2)
-        rules_left.addWidget(self.pattern_group, 1)
+        rules_left.addWidget(self.format_group)
+        rules_left.addWidget(self.pattern_group)
         rules_left.addWidget(self.advanced_group)
-        rules_right = QVBoxLayout()
-        rules_right.addWidget(self.storage_group)
-        rules_right.addStretch(1)
+        rules_left.addStretch(1)
         rules_layout.addLayout(rules_left, 1)
-        rules_layout.addLayout(rules_right, 1)
 
         status_page = QWidget()
         status_layout = QVBoxLayout(status_page)
         status_layout.setContentsMargins(10, 12, 10, 10)
         status_layout.setSpacing(10)
+        status_layout.addWidget(self.storage_group)
         status_layout.addWidget(self.health_group)
         status_layout.addWidget(self.issues_group)
         status_layout.addWidget(self.maintenance_group)
         status_layout.addStretch(1)
 
         self.settings_tabs = QTabWidget()
-        self.settings_tabs.addTab(directory_page, "目录与排除")
-        self.settings_tabs.addTab(rules_page, "规则与存储")
-        self.settings_tabs.addTab(status_page, "状态与维护")
+        self.settings_tabs.addTab(directory_page, "索引范围")
+        self.settings_tabs.addTab(rules_page, "文件规则")
+        self.settings_tabs.addTab(status_page, "存储与维护")
         main_layout.insertWidget(1, self.settings_tabs, 1)
 
     def _indexed_count_under_root(self, root: str) -> int:
@@ -303,9 +302,11 @@ class PausableIndexSettingsDialog(IndexSettingsDialog):
             self.remove_exclude_button,
             self.file_pattern_edit,
             *self.format_checkboxes.values(),
+            self.recommended_formats_button,
             self.office_formats_button,
             self.all_formats_button,
             self.clear_formats_button,
+            self.format_preset_combo,
             self.max_size,
             self.storage_move_button,
             self.backup_button,
@@ -664,7 +665,7 @@ class PausableIndexSettingsDialog(IndexSettingsDialog):
                 "之后仍存在的问题可再使用一键重试。"
             )
             hint.setWordWrap(True)
-            hint.setStyleSheet("color: palette(mid);")
+            hint.setStyleSheet("color: #64748B;")
             dialog.layout().insertWidget(1, hint)
             dialog.exec()
             self._refresh_issue_summary()

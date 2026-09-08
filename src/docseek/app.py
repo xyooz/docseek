@@ -39,6 +39,7 @@ from .storage_location import (
     pending_index_storage_move,
     stage_index_storage_move,
 )
+from .ui_icons import line_icon
 
 # Keep the established public helpers available from docseek.app. Existing
 # tests, scripts and users should not need to know that the stable core window
@@ -125,7 +126,10 @@ class MainWindow(app_base.MainWindow):
 
     def _install_search_state_controls(self) -> None:
         self.history_button = QToolButton()
-        self.history_button.setText("历史 ▾")
+        self.history_button.setText("搜索记录")
+        self.history_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.history_button.setAccessibleName("搜索记录")
+        self.history_button.setIcon(line_icon("history"))
         self.history_button.setMinimumHeight(38)
         self.history_button.setMinimumWidth(72)
         self.history_button.setToolTip("打开常用搜索和最近搜索")
@@ -136,6 +140,7 @@ class MainWindow(app_base.MainWindow):
         self.favorite_button.setMinimumWidth(84)
         self.favorite_button.setToolTip("收藏当前关键词、筛选和排序，方便以后直接恢复")
         self.favorite_button.clicked.connect(self._toggle_saved_search)
+        self.favorite_button.setVisible(False)
 
         self.help_button = QToolButton()
         self.help_button.setText("帮助")
@@ -143,14 +148,19 @@ class MainWindow(app_base.MainWindow):
         self.help_button.setMinimumWidth(58)
         self.help_button.setToolTip("查看搜索语法、结构定位和快捷键（F1）")
         self.help_button.clicked.connect(self._show_search_help)
+        self.help_button.setVisible(False)
 
         top_bar = self.workspace_bar_layout
         insert_at = top_bar.indexOf(self.choose_button)
         if insert_at < 0:
             insert_at = top_bar.count()
         top_bar.insertWidget(insert_at, self.history_button)
-        top_bar.insertWidget(insert_at + 1, self.favorite_button)
-        top_bar.insertWidget(top_bar.indexOf(self.cancel_button), self.help_button)
+        if self.more_button.menu() is not None:
+            self.more_button.menu().addSeparator()
+            help_menu_action = self.more_button.menu().addAction(
+                "搜索帮助", self._show_search_help
+            )
+            help_menu_action.setIcon(line_icon("help"))
 
         help_action = QAction("搜索帮助", self)
         help_action.setShortcut("F1")
@@ -176,6 +186,11 @@ class MainWindow(app_base.MainWindow):
             # interactive so restored widths remain user-adjustable.
             for section in range(header.count()):
                 header.setSectionResizeMode(section, QHeaderView.Interactive)
+        else:
+            # Keep details available from the column menu without forcing a
+            # horizontal scroll bar in the initial results pane.
+            header.setSectionHidden(3, True)
+            header.setSectionHidden(5, True)
 
         # The filename column is the one invariant: a result table without it
         # is too easy to make unusable by accident.
@@ -296,12 +311,13 @@ class MainWindow(app_base.MainWindow):
             self.sort_filter,
             self.search_button,
             self.history_button,
-            self.favorite_button,
-            self.help_button,
-            self.refresh_button,
             self.settings_button,
+            self.more_button,
         ):
             widget.setVisible(has_roots)
+        self.help_button.setVisible(False)
+        self.favorite_button.setVisible(False)
+        self.refresh_button.setVisible(False)
 
         if not has_roots:
             self.filter_chip_panel.setVisible(False)
@@ -489,6 +505,21 @@ class MainWindow(app_base.MainWindow):
             self._start_index([root])
 
     def _open_index_settings(self) -> None:
+        if self.current_worker is not None:
+            # Settings may be requested while a parser is stuck. Stop the
+            # current job first, then reopen the dialog automatically once its
+            # worker has unwound; this keeps SQLite mutations out of a live
+            # indexing transaction without trapping the user behind a modal
+            # "please wait" message.
+            self._open_settings_after_index_stops = True
+            self.pending_watch_paths.clear()
+            self.watch_full_rescan_pending = False
+            self.current_worker.cancel()
+            self.statusBar().showMessage(
+                "正在停止当前索引，停止后将打开索引设置…",
+                6000,
+            )
+            return
         dialog = PausableIndexSettingsDialog(self.database, self)
         if not dialog.exec():
             return
@@ -514,6 +545,28 @@ class MainWindow(app_base.MainWindow):
             )
         else:
             self.results_model.clear()
+
+    def _open_settings_when_index_stops(self) -> None:
+        if (
+            not getattr(self, "_open_settings_after_index_stops", False)
+            or self._close_when_index_stops
+        ):
+            self._open_settings_after_index_stops = False
+            return
+        self._open_settings_after_index_stops = False
+        QTimer.singleShot(0, self._open_index_settings)
+
+    def _index_finished(self, stats) -> None:
+        super()._index_finished(stats)
+        self._open_settings_when_index_stops()
+
+    def _index_cancelled(self) -> None:
+        super()._index_cancelled()
+        self._open_settings_when_index_stops()
+
+    def _index_failed(self, message: str) -> None:
+        super()._index_failed(message)
+        self._open_settings_when_index_stops()
 
     def _refresh_all_roots(self) -> None:
         roots = self.database.get_index_roots()
