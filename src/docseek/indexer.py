@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import threading
 import time
@@ -37,7 +38,21 @@ from .index_formats import (
 )
 from .index_priority import prioritize_index_candidates
 from .document_types import KNOWN_DOCUMENT_EXTENSIONS
+from .scan_backend import (
+    MAX_SCAN_BATCH_SIZE,
+    PythonScanBackend,
+    RustScanBackendUnavailable,
+    ScanBackend,
+    ScanCancelled,
+    ScanConfig,
+    ScanSession,
+    iter_scan_candidates,
+    resolve_scan_backend,
+)
 from .search_db import SearchDatabase
+
+
+logger = logging.getLogger(__name__)
 
 
 DEFAULT_IGNORED_DIR_NAMES = {
@@ -118,6 +133,7 @@ class DirectoryIndexer:
         excluded_paths: list[str] | None = None,
         excluded_file_patterns: list[str] | None = None,
         enabled_extensions: set[str] | frozenset[str] | None = None,
+        scan_backend: ScanBackend | None = None,
     ) -> None:
         self.database = database
         self.chunk_store = ChunkStore(database.db_path)
@@ -148,7 +164,12 @@ class DirectoryIndexer:
             if enabled_extensions is None
             else normalize_enabled_extensions(enabled_extensions)
         )
+        self.scan_backend = (
+            scan_backend if scan_backend is not None else resolve_scan_backend()
+        )
         self._cancel = threading.Event()
+        self._scan_session_lock = threading.Lock()
+        self._active_scan_session: ScanSession | None = None
 
     def _load_runtime_settings(
         self,
@@ -194,6 +215,45 @@ class DirectoryIndexer:
 
     def cancel(self) -> None:
         self._cancel.set()
+        with self._scan_session_lock:
+            session = self._active_scan_session
+        if session is None:
+            return
+        try:
+            session.cancel()
+        except Exception:
+            # The Python cancellation event remains authoritative for parser
+            # and indexing work. A backend cancellation failure must not make
+            # the UI stop action itself fail.
+            logger.warning("scan backend cancellation failed", exc_info=True)
+
+    def _set_active_scan_session(self, session: ScanSession) -> None:
+        with self._scan_session_lock:
+            self._active_scan_session = session
+
+    def _clear_active_scan_session(self, session: ScanSession) -> None:
+        with self._scan_session_lock:
+            if self._active_scan_session is session:
+                self._active_scan_session = None
+
+    def _start_scan_session(self, root: Path) -> ScanSession:
+        config = ScanConfig(
+            enabled_extensions=self.enabled_extensions,
+            ignored_dir_names=self.ignored_dir_names,
+            excluded_paths=self.excluded_paths,
+            excluded_file_patterns=self.excluded_file_patterns,
+            max_file_size=self.max_file_size,
+        )
+        try:
+            session = self.scan_backend.start_scan(root, config)
+        except RustScanBackendUnavailable:
+            logger.warning(
+                "Rust scan backend is unavailable; falling back to Python scanner"
+            )
+            self.scan_backend = PythonScanBackend()
+            session = self.scan_backend.start_scan(root, config)
+        self._set_active_scan_session(session)
+        return session
 
     @staticmethod
     def _normalize(path: Path) -> str:
@@ -898,6 +958,7 @@ class DirectoryIndexer:
         on_candidates_ready: Callable[[int], None] | None = None,
     ) -> IndexStats:
         root = root.resolve()
+        self._cancel.clear()
         stats = IndexStats()
         seen_paths: set[str] = set()
         successful_paths: set[str] = set()
@@ -919,37 +980,78 @@ class DirectoryIndexer:
                     stats,
                 )
 
-        discovery = iter(self._iter_supported_files(
-                    root,
-                    stats,
-                    issue_clears=discovery_issue_clears,
-                    issue_records=discovery_issue_records,
-                    on_discovery=discovery_callback,
-                    normalized_candidates=normalized_candidates,
-                ))
+        def report_backend_discovery(path: Path, count: int) -> None:
+            # ScanBackend owns traversal now, but directory issue cleanup stays
+            # in the indexer lifecycle. A progress path is either a visited
+            # directory or an entry inside one; clearing the corresponding
+            # directory key preserves the old no-stale-issue contract without
+            # opening SQLite during discovery.
+            candidates = [path]
+            if not path.is_dir():
+                candidates.append(path.parent)
+            for candidate in candidates:
+                if candidate.is_dir():
+                    discovery_issue_clears.add(self._normalize(candidate))
+            if discovery_callback is not None:
+                discovery_callback(path, count)
+
+        scan_session = self._start_scan_session(root)
+        discovery = iter_scan_candidates(
+            scan_session,
+            max_items=MAX_SCAN_BATCH_SIZE,
+            on_discovery=report_backend_discovery,
+            on_progress=lambda progress: setattr(stats, "excluded", progress.excluded),
+        )
+        normalized_directories = {root: self._normalize(root)}
+
+        def normalize_backend_candidate(path: Path) -> str:
+            key = str(path)
+            existing = normalized_candidates.get(key)
+            if existing is not None:
+                return existing
+
+            parent = path.parent
+            normalized_directory = normalized_directories.get(parent)
+            if normalized_directory is None:
+                normalized_directory = self._normalize(parent)
+                normalized_directories[parent] = normalized_directory
+            normalized = self._normalize_discovered_candidate(
+                path,
+                normalized_directory=normalized_directory,
+                is_symlink=path.is_symlink(),
+            )
+            normalized_candidates[key] = normalized
+            return normalized
 
         def candidate_batches():
             discovered = 0
-            while True:
-                if self._cancel.is_set():
-                    writer.abort()
-                    raise IndexCancelled()
-                # Finish the previous write transaction before more filesystem
-                # discovery; issue metadata remains buffered until the end.
-                writer.flush()
-                batch = list(islice(discovery, 128))
-                discovered += len(batch)
-                finished = len(batch) < 128
-                if finished:
-                    if on_candidates_ready:
-                        on_candidates_ready(discovered)
-                    elif on_progress:
-                        on_progress(
-                            Path(f"扫描完成 · 共发现 {discovered:,} 个候选文件"), stats
-                        )
-                yield from prioritize_index_candidates(batch)
-                if finished:
-                    break
+            try:
+                while True:
+                    if self._cancel.is_set():
+                        writer.abort()
+                        raise IndexCancelled()
+                    # Finish the previous write transaction before more filesystem
+                    # discovery; issue metadata remains buffered until the end.
+                    writer.flush()
+                    try:
+                        batch = list(islice(discovery, MAX_SCAN_BATCH_SIZE))
+                    except ScanCancelled as exc:
+                        writer.abort()
+                        raise IndexCancelled() from exc
+                    discovered += len(batch)
+                    finished = len(batch) < MAX_SCAN_BATCH_SIZE
+                    if finished:
+                        if on_candidates_ready:
+                            on_candidates_ready(discovered)
+                        elif on_progress:
+                            on_progress(
+                                Path(f"扫描完成 · 共发现 {discovered:,} 个候选文件"), stats
+                            )
+                    yield from prioritize_index_candidates(batch)
+                    if finished:
+                        break
+            finally:
+                self._clear_active_scan_session(scan_session)
 
         # Discovery stays outside the batched chunk writer. Healthy directory
         # traversal therefore performs no SQLite writes, while issue cleanup is
@@ -971,11 +1073,7 @@ class DirectoryIndexer:
                     raise IndexCancelled()
 
                 stats.scanned += 1
-                normalized = normalized_candidates.get(str(path))
-                if normalized is None:
-                    # Defensive fallback for callers/subclasses that provide a
-                    # candidate outside the normal discovery snapshot.
-                    normalized = self._normalize(path)
+                normalized = normalize_backend_candidate(path)
                 seen_paths.add(normalized)
 
                 try:

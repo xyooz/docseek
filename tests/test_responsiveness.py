@@ -87,15 +87,38 @@ class ResponsivenessTests(unittest.TestCase):
             db = SearchDatabase(Path(tmp) / "index.db")
             indexer = DirectoryIndexer(db)
             discovered, first_index = [], []
-            original = indexer._iter_supported_files
-            def walking(*args, **kwargs):
-                for path in original(*args, **kwargs):
-                    discovered.append(path)
-                    yield path
+
+            original_start_scan = indexer.scan_backend.start_scan
+
+            class RecordingSession:
+                def __init__(self, session):
+                    self._session = session
+
+                def next_batch(self, max_items=128):
+                    batch = self._session.next_batch(max_items)
+                    discovered.extend(batch.candidates)
+                    return batch
+
+                def cancel(self):
+                    return self._session.cancel()
+
+                def snapshot(self):
+                    return self._session.snapshot()
+
+                def is_finished(self):
+                    return self._session.is_finished()
+
+            def recording_start_scan(root_path, config=None):
+                return RecordingSession(original_start_scan(root_path, config))
+
             def progress(path, stats):
                 if stats.indexed and not first_index:
                     first_index.append(len(discovered))
-            with patch.object(indexer, "_iter_supported_files", walking):
+            with patch.object(
+                indexer.scan_backend,
+                "start_scan",
+                side_effect=recording_start_scan,
+            ):
                 stats = indexer.scan(root, on_progress=progress)
             self.assertEqual(stats.indexed, 260)
             self.assertLess(first_index[0], 260)

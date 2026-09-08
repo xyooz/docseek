@@ -72,6 +72,7 @@ pub struct ScanProgress {
     pub files_seen: usize,
     pub candidates_discovered: usize,
     pub candidates_emitted: usize,
+    pub excluded: usize,
     pub errors: usize,
     pub current_path: Option<PathBuf>,
 }
@@ -82,6 +83,7 @@ pub struct ScanReport {
     pub files_seen: usize,
     pub candidates_discovered: usize,
     pub candidates_emitted: usize,
+    pub excluded: usize,
     pub errors: usize,
     pub finished: bool,
     pub current_path: Option<PathBuf>,
@@ -94,6 +96,7 @@ impl ScanReport {
             files_seen: progress.files_seen,
             candidates_discovered: progress.candidates_discovered,
             candidates_emitted: progress.candidates_emitted,
+            excluded: progress.excluded,
             errors: progress.errors,
             finished: true,
             current_path: progress.current_path.clone(),
@@ -200,6 +203,10 @@ impl Scanner {
         let mut visited_directories = HashSet::new();
         visited_directories.insert(root.clone());
         let root_excluded = self.is_excluded_path(&root);
+        if root_excluded {
+            let mut current = progress.lock().expect("scan progress mutex poisoned");
+            current.excluded += 1;
+        }
         Ok(DiscoverySession {
             config: self.config.clone(),
             excluded_paths: self.excluded_paths.clone(),
@@ -323,6 +330,7 @@ impl DiscoverySession {
         let path = external_path(&entry.path());
         self.update_progress(|progress| progress.current_path = Some(path.clone()));
         if self.is_excluded_path(&path) {
+            self.update_progress(|progress| progress.excluded += 1);
             return Ok(None);
         }
 
@@ -377,8 +385,11 @@ impl DiscoverySession {
         }
 
         let extension = Candidate::extension_for_path(&path);
-        if !self.config.enabled_extensions.contains(&extension) || self.matches_file_pattern(&path)
-        {
+        if !self.config.enabled_extensions.contains(&extension) {
+            return Ok(None);
+        }
+        if self.matches_file_pattern(&path) {
+            self.update_progress(|progress| progress.excluded += 1);
             return Ok(None);
         }
 

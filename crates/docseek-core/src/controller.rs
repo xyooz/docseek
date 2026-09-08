@@ -38,6 +38,7 @@ pub struct JobSnapshot {
     pub files_seen: usize,
     pub candidates_discovered: usize,
     pub candidates_emitted: usize,
+    pub excluded: usize,
     pub errors: usize,
     pub current_path: Option<PathBuf>,
 }
@@ -48,6 +49,7 @@ impl JobSnapshot {
         self.files_seen = progress.files_seen;
         self.candidates_discovered = progress.candidates_discovered;
         self.candidates_emitted = progress.candidates_emitted;
+        self.excluded = progress.excluded;
         self.errors = progress.errors;
         self.current_path = progress.current_path.clone();
     }
@@ -182,6 +184,7 @@ impl JobController {
                 files_seen: 0,
                 candidates_discovered: 0,
                 candidates_emitted: 0,
+                excluded: 0,
                 errors: 0,
                 current_path: None,
             },

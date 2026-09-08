@@ -22,24 +22,29 @@ contract is exercised against the existing Python behavior.
     cargo clippy --workspace --all-targets --all-features -- -D warnings
     cargo fmt --all -- --check
     python -m unittest tests.test_scan_backend -v
+    python -m unittest tests.test_indexer_scan_backend -v
 
 To build the optional Python extension from the crate directory:
 
     maturin develop --interpreter python --manifest-path crates/docseek-python/Cargo.toml
     python -c "import docseek_rust; print(docseek_rust.JobController())"
 
-The Python extension remains opt-in and is not selected by `DirectoryIndexer`
-yet. `JobController.start_scan()` accepts the scanner configuration fields and
+The Python extension remains optional and `DirectoryIndexer` keeps the Python
+backend as its default. `DirectoryIndexer` accepts an injected `ScanBackend`,
+so the Rust backend can be exercised against the existing indexing lifecycle
+without changing parsers, chunk writing, or SQLite ownership. A missing Rust
+module falls back to the Python backend with a warning. The opt-in production
+switch is `DOCSEEK_SCAN_BACKEND=rust`; the default is `python`.
+`JobController.start_scan()` accepts the scanner configuration fields and
 exposes a bounded `ScanSession.next_batch()` API; each batch is capped at 128
 candidates and carries a progress snapshot.
 The terminal batch is empty and marked `finished`, so callers can process every
 candidate batch before stopping.
 Cancellation is idempotent and reports the `cancelling` lifecycle state before
-the session finishes as cancelled. The first adapter slice now lives in
-`src/docseek/scan_backend.py`; it is covered by a Python/Rust parity test but
-is deliberately not wired into the production index loop yet. The remaining
-M5 work will select the Rust controller while keeping the Python path available
-as a fallback. The adapter deliberately does not forward `max_file_size` to
+the session finishes as cancelled. The adapter and `DirectoryIndexer`
+integration live in `src/docseek/scan_backend.py` and
+`src/docseek/indexer.py`; the existing indexing lifecycle remains shared by
+both backends. The adapter deliberately does not forward `max_file_size` to
 discovery: oversized candidates must still reach `DirectoryIndexer`, where the
 existing lifecycle removes stale rows and records the user-visible
 `file_too_large` issue.

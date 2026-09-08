@@ -114,6 +114,7 @@ class ScanProgress:
     files_seen: int = 0
     candidates_discovered: int = 0
     candidates_emitted: int = 0
+    excluded: int = 0
     errors: int = 0
     current_path: Path | None = None
 
@@ -145,6 +146,7 @@ class _MutableProgress:
     files_seen: int = 0
     candidates_discovered: int = 0
     candidates_emitted: int = 0
+    excluded: int = 0
     errors: int = 0
     current_path: Path | None = None
 
@@ -154,6 +156,7 @@ class _MutableProgress:
             files_seen=self.files_seen,
             candidates_discovered=self.candidates_discovered,
             candidates_emitted=self.candidates_emitted,
+            excluded=self.excluded,
             errors=self.errors,
             current_path=self.current_path,
         )
@@ -231,6 +234,7 @@ class PythonScanSession:
             self._checkpoint()
             directory = pending_directories.pop()
             if self._is_excluded(directory):
+                self._progress.excluded += 1
                 continue
             self._progress.current_path = directory
             try:
@@ -249,6 +253,7 @@ class PythonScanSession:
                         self._progress.current_path = path
                         try:
                             if self._is_excluded(path):
+                                self._progress.excluded += 1
                                 continue
                             if entry.is_dir():
                                 name = entry.name.casefold()
@@ -274,6 +279,7 @@ class PythonScanSession:
                             if matches_file_exclusion(
                                 path, self._config.excluded_file_patterns
                             ):
+                                self._progress.excluded += 1
                                 continue
                             self._progress.candidates_discovered += 1
                             yield path
@@ -295,6 +301,7 @@ def _progress_from_rust(snapshot: object) -> ScanProgress:
         files_seen=int(getattr(snapshot, "files_seen", 0)),
         candidates_discovered=int(getattr(snapshot, "candidates_discovered", 0)),
         candidates_emitted=int(getattr(snapshot, "candidates_emitted", 0)),
+        excluded=int(getattr(snapshot, "excluded", 0)),
         errors=int(getattr(snapshot, "errors", 0)),
         current_path=Path(current_path) if current_path else None,
     )
@@ -365,15 +372,32 @@ class RustScanBackend:
         return RustScanSession(session, controller)
 
 
+def resolve_scan_backend(name: str | None = None) -> ScanBackend:
+    """Resolve the opt-in production backend without importing Rust eagerly."""
+
+    selected = (name if name is not None else os.environ.get("DOCSEEK_SCAN_BACKEND", ""))
+    selected = selected.strip().casefold() or "python"
+    if selected == "python":
+        return PythonScanBackend()
+    if selected == "rust":
+        return RustScanBackend()
+    raise ValueError(
+        "DOCSEEK_SCAN_BACKEND must be either 'python' or 'rust'"
+    )
+
+
 def iter_scan_candidates(
     session: ScanSession,
     *,
     max_items: int = MAX_SCAN_BATCH_SIZE,
     on_discovery: Callable[[Path, int], None] | None = None,
+    on_progress: Callable[[ScanProgress], None] | None = None,
 ) -> Iterator[Path]:
     """Replay session batches through the existing discovery callback shape."""
 
     initial = session.snapshot()
+    if on_progress is not None and initial is not None:
+        on_progress(initial)
     if (
         on_discovery is not None
         and initial is not None
@@ -383,6 +407,8 @@ def iter_scan_candidates(
 
     while True:
         batch = session.next_batch(max_items)
+        if on_progress is not None:
+            on_progress(batch.progress)
         if on_discovery is not None and batch.progress.current_path is not None:
             on_discovery(
                 batch.progress.current_path,
@@ -408,5 +434,6 @@ __all__ = [
     "ScanConfig",
     "ScanProgress",
     "ScanSession",
+    "resolve_scan_backend",
     "iter_scan_candidates",
 ]

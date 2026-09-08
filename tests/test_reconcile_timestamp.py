@@ -49,7 +49,7 @@ class ReconcileTimestampTests(unittest.TestCase):
         indexer = DirectoryIndexer(self.db)
         with patch.object(
             indexer,
-            "_iter_supported_files",
+            "_start_scan_session",
             side_effect=RuntimeError("scan failed before completion"),
         ):
             with self.assertRaises(RuntimeError):

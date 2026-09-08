@@ -11,7 +11,9 @@ on:
       - "Cargo.lock"
       - "rust-toolchain.toml"
       - "crates/**"
+      - "src/docseek/indexer.py"
       - "src/docseek/scan_backend.py"
+      - "tests/test_indexer_scan_backend.py"
       - "tests/test_scan_backend.py"
       - ".github/workflows/rust.yml"
   workflow_dispatch:
@@ -55,5 +57,9 @@ jobs:
         run: |
           python -c "import glob, subprocess, sys; wheels=glob.glob('target/wheels/*.whl'); assert wheels, 'no maturin wheel'; subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--force-reinstall', '--no-deps', wheels[0]])"
           python -c "import docseek_rust; controller=docseek_rust.JobController(); print(controller.last_snapshot())"
+      - name: Install Python indexer dependencies
+        run: python -m pip install PyMuPDF python-docx openpyxl python-pptx
       - name: Python scan backend parity
         run: python -m unittest tests.test_scan_backend -v
+      - name: DirectoryIndexer Rust integration
+        run: python -m unittest tests.test_indexer_scan_backend -v

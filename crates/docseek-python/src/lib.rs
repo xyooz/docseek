@@ -92,6 +92,8 @@ pub struct PyJobSnapshot {
     #[pyo3(get)]
     pub candidates_emitted: usize,
     #[pyo3(get)]
+    pub excluded: usize,
+    #[pyo3(get)]
     pub errors: usize,
     #[pyo3(get)]
     pub current_path: Option<String>,
@@ -106,6 +108,7 @@ impl From<JobSnapshot> for PyJobSnapshot {
             files_seen: snapshot.files_seen,
             candidates_discovered: snapshot.candidates_discovered,
             candidates_emitted: snapshot.candidates_emitted,
+            excluded: snapshot.excluded,
             errors: snapshot.errors,
             current_path: optional_path_to_string(snapshot.current_path),
         }
@@ -138,6 +141,8 @@ pub struct PyScanBatch {
     #[pyo3(get)]
     pub candidates_emitted: usize,
     #[pyo3(get)]
+    pub excluded: usize,
+    #[pyo3(get)]
     pub errors: usize,
     #[pyo3(get)]
     pub current_path: Option<String>,
@@ -157,6 +162,7 @@ impl From<ScanBatch> for PyScanBatch {
             files_seen: progress.files_seen,
             candidates_discovered: progress.candidates_discovered,
             candidates_emitted: progress.candidates_emitted,
+            excluded: progress.excluded,
             errors: progress.errors,
             current_path: optional_path_to_string(progress.current_path),
         }

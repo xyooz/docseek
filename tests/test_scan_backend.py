@@ -207,6 +207,7 @@ class PythonScanBackendTests(unittest.TestCase):
                 (python_progress.files_seen, python_progress.candidates_discovered),
                 (rust_progress.files_seen, rust_progress.candidates_discovered),
             )
+            self.assertEqual(python_progress.excluded, rust_progress.excluded)
             self.assertEqual(
                 (python_progress.candidates_emitted, rust_progress.candidates_emitted),
                 (8, 8),

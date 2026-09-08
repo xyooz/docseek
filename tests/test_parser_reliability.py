@@ -136,9 +136,16 @@ class ParserReliabilityTests(unittest.TestCase):
                     raise LegacyExtractionCancelled("user stop")
                 return iter([DocumentChunk(0, "行 1", "停止前批次")])
 
-            with patch("docseek.indexer.iter_document_chunks", side_effect=extract), patch(
-                "docseek.indexer.prioritize_index_candidates",
-                side_effect=lambda candidates: iter(candidates),
+            with (
+                patch("docseek.indexer.iter_document_chunks", side_effect=extract),
+                patch(
+                    "docseek.indexer.prioritize_index_candidates",
+                    side_effect=lambda candidates: iter(candidates),
+                ),
+                patch(
+                    "docseek.scan_backend.prioritize_index_candidates",
+                    side_effect=lambda candidates: iter(candidates),
+                ),
             ):
                 with self.assertRaises(IndexCancelled):
                     indexer.scan(root)
