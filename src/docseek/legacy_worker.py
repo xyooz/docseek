@@ -112,6 +112,10 @@ def main(argv: list[str] | None = None) -> int:
         source = Path(args[2])
         output = Path(args[3])
         progress_path = Path(args[5])
+    elif len(args) == 4 and args[2] == "--progress":
+        source = Path(args[0])
+        output = Path(args[1])
+        progress_path = Path(args[3])
     elif len(args) == 2:
         source = Path(args[0])
         output = Path(args[1])
