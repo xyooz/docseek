@@ -22,6 +22,7 @@ from docseek.scan_backend import (  # noqa: E402
     ScanCancelled,
     iter_scan_candidates,
 )
+from docseek.index_priority import prioritize_index_candidates  # noqa: E402
 
 
 def _collect_batches(session):
@@ -142,14 +143,27 @@ class PythonScanBackendTests(unittest.TestCase):
                 PythonScanBackend().start_scan(root, config)
             )
             rust_batches = _collect_batches(RustScanBackend().start_scan(root, config))
+            self.assertTrue(
+                all(
+                    not str(path).startswith("\\\\?\\")
+                    for batch in rust_batches
+                    for path in batch.candidates
+                )
+            )
+            python_paths = _candidate_paths(python_batches, root)
+            rust_paths = _candidate_paths(rust_batches, root)
 
+            # Directory enumeration order is intentionally not a cross-runtime
+            # contract: os.scandir() and Rust read_dir() may return different
+            # same-lane orders on Windows. Candidate membership and priority
+            # lane ordering must still agree.
             self.assertEqual(
-                _candidate_paths(python_batches, root),
-                _candidate_paths(rust_batches, root),
+                set(python_paths),
+                set(rust_paths),
             )
             self.assertEqual(
-                _candidate_paths(python_batches, root),
-                [
+                set(python_paths),
+                {
                     "modern.docx",
                     "notes.txt",
                     "reporta.txt",
@@ -158,6 +172,20 @@ class PythonScanBackendTests(unittest.TestCase):
                     "legacy.wps",
                     "book.epub",
                     "mail.eml",
+                },
+            )
+            self.assertEqual(
+                python_paths,
+                [
+                    path.as_posix()
+                    for path in prioritize_index_candidates(map(Path, python_paths))
+                ],
+            )
+            self.assertEqual(
+                rust_paths,
+                [
+                    path.as_posix()
+                    for path in prioritize_index_candidates(map(Path, rust_paths))
                 ],
             )
             self.assertEqual(
