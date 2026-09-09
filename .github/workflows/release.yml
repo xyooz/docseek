@@ -85,6 +85,7 @@ jobs:
           }
           finally {
             Remove-Item Env:DOCSEEK_FROZEN_SMOKE -ErrorAction SilentlyContinue
+          }
 
       - name: Verify portable ZIP strict Rust smoke
         shell: pwsh
@@ -107,7 +108,6 @@ jobs:
           }
           finally {
             Remove-Item Env:DOCSEEK_FROZEN_RUST_SMOKE -ErrorAction SilentlyContinue
-          }
           }
 
       - name: Generate SHA256SUMS
