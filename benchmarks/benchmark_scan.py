@@ -25,14 +25,39 @@ def create_files(root: Path, count: int) -> None:
         )
 
 
+class TimedScanSession:
+    """Benchmark-only proxy that times scanner waits without changing production code."""
+
+    def __init__(self, session: Any, record_wait: Callable[[float], None]) -> None:
+        self._session = session
+        self._record_wait = record_wait
+
+    def next_batch(self, max_items: int = 128) -> Any:
+        started = time.perf_counter()
+        try:
+            return self._session.next_batch(max_items)
+        finally:
+            self._record_wait(time.perf_counter() - started)
+
+    def cancel(self) -> Any:
+        return self._session.cancel()
+
+    def snapshot(self) -> Any:
+        return self._session.snapshot()
+
+    def is_finished(self) -> bool:
+        return self._session.is_finished()
+
+
 def timed_scan(
     indexer: DirectoryIndexer,
     root: Path,
     *,
     profile_phases: bool = False,
-) -> tuple[float, float, int, object, dict[str, float]]:
+) -> tuple[float, float, float, int, object, dict[str, float]]:
     started = time.perf_counter()
-    discovery_seconds: float | None = None
+    discovery_complete_elapsed: float | None = None
+    scanner_wait_seconds = 0.0
     candidate_count = 0
     phase = "discovery"
     timings: dict[str, float] = {}
@@ -50,6 +75,23 @@ def timed_scan(
                 add_timing(name, time.perf_counter() - call_started)
 
         return wrapped
+
+    def record_scanner_wait(elapsed: float) -> None:
+        nonlocal scanner_wait_seconds
+        scanner_wait_seconds += elapsed
+
+    original_iter_scan_candidates = indexer_module.iter_scan_candidates
+
+    def timed_iter_scan_candidates(
+        session: Any,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Iterator[Any]:
+        yield from original_iter_scan_candidates(
+            TimedScanSession(session, record_scanner_wait),
+            *args,
+            **kwargs,
+        )
 
     def classify_writer_sql(sql: str) -> str | None:
         normalized = " ".join(sql.split()).upper()
@@ -78,6 +120,14 @@ def timed_scan(
         return None
 
     restorers: list[Callable[[], None]] = []
+    indexer_module.iter_scan_candidates = timed_iter_scan_candidates
+    restorers.append(
+        lambda: setattr(
+            indexer_module,
+            "iter_scan_candidates",
+            original_iter_scan_candidates,
+        )
+    )
     if profile_phases:
         original_normalize = indexer._normalize
 
@@ -313,9 +363,9 @@ def timed_scan(
         restorers.append(lambda: setattr(writer_cls, "__exit__", original_exit))
 
     def candidates_ready(count: int) -> None:
-        nonlocal discovery_seconds, candidate_count, phase
-        if discovery_seconds is None:
-            discovery_seconds = time.perf_counter() - started
+        nonlocal discovery_complete_elapsed, candidate_count, phase
+        if discovery_complete_elapsed is None:
+            discovery_complete_elapsed = time.perf_counter() - started
         candidate_count = count
         phase = "post"
 
@@ -326,7 +376,14 @@ def timed_scan(
             restore()
 
     total_seconds = time.perf_counter() - started
-    return total_seconds, discovery_seconds or 0.0, candidate_count, stats, timings
+    return (
+        total_seconds,
+        scanner_wait_seconds,
+        discovery_complete_elapsed or 0.0,
+        candidate_count,
+        stats,
+        timings,
+    )
 
 
 def format_phase_timings(timings: dict[str, float]) -> str:
@@ -403,7 +460,8 @@ def run_backend_benchmark(file_count: int, backend_name: str) -> None:
 
         (
             first_seconds,
-            first_discovery_seconds,
+            first_scanner_wait,
+            first_discovery_complete,
             first_candidates,
             first_stats,
             first_timings,
@@ -414,7 +472,8 @@ def run_backend_benchmark(file_count: int, backend_name: str) -> None:
         )
         (
             second_seconds,
-            second_discovery_seconds,
+            second_scanner_wait,
+            second_discovery_complete,
             second_candidates,
             second_stats,
             second_timings,
@@ -436,18 +495,19 @@ def run_backend_benchmark(file_count: int, backend_name: str) -> None:
         update_only_ms = (time.perf_counter() - update_started) * 1000
         total_update_ms = init_ms + update_only_ms
 
-        first_post_discovery = max(0.0, first_seconds - first_discovery_seconds)
-        second_post_discovery = max(0.0, second_seconds - second_discovery_seconds)
+        first_tail_after_discovery = max(0.0, first_seconds - first_discovery_complete)
+        second_tail_after_discovery = max(0.0, second_seconds - second_discovery_complete)
 
         print("DocSeek directory scan benchmark")
         print(f"backend={backend_name}")
         print(f"files={file_count:,}")
         print(
             f"first_scan={first_seconds:.3f}s "
-            f"discovery={first_discovery_seconds:.3f}s "
-            f"post_discovery={first_post_discovery:.3f}s "
+            f"scanner_wait={first_scanner_wait:.3f}s "
+            f"discovery_complete_wall={first_discovery_complete:.3f}s "
+            f"tail_after_discovery={first_tail_after_discovery:.3f}s "
             f"candidates={first_candidates:,} "
-            f"discovery_share={first_discovery_seconds / first_seconds:.1%} "
+            f"scanner_wait_share={first_scanner_wait / first_seconds:.1%} "
             f"files_per_second={file_count / first_seconds:.1f} "
             f"indexed={first_stats.indexed}"
         )
@@ -457,10 +517,11 @@ def run_backend_benchmark(file_count: int, backend_name: str) -> None:
             print("first_writer_detail " + format_writer_detail(first_timings))
         print(
             f"unchanged_scan={second_seconds:.3f}s "
-            f"discovery={second_discovery_seconds:.3f}s "
-            f"post_discovery={second_post_discovery:.3f}s "
+            f"scanner_wait={second_scanner_wait:.3f}s "
+            f"discovery_complete_wall={second_discovery_complete:.3f}s "
+            f"tail_after_discovery={second_tail_after_discovery:.3f}s "
             f"candidates={second_candidates:,} "
-            f"discovery_share={second_discovery_seconds / second_seconds:.1%} "
+            f"scanner_wait_share={second_scanner_wait / second_seconds:.1%} "
             f"files_per_second={file_count / second_seconds:.1f} "
             f"unchanged={second_stats.unchanged}"
         )
@@ -481,12 +542,12 @@ def run_backend_benchmark(file_count: int, backend_name: str) -> None:
                 }
                 and not name.startswith("sql_")
             )
-            residual = max(0.0, second_post_discovery - measured)
+            residual = max(0.0, second_tail_after_discovery - measured)
             normalize_post = second_timings.get("normalize_post", 0.0)
             missing_cleanup = second_timings.get("missing_cleanup", 0.0)
             hot_share = (
-                (normalize_post + missing_cleanup) / second_post_discovery
-                if second_post_discovery > 0
+                (normalize_post + missing_cleanup) / second_tail_after_discovery
+                if second_tail_after_discovery > 0
                 else 0.0
             )
             normalize_per_1k_ms = (
@@ -502,7 +563,7 @@ def run_backend_benchmark(file_count: int, backend_name: str) -> None:
                 + f" normalize_per_1k={normalize_per_1k_ms:.2f}ms"
             )
         print(
-            f"single_file_total={total_update_ms:.2f}ms "
+            f"single_file_update=backend-independent total={total_update_ms:.2f}ms "
             f"indexer_init={init_ms:.2f}ms update_only={update_only_ms:.2f}ms "
             f"indexed={update_stats.indexed} removed={update_stats.removed}"
         )

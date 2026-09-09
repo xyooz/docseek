@@ -48,9 +48,13 @@ def _count_label(count: int) -> str:
     return str(count)
 
 
+def _is_supported_index(index: int, scenario: str) -> bool:
+    """Keep supported and unsupported entries deterministically interleaved."""
+    return index % 10 != 0 if scenario == "dense" else index % 10 == 0
+
+
 def _supported_count(files: int, scenario: str) -> int:
-    unsupported = files // 10
-    return files - unsupported if scenario == "dense" else unsupported
+    return sum(_is_supported_index(index, scenario) for index in range(files))
 
 
 def create_case(root: Path, files: int, scenario: str) -> int:
@@ -60,7 +64,7 @@ def create_case(root: Path, files: int, scenario: str) -> int:
     root.mkdir(parents=True)
     supported = _supported_count(files, scenario)
     for index in range(files):
-        suffix = ".txt" if index < supported else ".bin"
+        suffix = ".txt" if _is_supported_index(index, scenario) else ".bin"
         path = root / f"document_{index:06d}{suffix}"
         if suffix == ".txt":
             path.write_text("scan benchmark candidate\n", encoding="utf-8")
@@ -195,6 +199,7 @@ def _percentile(values: list[float], percentile: float) -> float:
 def _cancel_once(root: Path, backend_name: str, threshold: int) -> dict[str, Any]:
     session = _make_backend(backend_name).start_scan(root, _scan_config())
     threshold_reached = threading.Event()
+    files_seen_at_cancel_request = [0]
     outcome: dict[str, Any] = {}
 
     def scan_until_cancelled() -> None:
@@ -202,6 +207,7 @@ def _cancel_once(root: Path, backend_name: str, threshold: int) -> dict[str, Any
             while True:
                 batch = session.next_batch(MAX_SCAN_BATCH_SIZE)
                 if batch.progress.files_seen >= threshold:
+                    files_seen_at_cancel_request[0] = batch.progress.files_seen
                     threshold_reached.set()
                 if batch.finished:
                     outcome["completed"] = True
@@ -241,7 +247,7 @@ def _cancel_once(root: Path, backend_name: str, threshold: int) -> dict[str, Any
 
     return {
         "cancel_latency_ms": (cancelled_at - cancel_started) * 1000,
-        "files_seen_before_cancel": threshold,
+        "files_seen_at_cancel_request": files_seen_at_cancel_request[0],
     }
 
 

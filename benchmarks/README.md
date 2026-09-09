@@ -93,5 +93,10 @@ python benchmarks/benchmark_scan.py --files 10000 --backend rust
 python benchmarks/benchmark_scan.py --files 10000 --backend both
 ```
 
+完整索引 benchmark 中的 `scanner_wait` 是各次 `ScanSession.next_batch()` 的累计耗时；
+`discovery_complete_wall` 只是流式 discovery 完成时的交错 wall-clock 标记，不应解读为
+纯 Scanner discovery 时间。`single_file_update` 与 backend 无关，因为 `update_paths()`
+不经过 ScanBackend。
+
 scanner-only benchmark 的 Windows 报告通过手动触发的
 `.github/workflows/benchmark-scan-backends.yml` 上传，不进入普通 push gate。
