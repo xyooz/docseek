@@ -142,3 +142,34 @@ Windows 目标平台的正式矩阵可通过手动 Action `benchmark-index-hotsp
 
 scanner-only benchmark 的 Windows 报告通过手动触发的
 `.github/workflows/benchmark-scan-backends.yml` 上传，不进入普通 push gate。
+
+## M7-C Isolation Cost Breakdown
+
+`benchmark_extraction_isolation.py` 是 benchmark-only 的 PoC，用同一个已注册
+adapter 对比三种 extraction 生命周期：
+
+- `direct`：当前进程直接调用 adapter，用来估计 parser 本身；
+- `one-shot`：每个文件单独启动一个 worker，测量当前生产隔离模型的进程开销；
+- `persistent`：启动一次 worker，顺序处理多个文件，测量复用进程后的 steady state。
+
+它不修改 `legacy_isolation.py` 或 `legacy_worker.py`，并且会校验三种模式返回的
+`ordinal/location/content` 完全一致。`all` 模式还会验证坏文件后 worker 能继续、模拟
+hang 可以被 kill、kill 后可以 respawn，以及取消式 kill 的响应时间：
+
+默认优先使用 `direct` adapter。这样即使本机额外安装了可选的 `python-calamine`，也
+不会把 XLSX 的另一条 native parser 实验混入这次 Windows 目标路径的 isolation 对比。
+
+```bash
+.venv/bin/python benchmarks/benchmark_extraction_isolation.py \
+  --workload docx --files 20 --mode all
+```
+
+正式 Windows 矩阵使用：
+
+```text
+DOCX 100 / XLSX 50 / PPTX 100 / PDF 100
+```
+
+手动 Action 为 `benchmark-isolation-cost`，完成后上传每个 workload 的 JSON 和文本
+报告。重点比较 `one_shot_total`、`persistent_total`、`persistent_steady_state` 和
+`direct` 的每文件耗时；该 Action 不设置性能 hard gate。
