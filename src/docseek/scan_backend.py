@@ -41,7 +41,7 @@ class ScanCancelled(RuntimeError):
 
 
 class RustScanBackendUnavailable(RuntimeError):
-    """Raised when the optional PyO3 module is not installed."""
+    """Raised when Rust cannot create a scan session before traversal starts."""
 
 
 @dataclass(slots=True, frozen=True)
@@ -345,6 +345,9 @@ class PythonScanSession:
 
 
 class PythonScanBackend:
+    scan_backend_name = "python"
+    allow_fallback = False
+
     def start_scan(self, root: Path, config: ScanConfig | None = None) -> PythonScanSession:
         return PythonScanSession(Path(root), config or ScanConfig())
 
@@ -403,8 +406,16 @@ class RustScanSession:
 
 
 class RustScanBackend:
-    def __init__(self, rust_module: object | None = None) -> None:
+    scan_backend_name = "rust"
+
+    def __init__(
+        self,
+        rust_module: object | None = None,
+        *,
+        allow_fallback: bool = False,
+    ) -> None:
         self._rust_module = rust_module
+        self.allow_fallback = allow_fallback
 
     def _module(self) -> object:
         if self._rust_module is not None:
@@ -420,32 +431,52 @@ class RustScanBackend:
 
     def start_scan(self, root: Path, config: ScanConfig | None = None) -> RustScanSession:
         config = config or ScanConfig()
-        controller = self._module().JobController()
-        session = controller.start_scan(
-            Path(root),
-            sorted(config.enabled_extensions),
-            sorted(config.ignored_dir_names),
-            list(config.excluded_paths),
-            list(config.excluded_file_patterns),
-            # Keep file-size policy in DirectoryIndexer. If this value is
-            # forwarded, discovery would swallow oversized files before the
-            # indexer can remove stale rows and record file_too_large.
-            None,
-        )
-        return RustScanSession(session, controller)
+        try:
+            controller = self._module().JobController()
+            session = controller.start_scan(
+                Path(root),
+                sorted(config.enabled_extensions),
+                sorted(config.ignored_dir_names),
+                list(config.excluded_paths),
+                list(config.excluded_file_patterns),
+                # Keep file-size policy in DirectoryIndexer. If this value is
+                # forwarded, discovery would swallow oversized files before
+                # the indexer can remove stale rows and record file_too_large.
+                None,
+            )
+            return RustScanSession(session, controller)
+        except RustScanBackendUnavailable:
+            raise
+        except Exception as exc:
+            # This boundary is deliberately limited to session construction.
+            # Once RustScanSession has been returned, traversal errors must
+            # propagate instead of restarting discovery through Python.
+            raise RustScanBackendUnavailable(
+                "Rust scan backend could not initialize a scan session"
+            ) from exc
 
 
 def resolve_scan_backend(name: str | None = None) -> ScanBackend:
-    """Resolve the opt-in production backend without importing Rust eagerly."""
+    """Resolve the production backend without importing Rust eagerly.
 
-    selected = (name if name is not None else os.environ.get("DOCSEEK_SCAN_BACKEND", ""))
-    selected = selected.strip().casefold() or "python"
+    ``auto`` keeps Rust optional and permits a Python fallback only if Rust
+    cannot create the session. ``rust`` is strict and lets that startup error
+    reach the caller. Both modes defer importing the extension until scanning
+    actually starts.
+    """
+
+    selected = (
+        name if name is not None else os.environ.get("DOCSEEK_SCAN_BACKEND", "")
+    )
+    selected = selected.strip().casefold() or "auto"
     if selected == "python":
         return PythonScanBackend()
+    if selected == "auto":
+        return RustScanBackend(allow_fallback=True)
     if selected == "rust":
         return RustScanBackend()
     raise ValueError(
-        "DOCSEEK_SCAN_BACKEND must be either 'python' or 'rust'"
+        "DOCSEEK_SCAN_BACKEND must be one of 'auto', 'python', or 'rust'"
     )
 
 

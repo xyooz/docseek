@@ -1,7 +1,8 @@
 # Rust Core Phase 1
 
-The rust/core-phase1 branch is the Rust rewrite foundation. The Python
-indexer remains the production path and regression oracle during this phase.
+The rust/core-phase1 branch is the Rust rewrite foundation. The existing
+Python indexing lifecycle remains the regression oracle, while the default
+scan backend now selects Rust when available and keeps Python as the fallback.
 
 ## Workspace layout
 
@@ -22,6 +23,7 @@ contract is exercised against the existing Python behavior.
     cargo clippy --workspace --all-targets --all-features -- -D warnings
     cargo fmt --all -- --check
     python -m unittest tests.test_scan_backend -v
+    python -m unittest tests.test_scan_backend_selection -v
     python -m unittest tests.test_indexer_scan_backend -v
 
 To build the optional Python extension from the crate directory:
@@ -29,12 +31,16 @@ To build the optional Python extension from the crate directory:
     maturin develop --interpreter python --manifest-path crates/docseek-python/Cargo.toml
     python -c "import docseek_rust; print(docseek_rust.JobController())"
 
-The Python extension remains optional and `DirectoryIndexer` keeps the Python
-backend as its default. `DirectoryIndexer` accepts an injected `ScanBackend`,
-so the Rust backend can be exercised against the existing indexing lifecycle
-without changing parsers, chunk writing, or SQLite ownership. A missing Rust
-module falls back to the Python backend with a warning. The opt-in production
-switch is `DOCSEEK_SCAN_BACKEND=rust`; the default is `python`.
+The Python extension remains optional. `DirectoryIndexer` accepts an injected
+`ScanBackend`, so either backend can be exercised against the existing indexing
+lifecycle without changing parsers, chunk writing, or SQLite ownership. The
+production selector is `DOCSEEK_SCAN_BACKEND=auto|rust|python` and defaults to
+`auto`: Rust is selected when it can create a scan session, otherwise Python is
+selected with a warning. `rust` is strict and reports startup unavailability;
+`python` always selects the Python backend. Fallback is only possible while
+creating the session, before Rust has emitted any candidate. Once a session
+exists, traversal errors propagate and do not restart discovery through Python.
+`DirectoryIndexer.scan_backend_name` exposes the active diagnostic name.
 `JobController.start_scan()` accepts the scanner configuration fields and
 exposes a bounded `ScanSession.next_batch()` API. Each batch is capped at 128
 candidates, or 2,000 filesystem work items when a sparse tree needs a progress

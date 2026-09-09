@@ -13,6 +13,7 @@ from docseek.extraction_state import ExtractionStatus
 from docseek.indexer import DirectoryIndexer, IndexCancelled
 from docseek.legacy_isolation import LegacyExtractionCancelled
 from docseek.search_db import SearchDatabase
+from docseek.scan_backend import PythonScanBackend
 
 
 class ParserReliabilityTests(unittest.TestCase):
@@ -129,7 +130,11 @@ class ParserReliabilityTests(unittest.TestCase):
             first.write_text("这份内容在停止前已经提交", encoding="utf-8")
             stuck.write_bytes(b"placeholder")
             database = SearchDatabase(base / "index.db")
-            indexer = DirectoryIndexer(database)
+            # This test exercises parser cancellation and deliberately patches
+            # Python's priority iterator to make the committed neighbor
+            # deterministic. Rust's same-lane filesystem encounter order is
+            # intentionally not part of the cross-backend contract.
+            indexer = DirectoryIndexer(database, scan_backend=PythonScanBackend())
 
             def extract(path: Path, **_kwargs):
                 if path.suffix.lower() == ".xlsx":

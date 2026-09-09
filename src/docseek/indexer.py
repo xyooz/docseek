@@ -172,6 +172,11 @@ class DirectoryIndexer:
         self._scan_session_lock = threading.Lock()
         self._active_scan_session: ScanSession | None = None
 
+    @property
+    def scan_backend_name(self) -> str:
+        """Return the backend currently selected for the indexer."""
+        return str(getattr(self.scan_backend, "scan_backend_name", "custom"))
+
     def _load_runtime_settings(
         self,
     ) -> tuple[int, list[str], list[str], frozenset[str]]:
@@ -248,11 +253,18 @@ class DirectoryIndexer:
         try:
             session = self.scan_backend.start_scan(root, config)
         except RustScanBackendUnavailable:
-            logger.warning(
-                "Rust scan backend is unavailable; falling back to Python scanner"
-            )
+            # The fallback boundary is intentionally only around
+            # start_scan(). Once a session exists, candidate/traversal errors
+            # must not restart discovery and duplicate lifecycle work.
+            if not bool(getattr(self.scan_backend, "allow_fallback", True)):
+                logger.error(
+                    "Rust scan backend unavailable; strict Rust mode is enabled"
+                )
+                raise
+            logger.warning("Rust scan backend unavailable, falling back to Python")
             self.scan_backend = PythonScanBackend()
             session = self.scan_backend.start_scan(root, config)
+        logger.info("Scan backend selected: %s", self.scan_backend_name)
         self._set_active_scan_session(session)
         return session
 

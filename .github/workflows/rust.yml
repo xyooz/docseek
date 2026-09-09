@@ -16,6 +16,7 @@ on:
       - "tests/test_full_index_backend_regression.py"
       - "tests/test_indexer_scan_backend.py"
       - "tests/test_scan_backend.py"
+      - "tests/test_scan_backend_selection.py"
       - ".github/workflows/rust.yml"
   workflow_dispatch:
 
@@ -66,3 +67,5 @@ jobs:
         run: python -m unittest tests.test_indexer_scan_backend -v
       - name: Full index backend regression
         run: python -m unittest tests.test_full_index_backend_regression -v
+      - name: Scan backend selection
+        run: python -m unittest tests.test_scan_backend_selection -v

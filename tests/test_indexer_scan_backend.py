@@ -256,7 +256,8 @@ class DirectoryIndexerScanControlTests(unittest.TestCase):
                 [(str((root / "denied").resolve()), "permission_denied", "denied by test")],
             )
 
-    def test_backend_resolver_keeps_rust_opt_in(self) -> None:
+    def test_backend_resolver_supports_explicit_modes(self) -> None:
+        self.assertIsInstance(resolve_scan_backend("auto"), RustScanBackend)
         self.assertIsInstance(resolve_scan_backend("python"), PythonScanBackend)
         self.assertIsInstance(resolve_scan_backend("rust"), RustScanBackend)
         with tempfile.TemporaryDirectory() as temp_dir:
