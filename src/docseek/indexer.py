@@ -256,7 +256,7 @@ class DirectoryIndexer:
             # The fallback boundary is intentionally only around
             # start_scan(). Once a session exists, candidate/traversal errors
             # must not restart discovery and duplicate lifecycle work.
-            if not bool(getattr(self.scan_backend, "allow_fallback", True)):
+            if not bool(getattr(self.scan_backend, "allow_fallback", False)):
                 logger.error(
                     "Rust scan backend unavailable; strict Rust mode is enabled"
                 )

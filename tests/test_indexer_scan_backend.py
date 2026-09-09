@@ -33,6 +33,8 @@ from docseek.search_db import SearchDatabase
 
 
 class _UnavailableBackend:
+    allow_fallback = True
+
     def start_scan(self, _root: Path, _config):
         raise RustScanBackendUnavailable("test backend unavailable")
 

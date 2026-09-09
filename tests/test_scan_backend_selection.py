@@ -83,6 +83,11 @@ class _PostStartFailureBackend:
         return _PostStartFailureSession()
 
 
+class _UndeclaredUnavailableBackend:
+    def start_scan(self, _root: Path, _config):
+        raise RustScanBackendUnavailable("fallback must be explicitly enabled")
+
+
 class ScanBackendSelectionTests(unittest.TestCase):
     def test_resolver_supports_auto_python_and_strict_rust(self) -> None:
         auto = resolve_scan_backend("auto")
@@ -197,6 +202,21 @@ class ScanBackendSelectionTests(unittest.TestCase):
 
         self.assertIs(indexer.scan_backend, selected)
         self.assertEqual(indexer.scan_backend_name, "rust")
+
+    def test_undeclared_custom_backend_does_not_fallback(self) -> None:
+        selected = _UndeclaredUnavailableBackend()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "docs"
+            root.mkdir()
+            indexer = DirectoryIndexer(
+                SearchDatabase(Path(temp_dir) / "index.db"),
+                scan_backend=selected,
+            )
+            with self.assertRaises(RustScanBackendUnavailable):
+                indexer.scan(root)
+
+        self.assertIs(indexer.scan_backend, selected)
+        self.assertEqual(indexer.scan_backend_name, "custom")
 
     def test_failure_after_session_creation_does_not_fallback(self) -> None:
         selected = _PostStartFailureBackend()
