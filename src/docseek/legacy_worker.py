@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import contextlib
+import io
+import json
 import os
 import pickle
 import sys
@@ -99,8 +102,142 @@ def extract_to_file(
             os.environ["DOCSEEK_LEGACY_WORKER"] = previous
 
 
+def _write_persistent_message(message: dict[str, object]) -> None:
+    """Write one JSON-lines message on the persistent worker protocol."""
+    sys.stdout.write(json.dumps(message, ensure_ascii=False, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+
+
+def _persistent_worker_main() -> int:
+    """Serve sequential extraction requests until shutdown.
+
+    This is intentionally a thin protocol loop around ``extract_to_file``.
+    The parser still writes the established atomic pickle spool, while the
+    controller uses the JSON channel only for lifecycle and progress events.
+    Ordinary parser exceptions are returned as request-scoped errors so the
+    process remains reusable. Native crashes and forced termination are not
+    catchable here and are detected by the parent as EOF/exit.
+    """
+    _write_persistent_message(
+        {
+            "type": "ready",
+            "protocol_version": 1,
+            "pid": os.getpid(),
+        }
+    )
+
+    for raw_line in sys.stdin:
+        if not raw_line.strip():
+            continue
+        try:
+            request = json.loads(raw_line)
+        except (TypeError, ValueError) as exc:
+            _write_persistent_message(
+                {
+                    "type": "error",
+                    "request_id": None,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                }
+            )
+            continue
+
+        if not isinstance(request, dict):
+            _write_persistent_message(
+                {
+                    "type": "error",
+                    "request_id": None,
+                    "error_type": "ProtocolError",
+                    "error": "persistent worker request must be an object",
+                }
+            )
+            continue
+
+        request_type = request.get("type")
+        request_id = request.get("request_id")
+        if request_type == "shutdown":
+            _write_persistent_message({"type": "shutdown_ack", "request_id": None})
+            return 0
+        if request_type != "extract":
+            _write_persistent_message(
+                {
+                    "type": "error",
+                    "request_id": request_id,
+                    "error_type": "ProtocolError",
+                    "error": f"unknown request type: {request_type!r}",
+                }
+            )
+            continue
+
+        try:
+            source = Path(str(request["source"]))
+            output = Path(str(request["output"]))
+            adapter_name = request.get("adapter_name")
+            if adapter_name is not None:
+                adapter_name = str(adapter_name)
+        except (KeyError, TypeError, ValueError) as exc:
+            _write_persistent_message(
+                {
+                    "type": "error",
+                    "request_id": request_id,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                }
+            )
+            continue
+
+        output.unlink(missing_ok=True)
+        output.with_name(output.name + ".part").unlink(missing_ok=True)
+
+        def progress_callback(location: str, current: int) -> None:
+            _write_persistent_message(
+                {
+                    "type": "progress",
+                    "request_id": request_id,
+                    "location": str(location),
+                    "current": int(current),
+                }
+            )
+
+        try:
+            # A third-party parser should never be able to corrupt the JSON
+            # control channel with an incidental print() call.
+            with contextlib.redirect_stdout(io.StringIO()):
+                chunk_count = extract_to_file(
+                    source,
+                    output,
+                    adapter_name=adapter_name,
+                    on_progress=progress_callback,
+                )
+        except BaseException as exc:  # worker boundary: keep process reusable
+            output.unlink(missing_ok=True)
+            output.with_name(output.name + ".part").unlink(missing_ok=True)
+            _write_persistent_message(
+                {
+                    "type": "error",
+                    "request_id": request_id,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                }
+            )
+            continue
+
+        _write_persistent_message(
+            {
+                "type": "result",
+                "request_id": request_id,
+                "chunk_count": int(chunk_count),
+                "output": str(output),
+            }
+        )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
+    if args and args[0] == "--persistent":
+        return _persistent_worker_main()
+
     adapter_name: str | None = None
     progress_path: Path | None = None
     if len(args) == 4 and args[0] == "--adapter":

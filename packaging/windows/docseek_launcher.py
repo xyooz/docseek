@@ -82,6 +82,7 @@ def main() -> int:
         import docseek.index_maintenance  # noqa: F401
         import docseek.legacy_isolation  # noqa: F401
         import docseek.legacy_worker  # noqa: F401
+        import docseek.persistent_extraction  # noqa: F401
 
         return 0
 

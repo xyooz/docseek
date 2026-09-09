@@ -14,6 +14,8 @@ on:
       - "crates/**"
       - "src/docseek/scan_backend.py"
       - "src/docseek/indexer.py"
+      - "src/docseek/legacy_worker.py"
+      - "src/docseek/persistent_extraction.py"
       - ".github/workflows/windows-portable.yml"
   pull_request:
     paths:
@@ -25,6 +27,8 @@ on:
       - "crates/**"
       - "src/docseek/scan_backend.py"
       - "src/docseek/indexer.py"
+      - "src/docseek/legacy_worker.py"
+      - "src/docseek/persistent_extraction.py"
       - "src/docseek/__init__.py"
       - ".github/workflows/windows-portable.yml"
 
