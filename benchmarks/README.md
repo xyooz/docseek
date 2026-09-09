@@ -120,6 +120,10 @@ python benchmarks/benchmark_scan.py --workload pptx --files 500 --backend both
 python benchmarks/benchmark_scan.py --workload pdf --files 500 --backend both
 ```
 
+Windows 目标平台的正式矩阵可通过手动 Action `benchmark-index-hotspots` 运行。它只在
+`windows-latest` 上执行，不设置性能 hard gate，完成后上传七个 workload 的原始文本报告；
+默认 `source_ref` 为 `perf/index-hotspots`。
+
 报告中的 `first_extraction` 会给出：
 
 - `extraction_total`：按每次 chunk 拉取计时的 extraction 总耗时；
