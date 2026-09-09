@@ -291,9 +291,9 @@ class PythonScanBackendTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir) / "docs"
             root.mkdir()
-            # Keep the scanner inside one long-running batch.  These files are
-            # deliberately unsupported, so next_batch(1) must inspect the
-            # whole directory instead of returning after the first candidate.
+            # Keep the scanner busy across multiple bounded progress batches.
+            # These files are deliberately unsupported, so the worker must
+            # keep pulling batches instead of returning after the first pulse.
             for index in range(50_000):
                 (root / f"noncandidate-{index:05d}.bin").touch()
 
@@ -304,7 +304,11 @@ class PythonScanBackendTests(unittest.TestCase):
             def scan() -> None:
                 started.set()
                 try:
-                    outcome["batch"] = session.next_batch(1)
+                    while True:
+                        batch = session.next_batch(1)
+                        if batch.finished:
+                            outcome["batch"] = batch
+                            return
                 except BaseException as exc:  # pass the worker result to the test
                     outcome["error"] = exc
 
