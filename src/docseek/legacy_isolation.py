@@ -185,8 +185,14 @@ def iter_legacy_chunks_isolated(
     stall_timeout_seconds: float | None = LEGACY_ADAPTER_STALL_TIMEOUT_SECONDS,
     cancelled: Callable[[], bool] | None = None,
     on_progress: Callable[[str, int], None] | None = None,
+    persistent_worker=None,
 ) -> Iterator[DocumentChunk]:
-    """Extract one compatibility document through a bounded parser cascade."""
+    """Extract one compatibility document through a bounded parser cascade.
+
+    When ``persistent_worker`` is supplied, adapter requests use that already
+    owned worker session.  Omitting it preserves the original one-shot
+    subprocess path for compatibility callers and as the startup fallback.
+    """
     source = Path(source)
     adapter_names = available_legacy_adapter_names(source)
     if not adapter_names:
@@ -216,6 +222,37 @@ def iter_legacy_chunks_isolated(
                 max(0.01, float(adapter_timeout_seconds)),
                 max(0.01, remaining),
             )
+
+            if persistent_worker is not None:
+                try:
+                    chunks = persistent_worker.extract(
+                        source,
+                        adapter_name=adapter_name,
+                        on_progress=on_progress,
+                        cancelled=cancelled,
+                        timeout_seconds=attempt_timeout,
+                        stall_timeout_seconds=(
+                            min(float(stall_timeout_seconds), attempt_timeout)
+                            if stall_timeout_seconds is not None
+                            and on_progress is not None
+                            else None
+                        ),
+                    )
+                except LegacyExtractionCancelled:
+                    raise
+                except LegacyExtractionTimeout:
+                    attempts.append(f"{adapter_name}: 超时")
+                    continue
+                except Exception as exc:
+                    if type(exc).__name__ == "IndexCancelled":
+                        raise
+                    attempts.append(
+                        f"{adapter_name}: {type(exc).__name__}: {exc}"
+                    )
+                    continue
+                yield from chunks
+                return
+
             output = temp_root / f"chunks-{attempt_no}.bin"
             error_path = output.with_name(output.name + ".error.txt")
             progress = temp_root / f"progress-{attempt_no}.jsonl"

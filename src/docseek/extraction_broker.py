@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,6 +15,9 @@ from .document_adapters import (
     DocumentAdapterRegistry,
 )
 from .document_types import DIRECT_SUPPORTED_EXTENSIONS, DocumentFamily, document_family_for_extension
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True, frozen=True)
@@ -99,17 +103,37 @@ class ContentExtractionBroker:
         spreadsheet_rows_per_chunk: int = 200,
         on_progress: ChunkProgressCallback | None = None,
         cancelled=None,
+        persistent_worker=None,
     ) -> Iterator[DocumentChunk]:
         """Return chunks through the direct lane or isolated compatibility lane."""
         path = Path(path)
         if self._should_isolate(path, force=cancelled is not None):
             from .legacy_isolation import iter_legacy_chunks_isolated
 
+            if persistent_worker is not None:
+                # Startup failure is the only automatic fallback boundary for
+                # the persistent session. Once a worker is ready, parser
+                # failures stay inside the adapter cascade and are not retried
+                # through a second extraction path for the same request.
+                from .persistent_extraction import PersistentWorkerError
+
+                try:
+                    persistent_worker.start()
+                except PersistentWorkerError as exc:
+                    logger.warning(
+                        "persistent extraction worker unavailable; "
+                        "falling back to one-shot isolation: %s",
+                        exc,
+                    )
+                    persistent_worker = None
+
             isolation_kwargs = {}
             if cancelled is not None:
                 isolation_kwargs["cancelled"] = cancelled
             if on_progress is not None:
                 isolation_kwargs["on_progress"] = on_progress
+            if persistent_worker is not None:
+                isolation_kwargs["persistent_worker"] = persistent_worker
             yield from iter_legacy_chunks_isolated(path, **isolation_kwargs)
             return
 

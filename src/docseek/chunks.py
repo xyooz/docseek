@@ -37,6 +37,7 @@ def iter_document_chunks(
     xlsx_rows_per_chunk: int = 200,
     on_progress: ChunkProgressCallback | None = None,
     cancelled: Callable[[], bool] | None = None,
+    persistent_worker=None,
 ) -> Iterator[DocumentChunk]:
     """Public extraction entrypoint used by the production indexer.
 
@@ -55,6 +56,8 @@ def iter_document_chunks(
     }
     if cancelled is not None:
         kwargs["cancelled"] = cancelled
+    if persistent_worker is not None:
+        kwargs["persistent_worker"] = persistent_worker
     yield from DEFAULT_EXTRACTION_BROKER.iter_chunks(path, **kwargs)
 
 

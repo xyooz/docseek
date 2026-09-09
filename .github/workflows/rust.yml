@@ -13,10 +13,14 @@ on:
       - "crates/**"
       - "src/docseek/indexer.py"
       - "src/docseek/scan_backend.py"
+      - "src/docseek/chunks.py"
+      - "src/docseek/extraction_broker.py"
+      - "src/docseek/legacy_isolation.py"
       - "src/docseek/legacy_worker.py"
       - "src/docseek/persistent_extraction.py"
       - "tests/test_full_index_backend_regression.py"
       - "tests/test_indexer_scan_backend.py"
+      - "tests/test_persistent_extraction_integration.py"
       - "tests/test_persistent_extraction_worker.py"
       - "tests/test_scan_backend.py"
       - "tests/test_scan_backend_selection.py"
@@ -74,3 +78,5 @@ jobs:
         run: python -m unittest tests.test_scan_backend_selection -v
       - name: Persistent extraction worker
         run: python -m unittest tests.test_persistent_extraction_worker -v
+      - name: Persistent extraction integration
+        run: python -m unittest tests.test_persistent_extraction_integration -v

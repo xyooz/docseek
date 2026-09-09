@@ -5,10 +5,11 @@ import logging
 import os
 import threading
 import time
-from itertools import islice
+from contextlib import contextmanager
 from dataclasses import dataclass
+from itertools import islice
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Iterator
 
 from .chunk_store import ChunkStore
 from .chunk_writer import ChunkBatchWriter
@@ -51,6 +52,7 @@ from .scan_backend import (
     resolve_scan_backend,
 )
 from .search_db import SearchDatabase
+from .persistent_extraction import PersistentExtractionWorker
 
 
 logger = logging.getLogger(__name__)
@@ -171,6 +173,8 @@ class DirectoryIndexer:
         self._cancel = threading.Event()
         self._scan_session_lock = threading.Lock()
         self._active_scan_session: ScanSession | None = None
+        self._extraction_worker_lock = threading.Lock()
+        self._active_extraction_worker: PersistentExtractionWorker | None = None
 
     @property
     def scan_backend_name(self) -> str:
@@ -223,15 +227,40 @@ class DirectoryIndexer:
         self._cancel.set()
         with self._scan_session_lock:
             session = self._active_scan_session
-        if session is None:
-            return
+        with self._extraction_worker_lock:
+            extraction_worker = self._active_extraction_worker
+        if session is not None:
+            try:
+                session.cancel()
+            except Exception:
+                # The Python cancellation event remains authoritative for
+                # parser and indexing work. A backend cancellation failure must
+                # not make the UI stop action itself fail.
+                logger.warning("scan backend cancellation failed", exc_info=True)
+        if extraction_worker is not None:
+            try:
+                extraction_worker.cancel()
+            except Exception:
+                logger.warning(
+                    "persistent extraction worker cancellation failed",
+                    exc_info=True,
+                )
+
+    @contextmanager
+    def _extraction_job(self) -> Iterator[PersistentExtractionWorker]:
+        """Own one lazy persistent parser worker for one indexing job."""
+        worker = PersistentExtractionWorker()
+        with self._extraction_worker_lock:
+            self._active_extraction_worker = worker
         try:
-            session.cancel()
-        except Exception:
-            # The Python cancellation event remains authoritative for parser
-            # and indexing work. A backend cancellation failure must not make
-            # the UI stop action itself fail.
-            logger.warning("scan backend cancellation failed", exc_info=True)
+            yield worker
+        finally:
+            try:
+                worker.close()
+            finally:
+                with self._extraction_worker_lock:
+                    if self._active_extraction_worker is worker:
+                        self._active_extraction_worker = None
 
     def _set_active_scan_session(self, session: ScanSession) -> None:
         with self._scan_session_lock:
@@ -751,6 +780,7 @@ class DirectoryIndexer:
         | None = None,
         state_prefetched: bool = False,
         writer: ChunkBatchWriter | None = None,
+        extraction_worker: PersistentExtractionWorker | None = None,
         clear_issue: bool = True,
     ) -> bool:
         stat = path.stat()
@@ -860,6 +890,7 @@ class DirectoryIndexer:
                 if on_detail or on_progress or extension == ".xlsx"
                 else None,
                 cancelled=self._cancel.is_set,
+                persistent_worker=extraction_worker,
             ),
         }
         if writer is not None:
@@ -890,7 +921,23 @@ class DirectoryIndexer:
         on_progress: Callable[[Path, IndexStats], None] | None = None,
         on_detail: Callable[[Path, str, int], None] | None = None,
     ) -> IndexStats:
-        """Update only the changed filesystem paths reported by the watcher."""
+        with self._extraction_job() as extraction_worker:
+            return self._update_paths_impl(
+                paths,
+                on_progress=on_progress,
+                on_detail=on_detail,
+                extraction_worker=extraction_worker,
+            )
+
+    def _update_paths_impl(
+        self,
+        paths: Iterable[Path],
+        *,
+        on_progress: Callable[[Path, IndexStats], None] | None = None,
+        on_detail: Callable[[Path, str, int], None] | None = None,
+        extraction_worker: PersistentExtractionWorker,
+    ) -> IndexStats:
+        """Update changed paths using the worker owned by this job."""
         stats = IndexStats()
         processed: set[str] = set()
 
@@ -935,6 +982,7 @@ class DirectoryIndexer:
                     stats,
                     on_progress=on_progress,
                     on_detail=on_detail,
+                    extraction_worker=extraction_worker,
                 )
             except IndexCancelled:
                 self._record_parser_job_cancelled(normalized)
@@ -969,6 +1017,26 @@ class DirectoryIndexer:
         on_detail: Callable[[Path, str, int], None] | None = None,
         on_discovery: Callable[[Path, int], None] | None = None,
         on_candidates_ready: Callable[[int], None] | None = None,
+    ) -> IndexStats:
+        with self._extraction_job() as extraction_worker:
+            return self._scan_impl(
+                root,
+                on_progress=on_progress,
+                on_detail=on_detail,
+                on_discovery=on_discovery,
+                on_candidates_ready=on_candidates_ready,
+                extraction_worker=extraction_worker,
+            )
+
+    def _scan_impl(
+        self,
+        root: Path,
+        *,
+        on_progress: Callable[[Path, IndexStats], None] | None = None,
+        on_detail: Callable[[Path, str, int], None] | None = None,
+        on_discovery: Callable[[Path, int], None] | None = None,
+        on_candidates_ready: Callable[[int], None] | None = None,
+        extraction_worker: PersistentExtractionWorker,
     ) -> IndexStats:
         root = root.resolve()
         self._cancel.clear()
@@ -1108,6 +1176,7 @@ class DirectoryIndexer:
                         prefetched_state=index_state.get(normalized),
                         state_prefetched=True,
                         writer=writer,
+                        extraction_worker=extraction_worker,
                         clear_issue=False,
                     )
                     if success:

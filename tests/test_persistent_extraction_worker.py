@@ -154,6 +154,30 @@ class PersistentExtractionWorkerTests(unittest.TestCase):
             self.assertEqual([("fake-parser", 7)], progress)
             self.assertEqual(chunks[0].content, "persistent-result")
 
+    def test_progress_callback_failure_kills_worker_before_respawn(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "sample.txt"
+            source.write_text("content", encoding="utf-8")
+            with PersistentExtractionWorker(
+                command_factory=_real_progress_worker_command,
+                timeout_seconds=5,
+            ) as worker:
+                def fail_progress(_location: str, _current: int) -> None:
+                    raise RuntimeError("stop from progress callback")
+
+                with self.assertRaises(RuntimeError):
+                    list(
+                        worker.extract(
+                            source,
+                            adapter_name="fake",
+                            on_progress=fail_progress,
+                        )
+                    )
+                self.assertEqual(worker.state, "dead")
+                chunks = list(worker.extract(source, adapter_name="fake"))
+
+            self.assertEqual(chunks[0].content, "persistent-result")
+
     def test_progress_message_is_forwarded_by_controller(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "sample.txt"

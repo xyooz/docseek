@@ -1,8 +1,8 @@
 """Single-process persistent extraction worker controller.
 
-This module is the M8-A worker core.  It is deliberately not wired into the
-indexer yet: ``legacy_isolation.iter_legacy_chunks_isolated`` remains the
-production path until the lifecycle and fallback contract has been validated.
+This module is the persistent extraction worker core used by the M8-B
+compatibility extraction session.  ``legacy_isolation`` still retains its
+one-shot subprocess path for startup fallback and compatibility callers.
 
 The controller talks to one ``legacy_worker`` child over JSON lines while the
 child keeps the existing pickle chunk spool for results.  A parser exception is
@@ -493,7 +493,22 @@ class PersistentExtractionWorker:
                     )
                 last_progress_at = time.monotonic()
                 if on_progress is not None:
-                    on_progress(str(message.get("location", "")), int(message.get("current", 0)))
+                    try:
+                        on_progress(
+                            str(message.get("location", "")),
+                            int(message.get("current", 0)),
+                        )
+                    except BaseException as exc:
+                        # A progress callback can be the indexer's
+                        # cancellation boundary.  Do not leave the child
+                        # parsing after the callback has aborted the request,
+                        # or its late result would desynchronize the next
+                        # request on this persistent channel.
+                        with self._lifecycle_lock:
+                            if self._active_request_id == request_id:
+                                self._termination_reason = exc
+                                self._stop_locked()
+                        raise
                 continue
 
             if message.get("request_id") != request_id:
