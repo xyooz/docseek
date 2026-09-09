@@ -83,3 +83,15 @@ python -m pip install -e ".[benchmarks]"
 报告包含 discovery 总耗时、files/s、第一次有意义的 progress、第一次 candidate、
 整个进程 RSS，以及单独的 sparse-100k 并发取消延迟。扫描结果会校验 Python/Rust
 candidate 数量一致；性能数值不作为 CI hard gate。
+
+现有的完整索引 benchmark 仍然保留 parser/writer/SQLite 分解；可以显式选择 backend
+观察 discovery 对端到端结果的影响：
+
+```bash
+python benchmarks/benchmark_scan.py --files 10000 --backend python
+python benchmarks/benchmark_scan.py --files 10000 --backend rust
+python benchmarks/benchmark_scan.py --files 10000 --backend both
+```
+
+scanner-only benchmark 的 Windows 报告通过手动触发的
+`.github/workflows/benchmark-scan-backends.yml` 上传，不进入普通 push gate。

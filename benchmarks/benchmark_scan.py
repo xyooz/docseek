@@ -12,6 +12,7 @@ import docseek.chunk_writer as chunk_writer_module
 import docseek.indexer as indexer_module
 import docseek.structure_store as structure_store_module
 from docseek.indexer import DirectoryIndexer
+from docseek.scan_backend import PythonScanBackend, RustScanBackend
 from docseek.search_db import SearchDatabase
 
 
@@ -386,21 +387,19 @@ def format_writer_detail(timings: dict[str, float]) -> str:
     )
 
 
-def main() -> None:
-    if hasattr(sys.stdout, "reconfigure"):
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-
-    parser = argparse.ArgumentParser(description="DocSeek directory scan benchmark")
-    parser.add_argument("--files", type=int, default=1000, help="number of small text files")
-    args = parser.parse_args()
-    if args.files < 1:
-        parser.error("--files must be >= 1")
+def run_backend_benchmark(file_count: int, backend_name: str) -> None:
+    backend_factory = {
+        "python": PythonScanBackend,
+        "rust": lambda: RustScanBackend(allow_fallback=False),
+    }.get(backend_name)
+    if backend_factory is None:
+        raise ValueError(f"unsupported scan backend: {backend_name}")
 
     with tempfile.TemporaryDirectory() as temp:
         base = Path(temp)
         root = base / "documents"
         db = SearchDatabase(base / "docseek.db")
-        create_files(root, args.files)
+        create_files(root, file_count)
 
         (
             first_seconds,
@@ -408,20 +407,28 @@ def main() -> None:
             first_candidates,
             first_stats,
             first_timings,
-        ) = timed_scan(DirectoryIndexer(db), root, profile_phases=True)
+        ) = timed_scan(
+            DirectoryIndexer(db, scan_backend=backend_factory()),
+            root,
+            profile_phases=True,
+        )
         (
             second_seconds,
             second_discovery_seconds,
             second_candidates,
             second_stats,
             second_timings,
-        ) = timed_scan(DirectoryIndexer(db), root, profile_phases=True)
+        ) = timed_scan(
+            DirectoryIndexer(db, scan_backend=backend_factory()),
+            root,
+            profile_phases=True,
+        )
 
         changed = root / "document_000000.txt"
         changed.write_text("客户经理 信贷 精准增量更新后的内容", encoding="utf-8")
 
         init_started = time.perf_counter()
-        incremental_indexer = DirectoryIndexer(db)
+        incremental_indexer = DirectoryIndexer(db, scan_backend=backend_factory())
         init_ms = (time.perf_counter() - init_started) * 1000
 
         update_started = time.perf_counter()
@@ -433,14 +440,15 @@ def main() -> None:
         second_post_discovery = max(0.0, second_seconds - second_discovery_seconds)
 
         print("DocSeek directory scan benchmark")
-        print(f"files={args.files:,}")
+        print(f"backend={backend_name}")
+        print(f"files={file_count:,}")
         print(
             f"first_scan={first_seconds:.3f}s "
             f"discovery={first_discovery_seconds:.3f}s "
             f"post_discovery={first_post_discovery:.3f}s "
             f"candidates={first_candidates:,} "
             f"discovery_share={first_discovery_seconds / first_seconds:.1%} "
-            f"files_per_second={args.files / first_seconds:.1f} "
+            f"files_per_second={file_count / first_seconds:.1f} "
             f"indexed={first_stats.indexed}"
         )
         if first_timings:
@@ -453,7 +461,7 @@ def main() -> None:
             f"post_discovery={second_post_discovery:.3f}s "
             f"candidates={second_candidates:,} "
             f"discovery_share={second_discovery_seconds / second_seconds:.1%} "
-            f"files_per_second={args.files / second_seconds:.1f} "
+            f"files_per_second={file_count / second_seconds:.1f} "
             f"unchanged={second_stats.unchanged}"
         )
         if second_timings:
@@ -498,6 +506,27 @@ def main() -> None:
             f"indexer_init={init_ms:.2f}ms update_only={update_only_ms:.2f}ms "
             f"indexed={update_stats.indexed} removed={update_stats.removed}"
         )
+
+
+def main() -> None:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+    parser = argparse.ArgumentParser(description="DocSeek directory scan benchmark")
+    parser.add_argument("--files", type=int, default=1000, help="number of small text files")
+    parser.add_argument(
+        "--backend",
+        choices=("python", "rust", "both"),
+        default="python",
+        help="scan backend to profile (default: python)",
+    )
+    args = parser.parse_args()
+    if args.files < 1:
+        parser.error("--files must be >= 1")
+
+    backends = ("python", "rust") if args.backend == "both" else (args.backend,)
+    for backend_name in backends:
+        run_backend_benchmark(args.files, backend_name)
 
 
 if __name__ == "__main__":
