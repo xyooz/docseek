@@ -8,6 +8,12 @@ on:
       - ".github/workflows/release.yml"
       - "packaging/windows/**"
       - "pyproject.toml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "crates/**"
+      - "src/docseek/scan_backend.py"
+      - "src/docseek/indexer.py"
       - "src/docseek/__init__.py"
   push:
     tags:
@@ -26,6 +32,9 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
 
       - name: Install packaging dependencies
         run: python -m pip install -e ".[calamine,tika,wps,package]"
@@ -76,6 +85,29 @@ jobs:
           }
           finally {
             Remove-Item Env:DOCSEEK_FROZEN_SMOKE -ErrorAction SilentlyContinue
+
+      - name: Verify portable ZIP strict Rust smoke
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $zip = Get-ChildItem dist\DocSeek-*-Windows-x64.zip | Select-Object -First 1
+          if (-not $zip) { throw "Portable ZIP was not found" }
+          $verifyRoot = Join-Path $env:RUNNER_TEMP "docseek-release-rust-verify"
+          if (Test-Path $verifyRoot) { Remove-Item -Recurse -Force $verifyRoot }
+          New-Item -ItemType Directory -Path $verifyRoot | Out-Null
+          Expand-Archive -Path $zip.FullName -DestinationPath $verifyRoot
+          $exe = Join-Path $verifyRoot "DocSeek.exe"
+          if (-not (Test-Path $exe)) { throw "Extracted DocSeek.exe was not found" }
+          $env:DOCSEEK_FROZEN_RUST_SMOKE = "1"
+          try {
+            $smoke = Start-Process -FilePath $exe -Wait -PassThru
+            if ($smoke.ExitCode -ne 0) {
+              throw "Extracted strict Rust smoke failed with exit code $($smoke.ExitCode)"
+            }
+          }
+          finally {
+            Remove-Item Env:DOCSEEK_FROZEN_RUST_SMOKE -ErrorAction SilentlyContinue
+          }
           }
 
       - name: Generate SHA256SUMS

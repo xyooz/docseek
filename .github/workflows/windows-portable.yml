@@ -2,10 +2,29 @@ name: windows-portable
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - "rust/**"
+    paths:
+      - "packaging/windows/**"
+      - "pyproject.toml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "crates/**"
+      - "src/docseek/scan_backend.py"
+      - "src/docseek/indexer.py"
+      - ".github/workflows/windows-portable.yml"
   pull_request:
     paths:
       - "packaging/windows/**"
       - "pyproject.toml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "crates/**"
+      - "src/docseek/scan_backend.py"
+      - "src/docseek/indexer.py"
       - "src/docseek/__init__.py"
       - ".github/workflows/windows-portable.yml"
 
@@ -21,6 +40,9 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
 
       - name: Install packaging dependencies
         run: python -m pip install -e ".[calamine,tika,wps,package]"
@@ -29,7 +51,7 @@ jobs:
         shell: pwsh
         run: ./packaging/windows/build_portable.ps1
 
-      - name: Verify ZIP can run after extraction
+      - name: Verify ZIP frozen import smoke after extraction
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -53,6 +75,32 @@ jobs:
           }
           finally {
             Remove-Item Env:DOCSEEK_FROZEN_SMOKE -ErrorAction SilentlyContinue
+
+      - name: Verify ZIP strict Rust smoke after extraction
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $zip = Get-ChildItem dist\DocSeek-*-Windows-x64.zip | Select-Object -First 1
+          if (-not $zip) { throw "Portable ZIP was not found" }
+
+          $verifyRoot = Join-Path $env:RUNNER_TEMP "docseek-portable-rust-verify"
+          if (Test-Path $verifyRoot) { Remove-Item -Recurse -Force $verifyRoot }
+          New-Item -ItemType Directory -Path $verifyRoot | Out-Null
+          Expand-Archive -Path $zip.FullName -DestinationPath $verifyRoot
+
+          $exe = Join-Path $verifyRoot "DocSeek.exe"
+          if (-not (Test-Path $exe)) { throw "Extracted DocSeek.exe was not found" }
+
+          $env:DOCSEEK_FROZEN_RUST_SMOKE = "1"
+          try {
+            $process = Start-Process -FilePath $exe -Wait -PassThru
+            if ($process.ExitCode -ne 0) {
+              throw "Extracted strict Rust smoke failed with exit code $($process.ExitCode)"
+            }
+          }
+          finally {
+            Remove-Item Env:DOCSEEK_FROZEN_RUST_SMOKE -ErrorAction SilentlyContinue
+          }
           }
 
       - name: Report artifact

@@ -2,10 +2,29 @@ name: windows-installer
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - "rust/**"
+    paths:
+      - "packaging/windows/**"
+      - "pyproject.toml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "crates/**"
+      - "src/docseek/scan_backend.py"
+      - "src/docseek/indexer.py"
+      - ".github/workflows/windows-installer.yml"
   pull_request:
     paths:
       - "packaging/windows/**"
       - "pyproject.toml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "crates/**"
+      - "src/docseek/scan_backend.py"
+      - "src/docseek/indexer.py"
       - "src/docseek/__init__.py"
       - ".github/workflows/windows-installer.yml"
 
@@ -21,6 +40,9 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
 
       - name: Install packaging dependencies
         run: python -m pip install -e ".[calamine,tika,wps,package]"

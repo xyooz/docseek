@@ -67,6 +67,17 @@ try {
         Remove-Item Env:DOCSEEK_FROZEN_SMOKE -ErrorAction SilentlyContinue
     }
 
+    $env:DOCSEEK_FROZEN_RUST_SMOKE = "1"
+    try {
+        $rustSmoke = Start-Process -FilePath $exe -Wait -PassThru
+        if ($rustSmoke.ExitCode -ne 0) {
+            throw "Installed strict Rust smoke failed with exit code $($rustSmoke.ExitCode)"
+        }
+    }
+    finally {
+        Remove-Item Env:DOCSEEK_FROZEN_RUST_SMOKE -ErrorAction SilentlyContinue
+    }
+
     $uninstaller = Join-Path $InstallDir "unins000.exe"
     if (-not (Test-Path $uninstaller)) {
         throw "Uninstaller was not created"
@@ -95,6 +106,7 @@ try {
 }
 finally {
     Remove-Item Env:DOCSEEK_FROZEN_SMOKE -ErrorAction SilentlyContinue
+    Remove-Item Env:DOCSEEK_FROZEN_RUST_SMOKE -ErrorAction SilentlyContinue
     if ($installed -and (Test-Path (Join-Path $InstallDir "unins000.exe"))) {
         try {
             Start-Process -FilePath (Join-Path $InstallDir "unins000.exe") -ArgumentList @(

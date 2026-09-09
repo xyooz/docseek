@@ -26,6 +26,12 @@ foreach ($path in @($stageRoot, $workRoot, $packageDir, $zipPath)) {
 }
 New-Item -ItemType Directory -Force -Path $outputRootPath | Out-Null
 
+Write-Host "Building the Rust scanner extension..."
+& (Join-Path $PSScriptRoot "build_rust_extension.ps1")
+if ($LASTEXITCODE -ne 0) {
+    throw "Rust extension build failed with exit code $LASTEXITCODE"
+}
+
 $pyInstallerArgs = @(
     "-m", "PyInstaller",
     "--noconfirm",
@@ -41,6 +47,7 @@ $pyInstallerArgs = @(
     "--paths", (Join-Path $repoRoot "src"),
     "--collect-all", "python_calamine",
     "--collect-all", "iscc_tika",
+    "--hidden-import", "docseek_rust",
     "--hidden-import", "pythoncom",
     "--hidden-import", "win32com.client",
     (Join-Path $repoRoot "packaging\windows\docseek_launcher.py")
@@ -57,6 +64,12 @@ $frozenExe = Join-Path $frozenDir "DocSeek.exe"
 if (-not (Test-Path $frozenExe)) {
     throw "Expected frozen executable was not created: $frozenExe"
 }
+
+$rustPydFiles = @(Get-ChildItem -Path $frozenDir -Recurse -File -Filter "docseek_rust*.pyd")
+if ($rustPydFiles.Count -eq 0) {
+    throw "Frozen package does not contain docseek_rust*.pyd"
+}
+Write-Host "Frozen Rust extension: $($rustPydFiles[0].FullName)"
 
 Move-Item $frozenDir $packageDir
 Copy-Item (Join-Path $repoRoot "packaging\windows\PORTABLE_README.txt") (Join-Path $packageDir "README.txt")
@@ -77,6 +90,24 @@ try {
 }
 finally {
     Remove-Item Env:DOCSEEK_FROZEN_SMOKE -ErrorAction SilentlyContinue
+}
+
+# The ordinary smoke above proves the existing frozen import contract. This
+# second smoke must use strict Rust mode so a missing .pyd cannot silently
+# downgrade the package to the Python scanner.
+$env:DOCSEEK_FROZEN_RUST_SMOKE = "1"
+try {
+    $process = Start-Process `
+        -FilePath $frozenExe `
+        -Wait `
+        -PassThru `
+        -NoNewWindow
+    if ($process.ExitCode -ne 0) {
+        throw "Frozen Rust scanner smoke failed with exit code $($process.ExitCode)"
+    }
+}
+finally {
+    Remove-Item Env:DOCSEEK_FROZEN_RUST_SMOKE -ErrorAction SilentlyContinue
 }
 
 # Index Pipeline V2 launches compatibility parsers through the same frozen EXE.
