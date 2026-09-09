@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import io
+import math
+import os
+import shutil
 import sqlite3
 import sys
 import tempfile
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
@@ -16,13 +21,424 @@ from docseek.scan_backend import PythonScanBackend, RustScanBackend
 from docseek.search_db import SearchDatabase
 
 
-def create_files(root: Path, count: int) -> None:
-    root.mkdir(parents=True, exist_ok=True)
-    for index in range(count):
-        (root / f"document_{index:06d}.txt").write_text(
+@dataclass(frozen=True, slots=True)
+class WorkloadSpec:
+    name: str
+    extension: str
+    text_bytes: int | None = None
+    fixture_name: str | None = None
+
+
+WORKLOADS = {
+    "tiny-text": WorkloadSpec("tiny-text", ".txt"),
+    "medium-text": WorkloadSpec("medium-text", ".txt", text_bytes=16 * 1024),
+    "large-text": WorkloadSpec("large-text", ".txt", text_bytes=512 * 1024),
+    "docx": WorkloadSpec("docx", ".docx", fixture_name="testWORD.docx"),
+    "xlsx": WorkloadSpec("xlsx", ".xlsx", fixture_name="testEXCEL.xlsx"),
+    "pptx": WorkloadSpec("pptx", ".pptx", fixture_name="testPPT.pptx"),
+    "pdf": WorkloadSpec("pdf", ".pdf", fixture_name="testPDF.pdf"),
+}
+
+
+def _official_fixture_path(fixture_name: str) -> Path:
+    return Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "official" / fixture_name
+
+
+def _write_text_workload_file(path: Path, index: int, target_bytes: int | None) -> None:
+    if target_bytes is None:
+        path.write_text(
             f"客户经理 信贷 业务制度 文件 {index}\n第二行办公资料",
             encoding="utf-8",
         )
+        return
+
+    line = (
+        f"客户经理 信贷 业务制度 文件 {index}；"
+        "用于 extraction profiling 的确定性文本行。\n"
+    )
+    line_bytes = len(line.encode("utf-8"))
+    repetitions = max(1, math.ceil(target_bytes / line_bytes))
+    path.write_text(line * repetitions, encoding="utf-8")
+
+
+def create_workload(root: Path, count: int, workload: WorkloadSpec) -> Path:
+    root.mkdir(parents=True, exist_ok=True)
+    first_path: Path | None = None
+    source = (
+        _official_fixture_path(workload.fixture_name)
+        if workload.fixture_name is not None
+        else None
+    )
+    if source is not None and not source.is_file():
+        raise FileNotFoundError(f"official fixture not found: {source}")
+
+    for index in range(count):
+        destination = root / f"document_{index:06d}{workload.extension}"
+        if source is None:
+            _write_text_workload_file(destination, index, workload.text_bytes)
+        else:
+            shutil.copy2(source, destination)
+        if first_path is None:
+            first_path = destination
+
+    if first_path is None:
+        raise ValueError("workload must contain at least one file")
+    return first_path
+
+
+def create_files(root: Path, count: int) -> None:
+    """Backward-compatible tiny-text workload helper."""
+    create_workload(root, count, WORKLOADS["tiny-text"])
+
+
+def _make_root_matcher(root: Path) -> Callable[[Path], bool]:
+    """Match scanner paths even when the temporary directory uses a symlink."""
+    raw_root = os.fspath(Path(root))
+    canonical_root = os.fspath(Path(root).resolve())
+    root_prefixes = tuple(
+        prefix.rstrip(os.sep) + os.sep
+        for prefix in {raw_root, canonical_root}
+    )
+    cache: dict[str, bool] = {}
+
+    def matches(path: Path) -> bool:
+        path = Path(path)
+        key = os.fspath(path)
+        cached = cache.get(key)
+        if cached is not None:
+            return cached
+        result = any(
+            key == prefix[:-1] or key.startswith(prefix)
+            for prefix in root_prefixes
+        )
+        cache[key] = result
+        return result
+
+    return matches
+
+
+class _TimedBufferedReader(io.BufferedReader):
+    """Benchmark-only binary reader that measures actual Python file reads."""
+
+    def __init__(self, raw: Any, record_read: Callable[[float], None]) -> None:
+        super().__init__(raw)
+        self._record_read = record_read
+
+    def _timed(self, method: Callable[..., Any], *args: Any) -> Any:
+        started = time.perf_counter()
+        try:
+            return method(*args)
+        finally:
+            self._record_read(time.perf_counter() - started)
+
+    def read(self, size: int = -1) -> bytes:
+        return self._timed(super().read, size)
+
+    def read1(self, size: int = -1) -> bytes:
+        return self._timed(super().read1, size)
+
+    def readline(self, size: int = -1) -> bytes:
+        return self._timed(super().readline, size)
+
+    def readinto(self, buffer: Any) -> int:
+        return self._timed(super().readinto, buffer)
+
+    def readinto1(self, buffer: Any) -> int:
+        return self._timed(super().readinto1, buffer)
+
+    def readall(self) -> bytes:
+        return self._timed(super().readall)
+
+
+class _TimedTextLines:
+    """Measure TextIOWrapper decode/newline work separately from chunk building."""
+
+    def __init__(self, source: Iterator[str], record_decode: Callable[[float], None]) -> None:
+        self._source = source
+        self._record_decode = record_decode
+        self.elapsed = 0.0
+
+    def __iter__(self) -> "_TimedTextLines":
+        return self
+
+    def __next__(self) -> str:
+        started = time.perf_counter()
+        try:
+            return next(self._source)
+        finally:
+            elapsed = time.perf_counter() - started
+            self.elapsed += elapsed
+            self._record_decode(elapsed)
+
+
+def install_extraction_profiler(
+    root: Path,
+    add_timing: Callable[[str, float], None],
+) -> list[Callable[[], None]]:
+    """Install benchmark-only extraction boundary probes.
+
+    The probes deliberately live here instead of production modules. Some
+    timings are nested diagnostics: ``adapter_*`` and ``text_path_total``
+    contain the finer-grained read/decode/chunk timings and must not be added
+    to ``extraction_total``.
+    """
+    import docseek.chunks as chunks_module
+    import docseek.document_adapters as adapters_module
+    import docseek.extraction_broker as broker_module
+    import docseek.legacy_isolation as isolation_module
+
+    is_target_path = _make_root_matcher(root)
+    restorers: list[Callable[[], None]] = []
+    stage_totals: dict[str, float] = {}
+
+    def record_stage(name: str, elapsed: float) -> None:
+        stage_totals[name] = stage_totals.get(name, 0.0) + elapsed
+        add_timing(name, elapsed)
+
+    original_path_open = Path.open
+
+    def profiled_path_open(
+        path: Path,
+        mode: str = "r",
+        buffering: int = -1,
+        encoding: str | None = None,
+        errors: str | None = None,
+        newline: str | None = None,
+    ) -> Any:
+        handle = original_path_open(path, mode, buffering, encoding, errors, newline)
+        if "b" not in mode or not is_target_path(path):
+            return handle
+        return _TimedBufferedReader(
+            handle,
+            lambda elapsed: record_stage("file_read", elapsed),
+        )
+
+    Path.open = profiled_path_open  # type: ignore[method-assign]
+    restorers.append(lambda: setattr(Path, "open", original_path_open))
+
+    original_decode = chunks_module._decode_text_bytes
+
+    def timed_decode(data: bytes) -> tuple[str, str]:
+        started = time.perf_counter()
+        try:
+            return original_decode(data)
+        finally:
+            record_stage("text_decode", time.perf_counter() - started)
+
+    chunks_module._decode_text_bytes = timed_decode  # type: ignore[assignment]
+    restorers.append(
+        lambda: setattr(chunks_module, "_decode_text_bytes", original_decode)
+    )
+
+    original_iter_lines = chunks_module._iter_text_chunks_from_lines
+
+    def timed_iter_lines(lines: Iterator[str], *args: Any, **kwargs: Any) -> Iterator[Any]:
+        timed_lines: _TimedTextLines | Iterator[str]
+        if isinstance(lines, io.TextIOBase):
+            timed_lines = _TimedTextLines(
+                lines,
+                lambda elapsed: record_stage("text_decode_normalize", elapsed),
+            )
+        else:
+            timed_lines = lines
+
+        iterator = iter(original_iter_lines(timed_lines, *args, **kwargs))
+        while True:
+            started = time.perf_counter()
+            line_elapsed_before = (
+                timed_lines.elapsed if isinstance(timed_lines, _TimedTextLines) else 0.0
+            )
+            try:
+                item = next(iterator)
+            except StopIteration:
+                elapsed = time.perf_counter() - started
+                line_elapsed = (
+                    timed_lines.elapsed - line_elapsed_before
+                    if isinstance(timed_lines, _TimedTextLines)
+                    else 0.0
+                )
+                record_stage("text_chunk_build", max(0.0, elapsed - line_elapsed))
+                return
+            except BaseException:
+                elapsed = time.perf_counter() - started
+                line_elapsed = (
+                    timed_lines.elapsed - line_elapsed_before
+                    if isinstance(timed_lines, _TimedTextLines)
+                    else 0.0
+                )
+                record_stage("text_chunk_build", max(0.0, elapsed - line_elapsed))
+                raise
+            elapsed = time.perf_counter() - started
+            line_elapsed = (
+                timed_lines.elapsed - line_elapsed_before
+                if isinstance(timed_lines, _TimedTextLines)
+                else 0.0
+            )
+            record_stage("text_chunk_build", max(0.0, elapsed - line_elapsed))
+            yield item
+
+    chunks_module._iter_text_chunks_from_lines = timed_iter_lines  # type: ignore[assignment]
+    restorers.append(
+        lambda: setattr(
+            chunks_module,
+            "_iter_text_chunks_from_lines",
+            original_iter_lines,
+        )
+    )
+
+    original_iter_text = chunks_module._iter_text_chunks
+
+    def timed_iter_text(path: Path, *args: Any, **kwargs: Any) -> Iterator[Any]:
+        nested_names = (
+            "file_read",
+            "text_decode",
+            "text_decode_normalize",
+            "text_chunk_build",
+        )
+        iterator = iter(original_iter_text(path, *args, **kwargs))
+
+        def record_text_step(started: float, before: dict[str, float]) -> None:
+            total = time.perf_counter() - started
+            record_stage("text_path_total", total)
+            nested = sum(
+                max(0.0, stage_totals.get(name, 0.0) - before[name])
+                for name in nested_names
+            )
+            record_stage(
+                "text_normalize_chunk_build",
+                max(0.0, total - nested),
+            )
+
+        while True:
+            started = time.perf_counter()
+            before = {name: stage_totals.get(name, 0.0) for name in nested_names}
+            try:
+                item = next(iterator)
+            except StopIteration:
+                record_text_step(started, before)
+                return
+            except BaseException:
+                record_text_step(started, before)
+                raise
+            record_text_step(started, before)
+            yield item
+
+    chunks_module._iter_text_chunks = timed_iter_text  # type: ignore[assignment]
+    restorers.append(
+        lambda: setattr(chunks_module, "_iter_text_chunks", original_iter_text)
+    )
+
+    original_registry_adapter_for = adapters_module.DocumentAdapterRegistry.adapter_for
+
+    def timed_registry_adapter_for(registry: Any, path: Path) -> Any:
+        started = time.perf_counter()
+        try:
+            return original_registry_adapter_for(registry, path)
+        finally:
+            elapsed = time.perf_counter() - started
+            if is_target_path(path):
+                record_stage("broker_dispatch", elapsed)
+
+    adapters_module.DocumentAdapterRegistry.adapter_for = (  # type: ignore[method-assign]
+        timed_registry_adapter_for
+    )
+    restorers.append(
+        lambda: setattr(
+            adapters_module.DocumentAdapterRegistry,
+            "adapter_for",
+            original_registry_adapter_for,
+        )
+    )
+
+    original_isolated = isolation_module.iter_legacy_chunks_isolated
+
+    def timed_isolated(source: Path, *args: Any, **kwargs: Any) -> Iterator[Any]:
+        iterator = iter(original_isolated(source, *args, **kwargs))
+        while True:
+            started = time.perf_counter()
+            try:
+                item = next(iterator)
+            except StopIteration:
+                elapsed = time.perf_counter() - started
+                if is_target_path(source):
+                    record_stage("adapter_isolated", elapsed)
+                return
+            except BaseException:
+                elapsed = time.perf_counter() - started
+                if is_target_path(source):
+                    record_stage("adapter_isolated", elapsed)
+                raise
+            elapsed = time.perf_counter() - started
+            if is_target_path(source):
+                record_stage("adapter_isolated", elapsed)
+            yield item
+
+    isolation_module.iter_legacy_chunks_isolated = timed_isolated  # type: ignore[assignment]
+    restorers.append(
+        lambda: setattr(
+            isolation_module,
+            "iter_legacy_chunks_isolated",
+            original_isolated,
+        )
+    )
+
+    registry = broker_module.DEFAULT_EXTRACTION_BROKER.registry
+    seen_adapter_types: set[type[Any]] = set()
+    for registered_adapter in getattr(registry, "_adapters", ()):
+        adapter_type = type(registered_adapter)
+        if adapter_type in seen_adapter_types:
+            continue
+        seen_adapter_types.add(adapter_type)
+        original_adapter_iter = adapter_type.iter_chunks
+
+        def make_timed_adapter_iter(
+            original: Callable[..., Any],
+            fallback_name: str,
+        ) -> Callable[..., Any]:
+            def timed_adapter_iter(
+                adapter: Any,
+                path: Path,
+                *args: Any,
+                **kwargs: Any,
+            ) -> Iterator[Any]:
+                iterator = iter(original(adapter, path, *args, **kwargs))
+                while True:
+                    started = time.perf_counter()
+                    try:
+                        item = next(iterator)
+                    except StopIteration:
+                        elapsed = time.perf_counter() - started
+                        if is_target_path(path):
+                            adapter_name = str(getattr(adapter, "name", fallback_name))
+                            record_stage(f"adapter_{adapter_name}", elapsed)
+                        return
+                    except BaseException:
+                        elapsed = time.perf_counter() - started
+                        if is_target_path(path):
+                            adapter_name = str(getattr(adapter, "name", fallback_name))
+                            record_stage(f"adapter_{adapter_name}", elapsed)
+                        raise
+                    elapsed = time.perf_counter() - started
+                    if is_target_path(path):
+                        adapter_name = str(getattr(adapter, "name", fallback_name))
+                        record_stage(f"adapter_{adapter_name}", elapsed)
+                    yield item
+
+            return timed_adapter_iter
+
+        adapter_type.iter_chunks = make_timed_adapter_iter(  # type: ignore[method-assign]
+            original_adapter_iter,
+            adapter_type.__name__,
+        )
+        restorers.append(
+            lambda adapter_type=adapter_type, original_adapter_iter=original_adapter_iter: setattr(
+                adapter_type,
+                "iter_chunks",
+                original_adapter_iter,
+            )
+        )
+
+    return restorers
 
 
 class TimedScanSession:
@@ -222,6 +638,7 @@ def timed_scan(
                 original_iter_document_chunks,
             )
         )
+        restorers.extend(install_extraction_profiler(root, add_timing))
 
         original_cjk_bigrams = indexer.chunk_store._cjk_bigrams
         indexer.chunk_store._cjk_bigrams = timed_call(  # type: ignore[method-assign]
@@ -337,9 +754,11 @@ def timed_scan(
             try:
                 return original_flush(writer, *args, **kwargs)
             finally:
+                elapsed = time.perf_counter() - call_started
                 if outermost:
                     writer_scope_depth -= 1
-                add_timing("writer_flush", time.perf_counter() - call_started)
+                    add_timing("writer_flush_outer", elapsed)
+                add_timing("writer_flush", elapsed)
 
         writer_cls.flush = timed_flush  # type: ignore[method-assign]
         restorers.append(lambda: setattr(writer_cls, "flush", original_flush))
@@ -411,22 +830,65 @@ def format_first_index_breakdown(timings: dict[str, float]) -> str:
     cjk = timings.get("cjk_tokens", 0.0)
     raw_encode = timings.get("raw_encode", 0.0)
     flush = timings.get("writer_flush", 0.0)
+    flush_outer = timings.get("writer_flush_outer", 0.0)
     writer_exit = timings.get("writer_exit", 0.0)
     candidate = timings.get("candidate_check", 0.0)
     writer_residual = max(0.0, writer_replace - extraction - cjk - raw_encode - flush)
     candidate_overhead = max(0.0, candidate - writer_replace)
+    writer_total = writer_replace + flush_outer + writer_exit
     return (
-        f"extract={extraction:.3f}s cjk={cjk:.3f}s raw_encode={raw_encode:.3f}s "
-        f"writer_flush={flush:.3f}s writer_exit={writer_exit:.3f}s "
+        f"extraction_total={extraction:.3f}s cjk={cjk:.3f}s raw_encode={raw_encode:.3f}s "
+        f"writer_total={writer_total:.3f}s writer_replace={writer_replace:.3f}s "
+        f"writer_flush={flush:.3f}s writer_flush_outer={flush_outer:.3f}s "
+        f"writer_exit={writer_exit:.3f}s "
         f"writer_residual={writer_residual:.3f}s candidate_overhead={candidate_overhead:.3f}s"
     )
+
+
+def format_extraction_detail(timings: dict[str, float]) -> str:
+    names = (
+        "broker_dispatch",
+        "file_read",
+        "text_decode",
+        "text_decode_normalize",
+        "text_chunk_build",
+        "text_normalize_chunk_build",
+        "adapter_direct",
+        "adapter_calamine-xlsx-fast",
+        "adapter_calamine",
+        "adapter_tika-native",
+        "adapter_wps-local",
+        "adapter_isolated",
+    )
+    details = " ".join(
+        f"{name}={timings.get(name, 0.0):.3f}s"
+        for name in names
+        if name in timings or name in {"broker_dispatch", "adapter_isolated"}
+    )
+    return f"extraction_total={timings.get('extract_chunks', 0.0):.3f}s {details}"
 
 
 def format_writer_detail(timings: dict[str, float]) -> str:
     structure_total = timings.get("structure_total", 0.0)
     structure_sql = timings.get("sql_structure", 0.0)
     structure_cpu = max(0.0, structure_total - structure_sql)
+    sql_names = (
+        "sql_begin",
+        "sql_savepoint",
+        "sql_files",
+        "sql_file_id",
+        "sql_delete_lookup",
+        "sql_delete_chunks",
+        "sql_chunks",
+        "sql_structure",
+        "sql_fts_cjk",
+        "sql_fts_normal",
+        "sql_extraction_state",
+        "sql_commit",
+    )
+    sql_total = sum(timings.get(name, 0.0) for name in sql_names)
     return (
+        f"sql_total={sql_total:.3f}s "
         f"files_sql={timings.get('sql_files', 0.0):.3f}s "
         f"chunks_sql={timings.get('sql_chunks', 0.0):.3f}s "
         f"structure_total={structure_total:.3f}s "
@@ -444,7 +906,11 @@ def format_writer_detail(timings: dict[str, float]) -> str:
     )
 
 
-def run_backend_benchmark(file_count: int, backend_name: str) -> None:
+def run_backend_benchmark(
+    file_count: int,
+    backend_name: str,
+    workload: WorkloadSpec,
+) -> None:
     backend_factory = {
         "python": PythonScanBackend,
         "rust": lambda: RustScanBackend(allow_fallback=False),
@@ -456,7 +922,7 @@ def run_backend_benchmark(file_count: int, backend_name: str) -> None:
         base = Path(temp)
         root = base / "documents"
         db = SearchDatabase(base / "docseek.db")
-        create_files(root, file_count)
+        changed = create_workload(root, file_count, workload)
 
         (
             first_seconds,
@@ -483,8 +949,14 @@ def run_backend_benchmark(file_count: int, backend_name: str) -> None:
             profile_phases=True,
         )
 
-        changed = root / "document_000000.txt"
-        changed.write_text("客户经理 信贷 精准增量更新后的内容", encoding="utf-8")
+        changed_stat = changed.stat()
+        os.utime(
+            changed,
+            ns=(
+                changed_stat.st_atime_ns,
+                max(time.time_ns(), changed_stat.st_mtime_ns + 2_000_000_000),
+            ),
+        )
 
         init_started = time.perf_counter()
         incremental_indexer = DirectoryIndexer(db, scan_backend=backend_factory())
@@ -500,7 +972,12 @@ def run_backend_benchmark(file_count: int, backend_name: str) -> None:
 
         print("DocSeek directory scan benchmark")
         print(f"backend={backend_name}")
+        print(f"workload={workload.name}")
         print(f"files={file_count:,}")
+        if workload.fixture_name is not None:
+            print(f"fixture={workload.fixture_name}")
+        elif workload.text_bytes is not None:
+            print(f"target_text_bytes_per_file={workload.text_bytes:,}")
         print(
             f"first_scan={first_seconds:.3f}s "
             f"scanner_wait={first_scanner_wait:.3f}s "
@@ -513,6 +990,7 @@ def run_backend_benchmark(file_count: int, backend_name: str) -> None:
         )
         if first_timings:
             print("first_phases " + format_phase_timings(first_timings))
+            print("first_extraction " + format_extraction_detail(first_timings))
             print("first_writer_breakdown " + format_first_index_breakdown(first_timings))
             print("first_writer_detail " + format_writer_detail(first_timings))
         print(
@@ -536,6 +1014,7 @@ def run_backend_benchmark(file_count: int, backend_name: str) -> None:
                     "cjk_tokens",
                     "raw_encode",
                     "writer_flush",
+                    "writer_flush_outer",
                     "writer_exit",
                     "structure_total",
                     "source_validate",
@@ -563,7 +1042,7 @@ def run_backend_benchmark(file_count: int, backend_name: str) -> None:
                 + f" normalize_per_1k={normalize_per_1k_ms:.2f}ms"
             )
         print(
-            f"single_file_update=backend-independent total={total_update_ms:.2f}ms "
+            f"single_file_update=backend-independent workload_touch total={total_update_ms:.2f}ms "
             f"indexer_init={init_ms:.2f}ms update_only={update_only_ms:.2f}ms "
             f"indexed={update_stats.indexed} removed={update_stats.removed}"
         )
@@ -574,7 +1053,18 @@ def main() -> None:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
     parser = argparse.ArgumentParser(description="DocSeek directory scan benchmark")
-    parser.add_argument("--files", type=int, default=1000, help="number of small text files")
+    parser.add_argument(
+        "--files",
+        type=int,
+        default=1000,
+        help="number of files or fixture copies in the selected workload",
+    )
+    parser.add_argument(
+        "--workload",
+        choices=tuple(WORKLOADS),
+        default="tiny-text",
+        help="input workload (default: tiny-text)",
+    )
     parser.add_argument(
         "--backend",
         choices=("python", "rust", "both"),
@@ -586,8 +1076,9 @@ def main() -> None:
         parser.error("--files must be >= 1")
 
     backends = ("python", "rust") if args.backend == "both" else (args.backend,)
+    workload = WORKLOADS[args.workload]
     for backend_name in backends:
-        run_backend_benchmark(args.files, backend_name)
+        run_backend_benchmark(args.files, backend_name, workload)
 
 
 if __name__ == "__main__":

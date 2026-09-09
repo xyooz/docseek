@@ -98,5 +98,43 @@ python benchmarks/benchmark_scan.py --files 10000 --backend both
 纯 Scanner discovery 时间。`single_file_update` 与 backend 无关，因为 `update_paths()`
 不经过 ScanBackend。
 
+## Extraction / Writer 边界 profiling
+
+`benchmark_scan.py` 仍然只修改 benchmark 进程内的计时探针，不改变生产索引实现。除
+原有的完整索引和 unchanged rescan 外，`--workload` 可以选择不同的 extraction 负载：
+
+```bash
+# 大量小文本：当前 50k synthetic 场景
+python benchmarks/benchmark_scan.py --workload tiny-text --files 50000 --backend both
+
+# 中等文本：约 16 KiB / 文件
+python benchmarks/benchmark_scan.py --workload medium-text --files 10000 --backend both
+
+# 大文本：约 512 KiB / 文件
+python benchmarks/benchmark_scan.py --workload large-text --files 1000 --backend both
+
+# 复制仓库内真实 fixture，分别观察真实 parser / isolation lane
+python benchmarks/benchmark_scan.py --workload docx --files 500 --backend both
+python benchmarks/benchmark_scan.py --workload xlsx --files 200 --backend both
+python benchmarks/benchmark_scan.py --workload pptx --files 500 --backend both
+python benchmarks/benchmark_scan.py --workload pdf --files 500 --backend both
+```
+
+报告中的 `first_extraction` 会给出：
+
+- `extraction_total`：按每次 chunk 拉取计时的 extraction 总耗时；
+- `broker_dispatch`：适配器选择；
+- `file_read`：benchmark 进程内 Python binary reader 的实际读取；
+- `text_decode` / `text_decode_normalize`：文本 probe 解码以及流式文本解码/换行处理；
+- `text_chunk_build` / `text_normalize_chunk_build`：行分块、DocumentChunk 构造以及小文件
+  fast path 的剩余处理；
+- `adapter_direct` 或 `adapter_isolated`：adapter 边界耗时。Office/PDF 在 DirectoryIndexer
+  路径中通常位于隔离子进程，因此不会把子进程内部的 parser 时间伪装成 Python 文本阶段。
+
+这些 extraction 子项彼此可能是嵌套诊断，不能和 `extraction_total` 或
+`adapter_*` 相加。Writer 的 `writer_total` 使用 `replace_document + 外层 flush + exit`，
+不会重复计算 `replace_document` 内部触发的 flush；`sql_total` 则是各次 SQL execute/commit
+耗时的汇总，不包含重复的 `structure_total`。
+
 scanner-only benchmark 的 Windows 报告通过手动触发的
 `.github/workflows/benchmark-scan-backends.yml` 上传，不进入普通 push gate。
