@@ -376,7 +376,10 @@ class PersistentExtractionWorker:
             name="docseek-persistent-worker-stderr",
             daemon=True,
         )
-        self._reader_threads.extend((stdout_thread, stderr_thread))
+        # A respawn replaces the previous process and its reader threads.  The
+        # old daemon threads have closed pipes and can finish independently;
+        # do not retain their references for the lifetime of this controller.
+        self._reader_threads = [stdout_thread, stderr_thread]
         stdout_thread.start()
         stderr_thread.start()
 

@@ -73,8 +73,32 @@ def _stub_command() -> list[str]:
     return [sys.executable, "-c", STUB_WORKER]
 
 
+REAL_PROGRESS_WORKER = textwrap.dedent(
+    r'''
+    from docseek import legacy_worker
+    from docseek.chunks import DocumentChunk
+
+    def fake_extract(source, output, *, adapter_name=None, on_progress=None):
+        print("parser diagnostic", flush=True)
+        if on_progress is not None:
+            on_progress("fake-parser", 7)
+        return legacy_worker.write_chunk_file(
+            output,
+            [DocumentChunk(0, "fake", "persistent-result")],
+        )
+
+    legacy_worker.extract_to_file = fake_extract
+    raise SystemExit(legacy_worker.main(["--persistent"]))
+    '''
+)
+
+
+def _real_progress_worker_command() -> list[str]:
+    return [sys.executable, "-c", REAL_PROGRESS_WORKER]
+
+
 class PersistentExtractionWorkerTests(unittest.TestCase):
-    def test_real_worker_round_trip_progress_and_clean_shutdown(self) -> None:
+    def test_real_worker_round_trip_and_clean_shutdown(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "sample.txt"
             source.write_text("信贷客户经理\n第二行", encoding="utf-8")
@@ -98,6 +122,9 @@ class PersistentExtractionWorkerTests(unittest.TestCase):
             )
             self.assertEqual(len(chunks), 1)
             self.assertIn("信贷客户经理", chunks[0].content)
+            # The direct text adapter has no progress events for this tiny
+            # file; the protocol path itself is covered below with a worker
+            # that emits progress during extraction.
             self.assertEqual(progress, [])
             self.assertEqual(worker.state, "ready")
 
@@ -105,6 +132,27 @@ class PersistentExtractionWorkerTests(unittest.TestCase):
             self.assertFalse(worker.is_alive)
             self.assertIsNotNone(process.poll())
             worker.close()
+
+    def test_real_worker_progress_survives_parser_stdout_redirect(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "sample.txt"
+            source.write_text("content", encoding="utf-8")
+            progress: list[tuple[str, int]] = []
+            with PersistentExtractionWorker(
+                command_factory=_real_progress_worker_command,
+                timeout_seconds=5,
+            ) as worker:
+                chunks = list(
+                    worker.extract(
+                        source,
+                        adapter_name="fake",
+                        on_progress=lambda location, current: progress.append(
+                            (location, current)
+                        ),
+                    )
+                )
+            self.assertEqual([("fake-parser", 7)], progress)
+            self.assertEqual(chunks[0].content, "persistent-result")
 
     def test_progress_message_is_forwarded_by_controller(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -189,6 +237,7 @@ class PersistentExtractionWorkerTests(unittest.TestCase):
                 chunks = list(worker.extract(valid, adapter_name="stub"))
                 worker.restart()
                 chunks = list(worker.extract(valid, adapter_name="stub"))
+                self.assertLessEqual(len(worker._reader_threads), 2)
             self.assertEqual(chunks[0].content, "valid.txt")
 
     def test_cancel_kills_hanging_worker_quickly(self) -> None:
@@ -245,6 +294,26 @@ class PersistentExtractionWorkerTests(unittest.TestCase):
                 self.assertEqual(worker.state, "dead")
                 chunks = list(worker.extract(valid, adapter_name="stub"))
             self.assertEqual(chunks[0].content, "valid.txt")
+
+    def test_stall_without_progress_kills_worker(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "hang.txt"
+            source.write_text("hang", encoding="utf-8")
+            with PersistentExtractionWorker(
+                command_factory=_stub_command,
+                timeout_seconds=2,
+                adapter_timeout_seconds=2,
+                stall_timeout_seconds=0.10,
+            ) as worker:
+                with self.assertRaises(LegacyExtractionTimeout):
+                    list(
+                        worker.extract(
+                            source,
+                            adapter_name="stub",
+                            on_progress=lambda location, current: None,
+                        )
+                    )
+                self.assertEqual(worker.state, "dead")
 
     def test_frozen_worker_command_is_explicit(self) -> None:
         with mock.patch.object(sys, "frozen", True, create=True):

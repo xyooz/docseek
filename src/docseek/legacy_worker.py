@@ -102,10 +102,17 @@ def extract_to_file(
             os.environ["DOCSEEK_LEGACY_WORKER"] = previous
 
 
-def _write_persistent_message(message: dict[str, object]) -> None:
+def _write_persistent_message(
+    message: dict[str, object],
+    *,
+    stream=None,
+) -> None:
     """Write one JSON-lines message on the persistent worker protocol."""
-    sys.stdout.write(json.dumps(message, ensure_ascii=False, separators=(",", ":")) + "\n")
-    sys.stdout.flush()
+    protocol_stdout = sys.stdout if stream is None else stream
+    protocol_stdout.write(
+        json.dumps(message, ensure_ascii=False, separators=(",", ":")) + "\n"
+    )
+    protocol_stdout.flush()
 
 
 def _persistent_worker_main() -> int:
@@ -118,6 +125,7 @@ def _persistent_worker_main() -> int:
     process remains reusable. Native crashes and forced termination are not
     catchable here and are detected by the parent as EOF/exit.
     """
+    protocol_stdout = sys.stdout
     _write_persistent_message(
         {
             "type": "ready",
@@ -196,7 +204,8 @@ def _persistent_worker_main() -> int:
                     "request_id": request_id,
                     "location": str(location),
                     "current": int(current),
-                }
+                },
+                stream=protocol_stdout,
             )
 
         try:
