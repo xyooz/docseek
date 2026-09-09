@@ -32,6 +32,9 @@ package = [
   "pyinstaller==6.22.2",
   "maturin>=1.7,<2",
 ]
+# Scanner-only performance experiments use process RSS, including Rust native
+# allocations. This extra is intentionally not part of the normal runtime.
+benchmarks = ["psutil>=5.9"]
 
 [project.scripts]
 docseek = "docseek.bootstrap:main"

@@ -3,6 +3,7 @@ __pycache__/
 *.egg-info/
 .venv/
 .bench/
+benchmark-results.json
 build/
 dist/
 manual-test-corpus/generated/

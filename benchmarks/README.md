@@ -59,3 +59,27 @@ python benchmarks/benchmark_search.py --files 10000 --db .bench/docseek-10k.db
 - Windows 文件系统监听到搜索可见的端到端延迟。
 
 所有性能数字都应记录测试机器 CPU、内存、磁盘类型、Python 版本和文件规模，避免跨机器直接比较绝对值。
+
+## Scanner-only Python/Rust 对比
+
+`benchmark_scan_backends.py` 只测文件系统 discovery，不经过 Parser、ChunkBatchWriter
+或 SQLite/FTS。它在独立 worker 进程中运行 Python 和 Rust backend，默认覆盖 sparse/dense
+两种组成以及 10k/100k 文件规模，并输出控制台表格和 JSON 报告：
+
+```bash
+python benchmarks/benchmark_scan_backends.py \
+  --files 10000 100000 \
+  --scenario both \
+  --backend both \
+  --json-out benchmark-results.json
+```
+
+需要 benchmark 专用依赖：
+
+```bash
+python -m pip install -e ".[benchmarks]"
+```
+
+报告包含 discovery 总耗时、files/s、第一次有意义的 progress、第一次 candidate、
+整个进程 RSS，以及单独的 sparse-100k 并发取消延迟。扫描结果会校验 Python/Rust
+candidate 数量一致；性能数值不作为 CI hard gate。
