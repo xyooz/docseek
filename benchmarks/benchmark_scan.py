@@ -17,6 +17,7 @@ import docseek.chunk_writer as chunk_writer_module
 import docseek.indexer as indexer_module
 import docseek.structure_store as structure_store_module
 from docseek.indexer import DirectoryIndexer
+from docseek.persistent_extraction import PersistentExtractionWorker
 from docseek.scan_backend import PythonScanBackend, RustScanBackend
 from docseek.search_db import SearchDatabase
 
@@ -545,6 +546,70 @@ def timed_scan(
         )
     )
     if profile_phases:
+        original_persistent_worker = indexer_module.PersistentExtractionWorker
+
+        class TimedPersistentExtractionWorker(PersistentExtractionWorker):
+            """Benchmark-only timings for the production persistent worker."""
+
+            def start(self) -> None:
+                was_alive = self.is_alive
+                call_started = time.perf_counter()
+                try:
+                    return super().start()
+                finally:
+                    if not was_alive:
+                        add_timing(
+                            "persistent_worker_startup",
+                            time.perf_counter() - call_started,
+                        )
+                        add_timing("persistent_worker_start_count", 1.0)
+
+            def extract(self, *args: Any, **kwargs: Any) -> Iterator[Any]:
+                call_started = time.perf_counter()
+                try:
+                    replay = super().extract(*args, **kwargs)
+                finally:
+                    add_timing(
+                        "persistent_request_total",
+                        time.perf_counter() - call_started,
+                    )
+                    add_timing("persistent_request_count", 1.0)
+
+                def timed_replay() -> Iterator[Any]:
+                    replay_started = time.perf_counter()
+                    try:
+                        yield from replay
+                    finally:
+                        add_timing(
+                            "spool_replay",
+                            time.perf_counter() - replay_started,
+                        )
+
+                return timed_replay()
+
+            @staticmethod
+            def _validate_chunk_file(output: Path, expected_count: int) -> None:
+                call_started = time.perf_counter()
+                try:
+                    return PersistentExtractionWorker._validate_chunk_file(
+                        output,
+                        expected_count,
+                    )
+                finally:
+                    add_timing(
+                        "spool_validate",
+                        time.perf_counter() - call_started,
+                    )
+
+        indexer_module.PersistentExtractionWorker = TimedPersistentExtractionWorker
+        restorers.append(
+            lambda: setattr(
+                indexer_module,
+                "PersistentExtractionWorker",
+                original_persistent_worker,
+            )
+        )
+
         original_normalize = indexer._normalize
 
         def timed_normalize(path: Path) -> str:
@@ -868,6 +933,17 @@ def format_extraction_detail(timings: dict[str, float]) -> str:
     return f"extraction_total={timings.get('extract_chunks', 0.0):.3f}s {details}"
 
 
+def format_persistent_worker_detail(timings: dict[str, float]) -> str:
+    return (
+        f"persistent_worker_startup={timings.get('persistent_worker_startup', 0.0):.3f}s "
+        f"persistent_worker_starts={timings.get('persistent_worker_start_count', 0.0):.0f} "
+        f"persistent_request_total={timings.get('persistent_request_total', 0.0):.3f}s "
+        f"persistent_requests={timings.get('persistent_request_count', 0.0):.0f} "
+        f"spool_validate={timings.get('spool_validate', 0.0):.3f}s "
+        f"spool_replay={timings.get('spool_replay', 0.0):.3f}s"
+    )
+
+
 def format_writer_detail(timings: dict[str, float]) -> str:
     structure_total = timings.get("structure_total", 0.0)
     structure_sql = timings.get("sql_structure", 0.0)
@@ -910,6 +986,8 @@ def run_backend_benchmark(
     file_count: int,
     backend_name: str,
     workload: WorkloadSpec,
+    *,
+    require_persistent_worker: bool = False,
 ) -> None:
     backend_factory = {
         "python": PythonScanBackend,
@@ -970,6 +1048,15 @@ def run_backend_benchmark(
         first_tail_after_discovery = max(0.0, first_seconds - first_discovery_complete)
         second_tail_after_discovery = max(0.0, second_seconds - second_discovery_complete)
 
+        if require_persistent_worker and workload.fixture_name is not None:
+            persistent_requests = first_timings.get("persistent_request_count", 0.0)
+            if persistent_requests < file_count:
+                raise RuntimeError(
+                    f"{workload.name}/{backend_name} did not use the persistent "
+                    f"worker for every file: requests={persistent_requests:.0f}, "
+                    f"expected_at_least={file_count}"
+                )
+
         print("DocSeek directory scan benchmark")
         print(f"backend={backend_name}")
         print(f"workload={workload.name}")
@@ -991,6 +1078,7 @@ def run_backend_benchmark(
         if first_timings:
             print("first_phases " + format_phase_timings(first_timings))
             print("first_extraction " + format_extraction_detail(first_timings))
+            print("first_persistent " + format_persistent_worker_detail(first_timings))
             print("first_writer_breakdown " + format_first_index_breakdown(first_timings))
             print("first_writer_detail " + format_writer_detail(first_timings))
         print(
@@ -1071,6 +1159,11 @@ def main() -> None:
         default="python",
         help="scan backend to profile (default: python)",
     )
+    parser.add_argument(
+        "--require-persistent-worker",
+        action="store_true",
+        help="fail Office/PDF workloads if production falls back to one-shot isolation",
+    )
     args = parser.parse_args()
     if args.files < 1:
         parser.error("--files must be >= 1")
@@ -1078,7 +1171,12 @@ def main() -> None:
     backends = ("python", "rust") if args.backend == "both" else (args.backend,)
     workload = WORKLOADS[args.workload]
     for backend_name in backends:
-        run_backend_benchmark(args.files, backend_name, workload)
+        run_backend_benchmark(
+            args.files,
+            backend_name,
+            workload,
+            require_persistent_worker=args.require_persistent_worker,
+        )
 
 
 if __name__ == "__main__":
