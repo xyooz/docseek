@@ -36,7 +36,10 @@ $pyInstallerArgs = @(
     "-m", "PyInstaller",
     "--noconfirm",
     "--clean",
-    "--windowed",
+    # The same executable is also launched as the persistent extraction
+    # worker.  A console subsystem is required for its JSON stdin/stdout
+    # protocol; the launcher hides the console for the normal desktop path.
+    "--console",
     "--onedir",
     "--name", "DocSeek",
     "--icon", (Join-Path $repoRoot "assets\docseek.ico"),

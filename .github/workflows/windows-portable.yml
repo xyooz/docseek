@@ -55,7 +55,7 @@ jobs:
           toolchain: stable
 
       - name: Install packaging dependencies
-        run: python -m pip install -e ".[calamine,tika,wps,package]"
+        run: python -m pip install -e ".[calamine,tika,wps,package,benchmarks]"
 
       - name: Build portable ZIP
         shell: pwsh
@@ -112,6 +112,22 @@ jobs:
           finally {
             Remove-Item Env:DOCSEEK_FROZEN_RUST_SMOKE -ErrorAction SilentlyContinue
           }
+
+      - name: Verify frozen persistent worker and production index E2E
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $zip = Get-ChildItem dist\DocSeek-*-Windows-x64.zip | Select-Object -First 1
+          if (-not $zip) { throw "Portable ZIP was not found" }
+
+          $verifyRoot = Join-Path $env:RUNNER_TEMP "docseek-portable-persistent-e2e"
+          if (Test-Path $verifyRoot) { Remove-Item -Recurse -Force $verifyRoot }
+          New-Item -ItemType Directory -Path $verifyRoot | Out-Null
+          Expand-Archive -Path $zip.FullName -DestinationPath $verifyRoot
+
+          $exe = Join-Path $verifyRoot "DocSeek.exe"
+          if (-not (Test-Path $exe)) { throw "Extracted DocSeek.exe was not found" }
+          python packaging/windows/verify_persistent_worker_e2e.py --exe $exe
 
       - name: Report artifact
         shell: pwsh
