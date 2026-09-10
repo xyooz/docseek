@@ -22,6 +22,7 @@ on:
       - "tests/test_full_index_backend_regression.py"
       - "tests/test_indexer_scan_backend.py"
       - "tests/test_persistent_extraction_integration.py"
+      - "tests/test_persistent_extraction_reliability.py"
       - "tests/test_persistent_extraction_worker.py"
       - "tests/test_scan_backend.py"
       - "tests/test_scan_backend_selection.py"
@@ -81,3 +82,5 @@ jobs:
         run: python -m unittest tests.test_persistent_extraction_worker -v
       - name: Persistent extraction integration
         run: python -m unittest tests.test_persistent_extraction_integration -v
+      - name: Persistent extraction reliability regression
+        run: python -m unittest tests.test_persistent_extraction_reliability -v
