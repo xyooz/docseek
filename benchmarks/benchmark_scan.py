@@ -479,6 +479,12 @@ def timed_scan(
     phase = "discovery"
     timings: dict[str, float] = {}
     writer_scope_depth = 0
+    transaction_states: dict[int, dict[str, float]] = {}
+    max_transaction_rows = 0.0
+    max_transaction_chunks = 0.0
+    db_path = Path(indexer.chunk_store.db_path)
+    wal_path = Path(f"{db_path}-wal")
+    timings["wal_bytes_before"] = float(wal_path.stat().st_size) if wal_path.exists() else 0.0
 
     def add_timing(name: str, elapsed: float) -> None:
         timings[name] = timings.get(name, 0.0) + elapsed
@@ -516,8 +522,10 @@ def timed_scan(
             return "sql_begin"
         if normalized.startswith(("SAVEPOINT ", "RELEASE ", "ROLLBACK TO ")):
             return "sql_savepoint"
-        if normalized.startswith("INSERT INTO FILES") or normalized.startswith("UPDATE FILES"):
-            return "sql_files"
+        if normalized.startswith("INSERT INTO FILES"):
+            return "sql_files_insert"
+        if normalized.startswith("UPDATE FILES"):
+            return "sql_files_update"
         if normalized.startswith("SELECT ID FROM FILES WHERE PATH"):
             return "sql_file_id"
         if normalized.startswith("SELECT C.ID, C.CONTENT, F.FILENAME"):
@@ -529,12 +537,86 @@ def timed_scan(
         if normalized.startswith("INSERT INTO CHUNK_STRUCTURE"):
             return "sql_structure"
         if normalized.startswith("INSERT INTO CHUNK_INDEX_CJK2"):
-            return "sql_fts_cjk"
+            if "VALUES ('DELETE'" in normalized:
+                return "sql_fts_cjk_delete"
+            return "sql_fts_cjk_insert"
         if normalized.startswith("INSERT INTO CHUNK_INDEX"):
-            return "sql_fts_normal"
+            if "VALUES ('DELETE'" in normalized:
+                return "sql_fts_normal_delete"
+            return "sql_fts_normal_insert"
         if normalized.startswith("INSERT INTO EXTRACTION_STATE"):
             return "sql_extraction_state"
+        if normalized.startswith("PRAGMA WAL_CHECKPOINT"):
+            return "sql_wal_checkpoint"
         return None
+
+    def writer_sql_aliases(category: str) -> tuple[str, ...]:
+        if category == "sql_files_insert" or category == "sql_files_update":
+            return ("sql_files",)
+        if category.startswith("sql_fts_normal_"):
+            return ("sql_fts_normal",)
+        if category.startswith("sql_fts_cjk_"):
+            return ("sql_fts_cjk",)
+        return ()
+
+    def record_writer_sql(
+        conn: sqlite3.Connection,
+        category: str | None,
+        elapsed: float,
+        cursor: sqlite3.Cursor | None,
+        *,
+        count_execute: bool = True,
+    ) -> None:
+        nonlocal max_transaction_rows, max_transaction_chunks
+        if writer_scope_depth <= 0:
+            return
+
+        if count_execute:
+            add_timing("sql_execute", elapsed)
+            add_timing("sql_execute_count", 1.0)
+        if category is None:
+            return
+
+        add_timing(category, elapsed)
+        add_timing(f"{category}_count", 1.0)
+        for alias in writer_sql_aliases(category):
+            add_timing(alias, elapsed)
+
+        rowcount = 0.0
+        if cursor is not None:
+            try:
+                if int(cursor.rowcount) >= 0:
+                    rowcount = float(cursor.rowcount)
+            except (AttributeError, TypeError, ValueError):
+                rowcount = 0.0
+
+        if rowcount > 0:
+            add_timing("sql_rows_affected", rowcount)
+            add_timing(f"{category}_rows", rowcount)
+            state = transaction_states.get(id(conn))
+            if state is not None:
+                state["rows"] += rowcount
+                if category == "sql_chunks":
+                    state["chunks"] += rowcount
+
+        if category == "sql_begin":
+            transaction_states[id(conn)] = {"rows": 0.0, "chunks": 0.0}
+            add_timing("writer_transaction_count", 1.0)
+
+    def finish_writer_transaction(conn: sqlite3.Connection, *, committed: bool) -> None:
+        nonlocal max_transaction_rows, max_transaction_chunks
+        if writer_scope_depth <= 0:
+            return
+        state = transaction_states.pop(id(conn), None)
+        if state is None:
+            return
+        if committed:
+            add_timing("writer_transaction_rows_total", state["rows"])
+            add_timing("writer_transaction_chunks_total", state["chunks"])
+            max_transaction_rows = max(max_transaction_rows, state["rows"])
+            max_transaction_chunks = max(max_transaction_chunks, state["chunks"])
+        else:
+            add_timing("writer_transaction_rolled_back", 1.0)
 
     restorers: list[Callable[[], None]] = []
     indexer_module.iter_scan_candidates = timed_iter_scan_candidates
@@ -729,21 +811,80 @@ def timed_scan(
         class ProfilingConnection(sqlite3.Connection):
             def execute(self, sql: str, parameters: Any = ()) -> sqlite3.Cursor:
                 call_started = time.perf_counter()
+                cursor: sqlite3.Cursor | None = None
                 try:
-                    return super().execute(sql, parameters)
+                    cursor = super().execute(sql, parameters)
+                    return cursor
                 finally:
                     if writer_scope_depth > 0:
                         category = classify_writer_sql(sql)
-                        if category is not None:
-                            add_timing(category, time.perf_counter() - call_started)
+                        record_writer_sql(
+                            self,
+                            category,
+                            time.perf_counter() - call_started,
+                            cursor,
+                        )
+
+            def executemany(
+                self,
+                sql: str,
+                seq_of_parameters: Any,
+            ) -> sqlite3.Cursor:
+                call_started = time.perf_counter()
+                cursor: sqlite3.Cursor | None = None
+                try:
+                    cursor = super().executemany(sql, seq_of_parameters)
+                    return cursor
+                finally:
+                    if writer_scope_depth > 0:
+                        add_timing(
+                            "sql_executemany",
+                            time.perf_counter() - call_started,
+                        )
+                        add_timing("sql_executemany_count", 1.0)
+                        category = classify_writer_sql(sql)
+                        record_writer_sql(
+                            self,
+                            category,
+                            time.perf_counter() - call_started,
+                            cursor,
+                            count_execute=False,
+                        )
+
+            def executescript(self, sql_script: str) -> sqlite3.Cursor:
+                call_started = time.perf_counter()
+                cursor: sqlite3.Cursor | None = None
+                try:
+                    cursor = super().executescript(sql_script)
+                    return cursor
+                finally:
+                    if writer_scope_depth > 0:
+                        add_timing(
+                            "sql_executescript",
+                            time.perf_counter() - call_started,
+                        )
+                        add_timing("sql_executescript_count", 1.0)
 
             def commit(self) -> None:
                 call_started = time.perf_counter()
+                succeeded = False
                 try:
-                    return super().commit()
+                    result = super().commit()
+                    succeeded = True
+                    return result
                 finally:
                     if writer_scope_depth > 0:
                         add_timing("sql_commit", time.perf_counter() - call_started)
+                        add_timing("writer_commit_count", 1.0)
+                        finish_writer_transaction(self, committed=succeeded)
+
+            def rollback(self) -> None:
+                try:
+                    return super().rollback()
+                finally:
+                    if writer_scope_depth > 0:
+                        add_timing("writer_rollback_count", 1.0)
+                        finish_writer_transaction(self, committed=False)
 
             def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> bool:
                 try:
@@ -784,6 +925,7 @@ def timed_scan(
 
         def timed_replace_document(writer: Any, *args: Any, **kwargs: Any) -> Any:
             nonlocal writer_scope_depth
+            add_timing("writer_replace_count", 1.0)
             validate_source = kwargs.get("validate_source")
             if validate_source is not None:
                 def timed_validate_source() -> Any:
@@ -814,8 +956,10 @@ def timed_scan(
             nonlocal writer_scope_depth
             call_started = time.perf_counter()
             outermost = writer_scope_depth == 0
+            add_timing("writer_flush_count", 1.0)
             if outermost:
                 writer_scope_depth += 1
+                add_timing("writer_flush_outer_count", 1.0)
             try:
                 return original_flush(writer, *args, **kwargs)
             finally:
@@ -834,6 +978,7 @@ def timed_scan(
             nonlocal writer_scope_depth
             call_started = time.perf_counter()
             outermost = writer_scope_depth == 0
+            add_timing("writer_exit_count", 1.0)
             if outermost:
                 writer_scope_depth += 1
             try:
@@ -858,6 +1003,12 @@ def timed_scan(
     finally:
         for restore in reversed(restorers):
             restore()
+
+    shm_path = Path(f"{db_path}-shm")
+    timings["writer_transaction_max_rows"] = max_transaction_rows
+    timings["writer_transaction_max_chunks"] = max_transaction_chunks
+    timings["wal_bytes_after"] = float(wal_path.stat().st_size) if wal_path.exists() else 0.0
+    timings["shm_bytes_after"] = float(shm_path.stat().st_size) if shm_path.exists() else 0.0
 
     total_seconds = time.perf_counter() - started
     return (
@@ -961,8 +1112,14 @@ def format_writer_detail(timings: dict[str, float]) -> str:
         "sql_fts_normal",
         "sql_extraction_state",
         "sql_commit",
+        "sql_wal_checkpoint",
     )
     sql_total = sum(timings.get(name, 0.0) for name in sql_names)
+    transaction_count = timings.get("writer_transaction_count", 0.0)
+    rows_total = timings.get("writer_transaction_rows_total", 0.0)
+    chunks_total = timings.get("writer_transaction_chunks_total", 0.0)
+    average_rows = rows_total / transaction_count if transaction_count else 0.0
+    average_chunks = chunks_total / transaction_count if transaction_count else 0.0
     return (
         f"sql_total={sql_total:.3f}s "
         f"files_sql={timings.get('sql_files', 0.0):.3f}s "
@@ -978,7 +1135,43 @@ def format_writer_detail(timings: dict[str, float]) -> str:
         f"source_validate={timings.get('source_validate', 0.0):.3f}s "
         f"file_id_sql={timings.get('sql_file_id', 0.0):.3f}s "
         f"delete_lookup={timings.get('sql_delete_lookup', 0.0):.3f}s "
-        f"delete_chunks={timings.get('sql_delete_chunks', 0.0):.3f}s"
+        f"delete_chunks={timings.get('sql_delete_chunks', 0.0):.3f}s "
+        f"files_insert={timings.get('sql_files_insert', 0.0):.3f}s "
+        f"files_update={timings.get('sql_files_update', 0.0):.3f}s "
+        f"files_insert_rows={timings.get('sql_files_insert_rows', 0.0):.0f} "
+        f"files_update_rows={timings.get('sql_files_update_rows', 0.0):.0f} "
+        f"chunk_delete_rows={timings.get('sql_delete_chunks_rows', 0.0):.0f} "
+        f"state_rows={timings.get('sql_extraction_state_rows', 0.0):.0f} "
+        f"fts_normal_insert={timings.get('sql_fts_normal_insert', 0.0):.3f}s "
+        f"fts_normal_delete={timings.get('sql_fts_normal_delete', 0.0):.3f}s "
+        f"fts_cjk_insert={timings.get('sql_fts_cjk_insert', 0.0):.3f}s "
+        f"fts_cjk_delete={timings.get('sql_fts_cjk_delete', 0.0):.3f}s "
+        f"execute={timings.get('sql_execute', 0.0):.3f}s "
+        f"execute_calls={timings.get('sql_execute_count', 0.0):.0f} "
+        f"executemany={timings.get('sql_executemany', 0.0):.3f}s "
+        f"executemany_calls={timings.get('sql_executemany_count', 0.0):.0f} "
+        f"executescript={timings.get('sql_executescript', 0.0):.3f}s "
+        f"transactions={transaction_count:.0f} "
+        f"commits={timings.get('writer_commit_count', 0.0):.0f} "
+        f"rollbacks={timings.get('writer_rollback_count', 0.0):.0f} "
+        f"rows_affected={timings.get('sql_rows_affected', 0.0):.0f} "
+        f"rows_per_transaction={average_rows:.1f} "
+        f"max_rows_per_transaction={timings.get('writer_transaction_max_rows', 0.0):.0f} "
+        f"chunks_written={timings.get('sql_chunks_rows', 0.0):.0f} "
+        f"chunks_per_transaction={average_chunks:.1f} "
+        f"structure_rows={timings.get('sql_structure_rows', 0.0):.0f} "
+        f"fts_normal_insert_rows={timings.get('sql_fts_normal_insert_rows', 0.0):.0f} "
+        f"fts_normal_delete_rows={timings.get('sql_fts_normal_delete_rows', 0.0):.0f} "
+        f"fts_cjk_insert_rows={timings.get('sql_fts_cjk_insert_rows', 0.0):.0f} "
+        f"fts_cjk_delete_rows={timings.get('sql_fts_cjk_delete_rows', 0.0):.0f} "
+        f"flush_calls={timings.get('writer_flush_count', 0.0):.0f} "
+        f"outer_flush_calls={timings.get('writer_flush_outer_count', 0.0):.0f} "
+        f"replace_calls={timings.get('writer_replace_count', 0.0):.0f} "
+        f"wal_checkpoint={timings.get('sql_wal_checkpoint', 0.0):.3f}s "
+        f"wal_checkpoint_calls={timings.get('sql_wal_checkpoint_count', 0.0):.0f} "
+        f"wal_before={timings.get('wal_bytes_before', 0.0):.0f}B "
+        f"wal_after={timings.get('wal_bytes_after', 0.0):.0f}B "
+        f"shm_after={timings.get('shm_bytes_after', 0.0):.0f}B"
     )
 
 
@@ -988,6 +1181,7 @@ def run_backend_benchmark(
     workload: WorkloadSpec,
     *,
     require_persistent_worker: bool = False,
+    profile_replacement: bool = False,
 ) -> None:
     backend_factory = {
         "python": PythonScanBackend,
@@ -1035,6 +1229,21 @@ def run_backend_benchmark(
                 max(time.time_ns(), changed_stat.st_mtime_ns + 2_000_000_000),
             ),
         )
+
+        replacement_result: tuple[
+            float,
+            float,
+            float,
+            int,
+            object,
+            dict[str, float],
+        ] | None = None
+        if profile_replacement:
+            replacement_result = timed_scan(
+                DirectoryIndexer(db, scan_backend=backend_factory()),
+                root,
+                profile_phases=True,
+            )
 
         init_started = time.perf_counter()
         incremental_indexer = DirectoryIndexer(db, scan_backend=backend_factory())
@@ -1129,6 +1338,38 @@ def run_backend_benchmark(
                 + f" path_hot_share={hot_share:.1%}"
                 + f" normalize_per_1k={normalize_per_1k_ms:.2f}ms"
             )
+        if replacement_result is not None:
+            (
+                replacement_seconds,
+                replacement_scanner_wait,
+                replacement_discovery_complete,
+                replacement_candidates,
+                replacement_stats,
+                replacement_timings,
+            ) = replacement_result
+            replacement_tail = max(
+                0.0,
+                replacement_seconds - replacement_discovery_complete,
+            )
+            print(
+                f"replacement_scan={replacement_seconds:.3f}s "
+                f"scanner_wait={replacement_scanner_wait:.3f}s "
+                f"discovery_complete_wall={replacement_discovery_complete:.3f}s "
+                f"tail_after_discovery={replacement_tail:.3f}s "
+                f"candidates={replacement_candidates:,} "
+                f"scanner_wait_share={replacement_scanner_wait / replacement_seconds:.1%} "
+                f"indexed={replacement_stats.indexed} "
+                f"unchanged={replacement_stats.unchanged}"
+            )
+            print(
+                "replacement_extraction "
+                + format_extraction_detail(replacement_timings)
+            )
+            print(
+                "replacement_writer_breakdown "
+                + format_first_index_breakdown(replacement_timings)
+            )
+            print("replacement_writer_detail " + format_writer_detail(replacement_timings))
         print(
             f"single_file_update=backend-independent workload_touch total={total_update_ms:.2f}ms "
             f"indexer_init={init_ms:.2f}ms update_only={update_only_ms:.2f}ms "
@@ -1164,6 +1405,11 @@ def main() -> None:
         action="store_true",
         help="fail Office/PDF workloads if production falls back to one-shot isolation",
     )
+    parser.add_argument(
+        "--profile-replacement",
+        action="store_true",
+        help="profile one changed-file reconciliation after the unchanged rescan",
+    )
     args = parser.parse_args()
     if args.files < 1:
         parser.error("--files must be >= 1")
@@ -1176,6 +1422,7 @@ def main() -> None:
             backend_name,
             workload,
             require_persistent_worker=args.require_persistent_worker,
+            profile_replacement=args.profile_replacement,
         )
 
 

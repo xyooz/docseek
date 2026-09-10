@@ -1,0 +1,79 @@
+name: benchmark-sqlite-writer
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: "Git ref containing the writer benchmark instrumentation"
+        required: true
+        default: "perf/sqlite-writer-baseline"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  windows-sqlite-writer-baseline:
+    runs-on: windows-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_ref }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Install benchmark and parser dependencies
+        run: python -m pip install -e ".[calamine,tika,wps,benchmarks]"
+
+      - name: Build and install PyO3 wheel
+        shell: pwsh
+        run: |
+          python -m pip install "maturin>=1.7,<2"
+          maturin build --interpreter python --manifest-path crates/docseek-python/Cargo.toml --release
+          python -c "import glob, os, subprocess, sys; wheels=sorted(glob.glob('target/wheels/docseek_rust-*.whl'), key=os.path.getmtime); assert wheels, 'no docseek_rust wheel'; subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--force-reinstall', '--no-deps', wheels[-1]])"
+          python -c "import docseek_rust; print(docseek_rust.__file__)"
+
+      - name: Record Windows runner
+        shell: pwsh
+        run: |
+          python --version
+          rustc --version
+          Get-ComputerInfo | Select-Object CsName, OsName, OsVersion, CsProcessors, CsTotalPhysicalMemory
+
+      - name: Run SQLite writer baseline matrix
+        shell: pwsh
+        run: |
+          $cases = @(
+            @{ Workload = "tiny-text"; Files = 50000 },
+            @{ Workload = "medium-text"; Files = 10000 },
+            @{ Workload = "large-text"; Files = 1000 }
+          )
+
+          foreach ($case in $cases) {
+            $output = "benchmark-sqlite-$($case.Workload).txt"
+            Write-Host "=== $($case.Workload) / $($case.Files) ==="
+            python benchmarks/benchmark_scan.py `
+              --workload $case.Workload `
+              --files $case.Files `
+              --backend both `
+              --profile-replacement 2>&1 | Tee-Object -FilePath $output
+            if ($LASTEXITCODE -ne 0) {
+              throw "SQLite writer baseline failed for $($case.Workload) with exit code $LASTEXITCODE"
+            }
+          }
+
+      - name: Upload SQLite writer baseline reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: docseek-sqlite-writer-windows-baseline
+          path: benchmark-sqlite-*.txt
+          if-no-files-found: error
+          retention-days: 30

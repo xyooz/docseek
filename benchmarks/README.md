@@ -138,3 +138,29 @@ python benchmarks/benchmark_scan.py --workload pdf --files 500 --backend both
 
 scanner-only benchmark 的 Windows 报告通过手动触发的
 `.github/workflows/benchmark-scan-backends.yml` 上传，不进入普通 push gate。
+
+## SQLite / FTS writer baseline
+
+M9-A 只增加 benchmark 进程内的 writer/SQLite 计时探针，不改变生产数据库逻辑、SQLite
+PRAGMA、batch size 或 transaction 粒度。它在完整索引和 unchanged rescan 中额外报告：
+
+- `transactions` / `commits` / `rollbacks`、`rows_per_transaction` 和 `chunks_per_transaction`；
+- `files_insert` / `files_update`、chunk insert/delete、structure、extraction state；
+- normal FTS 与 CJK FTS 的 insert/delete 时间及 row 数；
+- `execute` / `executemany` / `executescript` 时间和调用次数；
+- `flush`、`replace_document`、`commit`、WAL checkpoint 及 WAL sidecar 大小。
+
+这些指标存在嵌套关系：`writer_total` 包含 `replace_document`、外层 flush 和 writer exit；
+`sql_total` 是分类后的 SQL execute/commit 时间汇总，不再把 `structure_total` 重复相加；
+`execute` 是所有分类 SQL 的外层总计，不能与分类项相加。Windows 正式矩阵由手动触发的
+`.github/workflows/benchmark-sqlite-writer.yml` 上传，覆盖：
+
+```bash
+tiny-text 50,000
+medium-text 10,000
+large-text 1,000
+```
+
+该 workflow 还传入 `--profile-replacement`，在 fresh index 和 unchanged rescan 后修改一个
+文件并再扫一次，以便观察 replacement path 的 chunk/FTS delete 与 insert；这部分单独标为
+`replacement_*`，不与 fresh-index 计时相加。
