@@ -79,7 +79,10 @@ def _terminate_process(
     try:
         process.terminate()
     except OSError:
-        return
+        # The child may have exited between poll() and terminate().  Still
+        # wait below so Windows can reap the process and publish its final
+        # exit state to the parent.
+        pass
     try:
         process.wait(timeout=max(0.01, wait_seconds))
     except subprocess.TimeoutExpired:
@@ -271,6 +274,13 @@ class PersistentExtractionWorker:
                     self._active_request_id = None
                 if self._closed:
                     self._state = "closed"
+                elif self._state == "dead":
+                    # A reader EOF, timeout, cancellation, or fatal protocol
+                    # error may have already established that this worker is
+                    # unusable while process.poll() still temporarily reports
+                    # None on Windows.  Never infer readiness over that
+                    # lifecycle event.
+                    pass
                 elif self._process is not None and self._process.poll() is None:
                     self._state = "ready"
                 else:
@@ -509,7 +519,7 @@ class PersistentExtractionWorker:
             message_type = message.get("type")
             if message_type == "progress":
                 if message.get("request_id") != request_id:
-                    raise PersistentWorkerError(
+                    raise self._fatal_protocol_error(
                         f"progress request_id mismatch: {message!r}"
                     )
                 last_progress_at = time.monotonic()
@@ -533,24 +543,40 @@ class PersistentExtractionWorker:
                 continue
 
             if message.get("request_id") != request_id:
-                raise PersistentWorkerError(
+                raise self._fatal_protocol_error(
                     f"worker response request_id mismatch: {message!r}"
                 )
 
             if message_type == "result":
                 returned_output = Path(str(message.get("output", "")))
                 if returned_output != expected_output:
-                    raise PersistentWorkerError(
+                    raise self._fatal_protocol_error(
                         f"worker returned unexpected output path: {returned_output}"
                     )
-                return int(message.get("chunk_count", 0)), returned_output
+                try:
+                    chunk_count = int(message.get("chunk_count", 0))
+                except (TypeError, ValueError) as exc:
+                    raise self._fatal_protocol_error(
+                        f"worker returned invalid chunk count: {message!r}"
+                    ) from exc
+                return chunk_count, returned_output
 
             if message_type == "error":
                 detail = str(message.get("error", "persistent extraction failed"))
                 error_type = str(message.get("error_type", "Exception"))
                 raise PersistentWorkerError(f"{error_type}: {detail}")
 
-            raise PersistentWorkerError(f"unknown worker response: {message!r}")
+            raise self._fatal_protocol_error(
+                f"unknown worker response: {message!r}"
+            )
+
+    def _fatal_protocol_error(self, detail: str) -> PersistentWorkerError:
+        """Stop a worker after a response that cannot be safely recovered."""
+        error = PersistentWorkerError(detail)
+        with self._lifecycle_lock:
+            self._termination_reason = error
+            self._stop_locked()
+        return error
 
     def _wait_for_shutdown_locked(self, process: subprocess.Popen[str]) -> None:
         deadline = time.monotonic() + 2.0
@@ -570,15 +596,20 @@ class PersistentExtractionWorker:
         raise PersistentWorkerError("persistent extraction worker shutdown timeout")
 
     def _crashed_error(self, process: subprocess.Popen[str] | None) -> PersistentWorkerCrashed:
-        code = process.poll() if process is not None else None
-        stderr = " ".join(item for item in self._stderr_tail if item)
-        detail = f"persistent extraction worker exited (code={code})"
-        if stderr:
-            detail += f": {stderr[-1000:]}"
-        if process is not None and code is not None:
-            self._close_process_pipes(process)
-        self._state = "dead"
-        return PersistentWorkerCrashed(detail)
+        with self._lifecycle_lock:
+            code = process.poll() if process is not None else None
+            stderr = " ".join(item for item in self._stderr_tail if item)
+            detail = f"persistent extraction worker exited (code={code})"
+            if stderr:
+                detail += f": {stderr[-1000:]}"
+            # EOF from the reader is the authoritative failure event.  Reap
+            # the child here instead of waiting for poll() to catch up; on
+            # Windows the two observations can briefly disagree.
+            if process is not None:
+                _terminate_process(process)
+                self._close_process_pipes(process)
+            self._state = "dead"
+            return PersistentWorkerCrashed(detail)
 
     def _stop_locked(self) -> None:
         process = self._process

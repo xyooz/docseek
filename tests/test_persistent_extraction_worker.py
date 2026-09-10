@@ -264,6 +264,25 @@ class PersistentExtractionWorkerTests(unittest.TestCase):
                 self.assertLessEqual(len(worker._reader_threads), 2)
             self.assertEqual(chunks[0].content, "valid.txt")
 
+    def test_repeated_crash_respawn_converges_to_dead_then_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            valid = root / "valid.txt"
+            valid.write_text("valid", encoding="utf-8")
+            with PersistentExtractionWorker(
+                command_factory=_stub_command,
+                timeout_seconds=5,
+            ) as worker:
+                for attempt in range(50):
+                    crashed = root / f"crash-{attempt}.txt"
+                    crashed.write_text("crash", encoding="utf-8")
+                    with self.assertRaises(PersistentWorkerCrashed):
+                        list(worker.extract(crashed, adapter_name="stub"))
+                    self.assertEqual(worker.state, "dead")
+                    chunks = list(worker.extract(valid, adapter_name="stub"))
+                    self.assertEqual(chunks[0].content, "valid.txt")
+                    self.assertEqual(worker.state, "ready")
+
     def test_cancel_kills_hanging_worker_quickly(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "hang.txt"
