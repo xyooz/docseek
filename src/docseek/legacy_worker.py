@@ -110,7 +110,9 @@ def _write_persistent_message(
     """Write one JSON-lines message on the persistent worker protocol."""
     protocol_stdout = sys.stdout if stream is None else stream
     protocol_stdout.write(
-        json.dumps(message, ensure_ascii=False, separators=(",", ":")) + "\n"
+        # Keep the control channel independent from the child process locale.
+        # JSON decoders restore these escapes to the original Unicode values.
+        json.dumps(message, ensure_ascii=True, separators=(",", ":")) + "\n"
     )
     protocol_stdout.flush()
 

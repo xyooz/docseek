@@ -97,6 +97,25 @@ def _real_progress_worker_command() -> list[str]:
     return [sys.executable, "-c", REAL_PROGRESS_WORKER]
 
 
+UNICODE_PROTOCOL_WORKER = textwrap.dedent(
+    r'''
+    from docseek import legacy_worker
+
+    def fake_extract(source, output, *, adapter_name=None, on_progress=None):
+        if on_progress is not None:
+            on_progress("工作表 测试", 7)
+        raise ValueError("解析失败：测试")
+
+    legacy_worker.extract_to_file = fake_extract
+    raise SystemExit(legacy_worker.main(["--persistent"]))
+    '''
+)
+
+
+def _unicode_protocol_worker_command() -> list[str]:
+    return [sys.executable, "-c", UNICODE_PROTOCOL_WORKER]
+
+
 class PersistentExtractionWorkerTests(unittest.TestCase):
     def test_real_worker_round_trip_and_clean_shutdown(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -153,6 +172,29 @@ class PersistentExtractionWorkerTests(unittest.TestCase):
                 )
             self.assertEqual([("fake-parser", 7)], progress)
             self.assertEqual(chunks[0].content, "persistent-result")
+
+    def test_unicode_protocol_fields_round_trip_through_json(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "sample.xlsx"
+            source.write_text("content", encoding="utf-8")
+            progress: list[tuple[str, int]] = []
+            with PersistentExtractionWorker(
+                command_factory=_unicode_protocol_worker_command,
+                timeout_seconds=5,
+            ) as worker:
+                with self.assertRaises(PersistentWorkerError) as raised:
+                    list(
+                        worker.extract(
+                            source,
+                            adapter_name="fake",
+                            on_progress=lambda location, current: progress.append(
+                                (location, current)
+                            ),
+                        )
+                    )
+
+            self.assertEqual([("工作表 测试", 7)], progress)
+            self.assertIn("解析失败：测试", str(raised.exception))
 
     def test_progress_callback_failure_kills_worker_before_respawn(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
