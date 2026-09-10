@@ -164,3 +164,27 @@ large-text 1,000
 该 workflow 还传入 `--profile-replacement`，在 fresh index 和 unchanged rescan 后修改一个
 文件并再扫一次，以便观察 replacement path 的 chunk/FTS delete 与 insert；这部分单独标为
 `replacement_*`，不与 fresh-index 计时相加。
+
+## SQLite transaction / commit A/B
+
+`benchmark_transaction_sweep.py` 是 M9-B 的 benchmark-only transaction 容量 sweep。它在
+索引进程内临时扩大 `DirectoryIndexer` 的 discovery/write batch 边界，从而观察不同事务容量
+对 SQLite commit 的影响；生产默认值、`ChunkBatchWriter`、SQLite PRAGMA、journal mode、
+`synchronous` 和 tokenizer 都不会被修改。
+
+默认 Windows 矩阵为：
+
+```bash
+python benchmarks/benchmark_transaction_sweep.py \
+  --workload tiny-text --workload medium-text --workload large-text \
+  --backend both \
+  --capacities 128 256 512 1024 files \
+  --cancel-files 2000 \
+  --json-out benchmark-transaction-sweep.json
+```
+
+其中 `files` 是单次扫描的 upper-bound transaction 参考值。每组都会验证 indexed file 数、
+chunk/FTS/state 内容 digest、搜索结果、数据库 `integrity_check` 以及重新打开数据库后的
+一致性；同时报告 commit latency 的平均值、P50、P95、最大值、RSS 峰值和取消延迟。
+JSON 中保留每一次 commit 的 latency 样本，终端输出使用聚合值。不同指标存在嵌套关系，
+`writer_total`、`sql_total` 和 `commit_total` 不能简单相加。

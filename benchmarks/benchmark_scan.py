@@ -471,7 +471,12 @@ def timed_scan(
     root: Path,
     *,
     profile_phases: bool = False,
+    transaction_capacity: int | None = None,
+    commit_latencies: list[float] | None = None,
+    transaction_samples: list[tuple[float, float]] | None = None,
 ) -> tuple[float, float, float, int, object, dict[str, float]]:
+    if transaction_capacity is not None and transaction_capacity < 1:
+        raise ValueError("transaction_capacity must be greater than zero")
     started = time.perf_counter()
     discovery_complete_elapsed: float | None = None
     scanner_wait_seconds = 0.0
@@ -615,10 +620,22 @@ def timed_scan(
             add_timing("writer_transaction_chunks_total", state["chunks"])
             max_transaction_rows = max(max_transaction_rows, state["rows"])
             max_transaction_chunks = max(max_transaction_chunks, state["chunks"])
+            if transaction_samples is not None:
+                transaction_samples.append((state["rows"], state["chunks"]))
         else:
             add_timing("writer_transaction_rolled_back", 1.0)
 
     restorers: list[Callable[[], None]] = []
+    if transaction_capacity is not None:
+        original_scan_batch_size = indexer_module.MAX_SCAN_BATCH_SIZE
+        indexer_module.MAX_SCAN_BATCH_SIZE = int(transaction_capacity)
+        restorers.append(
+            lambda: setattr(
+                indexer_module,
+                "MAX_SCAN_BATCH_SIZE",
+                original_scan_batch_size,
+            )
+        )
     indexer_module.iter_scan_candidates = timed_iter_scan_candidates
     restorers.append(
         lambda: setattr(
@@ -874,8 +891,11 @@ def timed_scan(
                     return result
                 finally:
                     if writer_scope_depth > 0:
-                        add_timing("sql_commit", time.perf_counter() - call_started)
+                        elapsed = time.perf_counter() - call_started
+                        add_timing("sql_commit", elapsed)
                         add_timing("writer_commit_count", 1.0)
+                        if commit_latencies is not None:
+                            commit_latencies.append(elapsed)
                         finish_writer_transaction(self, committed=succeeded)
 
             def rollback(self) -> None:
