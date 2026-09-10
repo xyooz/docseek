@@ -113,22 +113,180 @@ class PersistentExtractionIntegrationTests(unittest.TestCase):
                 def __init__(self, *args, **kwargs):
                     super().__init__(*args, **kwargs)
                     self.request_pids: list[int | None] = []
+                    self.request_records: list[dict[str, object]] = []
                     worker_instances.append(self)
 
                 def extract(self, *args, **kwargs):
+                    source = Path(args[0]) if args else Path("<unknown>")
+                    adapter_name = str(kwargs.get("adapter_name", "<default>"))
                     process = self._process
-                    self.request_pids.append(
-                        None if process is None else process.pid
+                    pid = None if process is None else process.pid
+                    self.request_pids.append(pid)
+                    record: dict[str, object] = {
+                        "source": source,
+                        "adapter": adapter_name,
+                        "pid": pid,
+                    }
+                    self.request_records.append(record)
+                    try:
+                        chunks = super().extract(*args, **kwargs)
+                    except BaseException as exc:
+                        record["outcome"] = (
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                        raise
+
+                    def replay():
+                        try:
+                            yield from chunks
+                        except BaseException as exc:
+                            record["outcome"] = (
+                                f"{type(exc).__name__}: {exc}"
+                            )
+                            raise
+                        else:
+                            record["outcome"] = "success"
+
+                    return replay()
+
+            def diagnostic_message() -> str:
+                expected_paths = {
+                    name: str((root / name).resolve())
+                    for name in (
+                        "testWORD.docx",
+                        "testEXCEL.xlsx",
+                        "testPPT.pptx",
+                        "testPDF.pdf",
                     )
-                    return super().extract(*args, **kwargs)
+                }
+                with database.connect() as conn:
+                    file_rows = {
+                        str(row["path"]): row
+                        for row in conn.execute(
+                            """
+                            SELECT path, filename, extension, last_error
+                            FROM files
+                            """
+                        ).fetchall()
+                    }
+                    state_rows = {
+                        str(row["path"]): row
+                        for row in conn.execute(
+                            """
+                            SELECT path, status, failure_count, owner_pid
+                            FROM extraction_state
+                            """
+                        ).fetchall()
+                    }
+                    issue_rows = {
+                        str(row["path"]): row
+                        for row in conn.execute(
+                            """
+                            SELECT path, error_code, detail
+                            FROM index_issues
+                            """
+                        ).fetchall()
+                    }
+
+                def find_row(rows, path_text):
+                    row = rows.get(path_text)
+                    if row is not None:
+                        return row
+                    name = Path(path_text).name.casefold()
+                    matches = [
+                        candidate
+                        for candidate_path, candidate in rows.items()
+                        if Path(candidate_path).name.casefold() == name
+                    ]
+                    return matches[0] if len(matches) == 1 else None
+
+                records_by_name: dict[str, list[str]] = {}
+                request_records = () if worker is None else worker.request_records
+                for record in request_records:
+                    source = Path(str(record["source"]))
+                    records_by_name.setdefault(source.name, []).append(
+                        "{}@pid={} [{}]".format(
+                            record["adapter"],
+                            record["pid"],
+                            record.get("outcome", "in progress"),
+                        )
+                    )
+
+                lines = [
+                    "persistent integration diagnostics:",
+                    f"stats={stats!r}",
+                    "worker_state={}".format(
+                        "<not created>" if worker is None else repr(worker.state)
+                    ),
+                    "worker_pids={}".format(
+                        "<not created>"
+                        if worker is None
+                        else repr(worker.request_pids)
+                    ),
+                ]
+                for name, path_text in expected_paths.items():
+                    file_row = find_row(file_rows, path_text)
+                    state_row = find_row(state_rows, path_text)
+                    issue_row = find_row(issue_rows, path_text)
+                    status = (
+                        str(state_row["status"])
+                        if state_row is not None
+                        else "<missing>"
+                    )
+                    lifecycle = (
+                        "indexed"
+                        if status in {"INDEXED", "NO_TEXT", "OCR_REQUIRED"}
+                        else "failed/skipped"
+                        if state_row is not None or issue_row is not None
+                        else "missing"
+                    )
+                    issue = (
+                        "<none>"
+                        if issue_row is None
+                        else "{}: {}".format(
+                            issue_row["error_code"],
+                            str(issue_row["detail"]).replace("\n", " ")[:600],
+                        )
+                    )
+                    last_error = (
+                        "<none>"
+                        if file_row is None
+                        else str(file_row["last_error"] or "<none>")
+                    )
+                    lines.append(
+                        "{} ext={} lifecycle={} file_row={} state={} "
+                        "failure_count={} owner_pid={} last_error={} issue={} "
+                        "attempts={}".format(
+                            name,
+                            (root / name).suffix,
+                            lifecycle,
+                            file_row is not None,
+                            status,
+                            "<missing>"
+                            if state_row is None
+                            else state_row["failure_count"],
+                            "<missing>"
+                            if state_row is None
+                            else state_row["owner_pid"],
+                            last_error,
+                            issue,
+                            "; ".join(records_by_name.get(name, ())) or "<none>",
+                        )
+                    )
+                return "\n".join(lines)
 
             with patch("docseek.indexer.PersistentExtractionWorker", RecordingWorker):
                 database = SearchDatabase(Path(directory) / "docseek.db")
                 stats = DirectoryIndexer(database).scan(root)
 
-            self.assertEqual(stats.indexed, 4)
+            worker = worker_instances[0] if worker_instances else None
+            self.assertEqual(
+                stats.indexed,
+                4,
+                msg=diagnostic_message() if stats.indexed != 4 else None,
+            )
             self.assertEqual(len(worker_instances), 1)
-            worker = worker_instances[0]
+            assert worker is not None
             self.assertGreaterEqual(len(worker.request_pids), 4)
             self.assertEqual(len(set(worker.request_pids)), 1)
             self.assertFalse(worker.is_alive)
