@@ -125,7 +125,7 @@ class PersistentExtractionWorker:
         self._reader_threads: list[threading.Thread] = []
         self._state = "new"
         self._active_request_id: int | None = None
-        self._termination_reason: BaseException | None = None
+        self._termination_reason: tuple[int, BaseException] | None = None
         self._request_ids = itertools.count(1)
         self._output_paths: set[Path] = set()
         self._closed = False
@@ -223,6 +223,7 @@ class PersistentExtractionWorker:
         source = Path(source)
         output: Path | None = None
         process: subprocess.Popen[str] | None = None
+        request_id: int | None = None
         try:
             self.start()
             with self._lifecycle_lock:
@@ -285,7 +286,12 @@ class PersistentExtractionWorker:
                     self._state = "ready"
                 else:
                     self._state = "dead"
-                self._termination_reason = None
+                if (
+                    request_id is not None
+                    and self._termination_reason is not None
+                    and self._termination_reason[0] == request_id
+                ):
+                    self._termination_reason = None
             self._request_lock.release()
 
     def cancel(self) -> bool:
@@ -293,8 +299,8 @@ class PersistentExtractionWorker:
         with self._lifecycle_lock:
             if self._active_request_id is None:
                 return False
-            self._termination_reason = LegacyExtractionCancelled(
-                "兼容格式解析已取消"
+            self._set_termination_reason_locked(
+                LegacyExtractionCancelled("兼容格式解析已取消")
             )
             self._stop_locked()
             return True
@@ -303,8 +309,8 @@ class PersistentExtractionWorker:
         """Force the current worker down and mark it dead."""
         with self._lifecycle_lock:
             if self._active_request_id is not None:
-                self._termination_reason = PersistentWorkerError(
-                    "persistent extraction worker was terminated"
+                self._set_termination_reason_locked(
+                    PersistentWorkerError("persistent extraction worker was terminated")
                 )
             self._stop_locked()
 
@@ -319,8 +325,8 @@ class PersistentExtractionWorker:
 
             if process is not None and process.poll() is None:
                 if active:
-                    self._termination_reason = LegacyExtractionCancelled(
-                        "兼容格式解析已因 worker 关闭而取消"
+                    self._set_termination_reason_locked(
+                        LegacyExtractionCancelled("兼容格式解析已因 worker 关闭而取消")
                     )
                     _terminate_process(process)
                 else:
@@ -440,15 +446,57 @@ class PersistentExtractionWorker:
     def _send_locked(self, payload: dict[str, Any]) -> None:
         process = self._process
         if process is None or process.poll() is not None or process.stdin is None:
+            reason = self._consume_termination_reason_locked(self._active_request_id)
+            if reason is not None:
+                raise reason
             raise self._crashed_error(process)
         try:
             process.stdin.write(json.dumps(payload, ensure_ascii=False) + "\n")
             process.stdin.flush()
         except (BrokenPipeError, OSError) as exc:
-            reason = self._crashed_error(process)
-            self._termination_reason = reason
+            reason = self._consume_termination_reason_locked(self._active_request_id)
+            if reason is None:
+                reason = self._crashed_error(process)
             self._stop_locked()
             raise reason from exc
+
+    def _set_termination_reason_locked(
+        self,
+        reason: BaseException,
+        *,
+        request_id: int | None = None,
+    ) -> None:
+        """Record the first terminal outcome for one active request.
+
+        Cancellation can race with pipe EOF, a broken write, or a timeout.
+        Keep the outcome attached to the request that was active when the
+        lifecycle event happened, and never let a later observation replace
+        an earlier user cancellation/termination decision.
+        """
+        target_request_id = (
+            self._active_request_id if request_id is None else request_id
+        )
+        if target_request_id is None:
+            return
+        if (
+            self._termination_reason is not None
+            and self._termination_reason[0] == target_request_id
+        ):
+            return
+        self._termination_reason = (target_request_id, reason)
+
+    def _consume_termination_reason_locked(
+        self,
+        request_id: int | None,
+    ) -> BaseException | None:
+        """Consume a terminal outcome only when it belongs to this request."""
+        if request_id is None or self._termination_reason is None:
+            return None
+        stored_request_id, reason = self._termination_reason
+        if stored_request_id != request_id:
+            return None
+        self._termination_reason = None
+        return reason
 
     @staticmethod
     def _next_message_from(
@@ -489,17 +537,19 @@ class PersistentExtractionWorker:
                     f"兼容格式解析超过 {timeout:g} 秒，已终止 persistent worker"
                 )
                 with self._lifecycle_lock:
-                    self._termination_reason = error
+                    self._set_termination_reason_locked(error, request_id=request_id)
+                    terminal = self._consume_termination_reason_locked(request_id)
                     self._stop_locked()
-                raise error
+                raise terminal if terminal is not None else error
             if stall_limit is not None and now - last_progress_at >= stall_limit:
                 error = LegacyExtractionTimeout(
                     f"兼容格式解析连续 {stall_limit:g} 秒没有进展，已终止 persistent worker"
                 )
                 with self._lifecycle_lock:
-                    self._termination_reason = error
+                    self._set_termination_reason_locked(error, request_id=request_id)
+                    terminal = self._consume_termination_reason_locked(request_id)
                     self._stop_locked()
-                raise error
+                raise terminal if terminal is not None else error
 
             wait_seconds = min(WORKER_POLL_SECONDS, deadline - now)
             if stall_limit is not None:
@@ -511,7 +561,7 @@ class PersistentExtractionWorker:
 
             if message is None:
                 with self._lifecycle_lock:
-                    reason = self._termination_reason
+                    reason = self._consume_termination_reason_locked(request_id)
                 if reason is not None:
                     raise reason
                 raise self._crashed_error(self._process)
@@ -537,9 +587,17 @@ class PersistentExtractionWorker:
                         # request on this persistent channel.
                         with self._lifecycle_lock:
                             if self._active_request_id == request_id:
-                                self._termination_reason = exc
+                                self._set_termination_reason_locked(
+                                    exc,
+                                    request_id=request_id,
+                                )
+                                terminal = self._consume_termination_reason_locked(
+                                    request_id
+                                )
                                 self._stop_locked()
-                        raise
+                            else:
+                                terminal = None
+                        raise terminal if terminal is not None else exc
                 continue
 
             if message.get("request_id") != request_id:
@@ -570,13 +628,14 @@ class PersistentExtractionWorker:
                 f"unknown worker response: {message!r}"
             )
 
-    def _fatal_protocol_error(self, detail: str) -> PersistentWorkerError:
+    def _fatal_protocol_error(self, detail: str) -> BaseException:
         """Stop a worker after a response that cannot be safely recovered."""
         error = PersistentWorkerError(detail)
         with self._lifecycle_lock:
-            self._termination_reason = error
+            self._set_termination_reason_locked(error)
+            terminal = self._consume_termination_reason_locked(self._active_request_id)
             self._stop_locked()
-        return error
+        return error if terminal is None else terminal
 
     def _wait_for_shutdown_locked(self, process: subprocess.Popen[str]) -> None:
         deadline = time.monotonic() + 2.0

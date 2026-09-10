@@ -357,6 +357,54 @@ class PersistentExtractionWorkerTests(unittest.TestCase):
             self.assertLess(elapsed, 0.5)
             worker.close()
 
+    def test_repeated_cancel_preserves_cancelled_outcome_before_worker_eof(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            hanging = root / "hang.txt"
+            valid = root / "valid.txt"
+            hanging.write_text("hang", encoding="utf-8")
+            valid.write_text("valid", encoding="utf-8")
+            worker = PersistentExtractionWorker(
+                command_factory=_stub_command,
+                timeout_seconds=5,
+            )
+            try:
+                for attempt in range(50):
+                    outcome: list[BaseException] = []
+
+                    def extract() -> None:
+                        try:
+                            list(worker.extract(hanging, adapter_name="stub"))
+                        except BaseException as exc:  # assertion below checks the type
+                            outcome.append(exc)
+
+                    thread = threading.Thread(target=extract, daemon=True)
+                    thread.start()
+                    deadline = time.monotonic() + 5
+                    while (
+                        worker.active_request_id is None
+                        and time.monotonic() < deadline
+                    ):
+                        time.sleep(0.005)
+
+                    self.assertIsNotNone(
+                        worker.active_request_id,
+                        f"cancel attempt {attempt} did not start",
+                    )
+                    self.assertTrue(worker.cancel())
+                    thread.join(timeout=5)
+
+                    self.assertFalse(thread.is_alive())
+                    self.assertEqual(len(outcome), 1)
+                    self.assertIsInstance(outcome[0], LegacyExtractionCancelled)
+                    self.assertEqual(worker.state, "dead")
+
+                    chunks = list(worker.extract(valid, adapter_name="stub"))
+                    self.assertEqual(chunks[0].content, "valid.txt")
+                    self.assertEqual(worker.state, "ready")
+            finally:
+                worker.close()
+
     def test_timeout_kills_worker_and_next_request_respawns(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
