@@ -30,7 +30,15 @@ from docseek.search_db import SearchDatabase  # noqa: E402
 
 DEFAULT_CAPACITY_TOKENS = ("128", "256", "512", "1024", "files")
 DEFAULT_CANCEL_FILES = 2_000
+# Keep search validation deterministic across backends and transaction
+# capacities.  The synthetic workload puts these terms in every file, while
+# SearchDatabase intentionally returns only the top 100 matches.  Comparing
+# that unbounded top-100 slice would therefore depend on insertion order and
+# per-run filesystem timestamps rather than indexed content.  Restricting the
+# probe to one known file still exercises the real search/FTS path without
+# turning an otherwise equivalent result set into a false parity failure.
 SEARCH_QUERIES = ("客户经理", "信贷")
+SEARCH_PROBE_PATH = "document_000000"
 
 
 class RssSampler:
@@ -181,7 +189,11 @@ def database_snapshot(db_path: Path, root: Path) -> dict[str, Any]:
                 result.filename,
                 result.location,
             )
-            for result in store.search(query, limit=100)
+            for result in store.search(
+                query,
+                limit=100,
+                path_contains=SEARCH_PROBE_PATH,
+            )
         )
         for query in SEARCH_QUERIES
     }
