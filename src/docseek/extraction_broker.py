@@ -117,15 +117,34 @@ class ContentExtractionBroker:
                 # through a second extraction path for the same request.
                 from .persistent_extraction import PersistentWorkerError
 
-                try:
-                    persistent_worker.start()
-                except PersistentWorkerError as exc:
-                    logger.warning(
-                        "persistent extraction worker unavailable; "
-                        "falling back to one-shot isolation: %s",
-                        exc,
-                    )
+                unavailable = bool(
+                    getattr(persistent_worker, "unavailable_for_job", False)
+                    or getattr(persistent_worker, "_unavailable_for_job", False)
+                )
+                if unavailable:
                     persistent_worker = None
+                else:
+                    try:
+                        persistent_worker.start()
+                    except PersistentWorkerError as exc:
+                        disable_for_job = getattr(
+                            persistent_worker, "disable_for_job", None
+                        )
+                        if callable(disable_for_job):
+                            disable_for_job()
+                        else:
+                            # Keep simple test/embedder workers job-scoped too
+                            # when they do not implement the controller API.
+                            try:
+                                setattr(persistent_worker, "unavailable_for_job", True)
+                            except (AttributeError, TypeError):
+                                pass
+                        logger.warning(
+                            "persistent extraction worker unavailable; "
+                            "falling back to one-shot isolation for this job: %s",
+                            exc,
+                        )
+                        persistent_worker = None
 
             isolation_kwargs = {}
             if cancelled is not None:

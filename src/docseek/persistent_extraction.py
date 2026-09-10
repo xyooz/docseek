@@ -57,6 +57,10 @@ class PersistentWorkerBusy(PersistentWorkerError):
     """A second extraction was submitted while one request was active."""
 
 
+class PersistentWorkerReplayError(PersistentWorkerError):
+    """The worker result spool could not be replayed completely."""
+
+
 def persistent_worker_command() -> list[str]:
     """Build a source or PyInstaller-frozen persistent worker command."""
     if getattr(sys, "frozen", False):
@@ -122,6 +126,7 @@ class PersistentExtractionWorker:
         self._request_ids = itertools.count(1)
         self._output_paths: set[Path] = set()
         self._closed = False
+        self._unavailable_for_job = False
 
         if output_dir is None:
             self._temporary_output_dir = tempfile.TemporaryDirectory(
@@ -148,6 +153,17 @@ class PersistentExtractionWorker:
         with self._lifecycle_lock:
             return self._active_request_id
 
+    @property
+    def unavailable_for_job(self) -> bool:
+        """Whether startup has failed and this job should use one-shot mode."""
+        with self._lifecycle_lock:
+            return self._unavailable_for_job
+
+    def disable_for_job(self) -> None:
+        """Stop retrying persistent startup for the owning indexing job."""
+        with self._lifecycle_lock:
+            self._unavailable_for_job = True
+
     def __enter__(self) -> "PersistentExtractionWorker":
         return self
 
@@ -159,6 +175,10 @@ class PersistentExtractionWorker:
         """Start the worker if it is not already alive."""
         with self._lifecycle_lock:
             self._ensure_open_locked()
+            if self._unavailable_for_job:
+                raise PersistentWorkerError(
+                    "persistent extraction worker is unavailable for this job"
+                )
             if self._process is not None and self._process.poll() is None:
                 return
             if self._active_request_id is not None:
@@ -172,6 +192,7 @@ class PersistentExtractionWorker:
         try:
             with self._lifecycle_lock:
                 self._ensure_open_locked()
+                self._unavailable_for_job = False
                 self._stop_locked()
                 self._spawn_locked()
         finally:
@@ -238,7 +259,7 @@ class PersistentExtractionWorker:
                     else stall_timeout_seconds
                 ),
             )
-            del chunk_count
+            self._validate_chunk_file(returned_output, chunk_count)
             return self._replay_and_cleanup(returned_output)
         except BaseException:
             if output is not None:
@@ -577,10 +598,49 @@ class PersistentExtractionWorker:
             except (OSError, ValueError):
                 pass
 
-    def _replay_and_cleanup(self, output: Path) -> Iterator[DocumentChunk]:
+    @staticmethod
+    def _validate_chunk_file(output: Path, expected_count: int) -> None:
+        """Verify the complete atomic spool before exposing any chunk.
+
+        ``iter_chunk_file`` intentionally treats EOF as the normal end of a
+        stream for historical one-shot callers.  The persistent protocol also
+        supplies an expected chunk count, so use it to distinguish a complete
+        spool from a truncated result and keep adapter fallback atomic.
+        """
+        actual_count = 0
         try:
-            yield from iter_chunk_file(output)
+            for _chunk in iter_chunk_file(output):
+                actual_count += 1
+        except Exception as exc:
+            raise PersistentWorkerReplayError(
+                f"persistent extraction result spool is invalid: {exc}"
+            ) from exc
+        if actual_count != int(expected_count):
+            raise PersistentWorkerReplayError(
+                "persistent extraction result spool is truncated: "
+                f"expected {int(expected_count)} chunks, got {actual_count}"
+            )
+
+    def _replay_and_cleanup(self, output: Path) -> Iterator[DocumentChunk]:
+        iterator = None
+        try:
+            iterator = iter_chunk_file(output)
+            while True:
+                try:
+                    chunk = next(iterator)
+                except StopIteration:
+                    return
+                except Exception as exc:
+                    raise PersistentWorkerReplayError(
+                        f"persistent extraction result replay failed: {exc}"
+                    ) from exc
+                # Keep the caller's exceptions outside the replay error
+                # boundary.  Index cancellation or writer failures must not
+                # be mistaken for an adapter failure and retried.
+                yield chunk
         finally:
+            if iterator is not None:
+                iterator.close()
             self._remove_output(output)
 
     def _remove_output(self, output: Path) -> None:

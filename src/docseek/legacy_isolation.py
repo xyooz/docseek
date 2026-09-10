@@ -224,6 +224,12 @@ def iter_legacy_chunks_isolated(
             )
 
             if persistent_worker is not None:
+                # Import lazily to avoid the persistent controller's imports
+                # cycling back through this compatibility module at import
+                # time.  Replay errors are part of this same adapter attempt:
+                # the next adapter may still be able to parse the source.
+                from .persistent_extraction import PersistentWorkerError
+
                 try:
                     chunks = persistent_worker.extract(
                         source,
@@ -243,15 +249,24 @@ def iter_legacy_chunks_isolated(
                 except LegacyExtractionTimeout:
                     attempts.append(f"{adapter_name}: 超时")
                     continue
-                except Exception as exc:
-                    if type(exc).__name__ == "IndexCancelled":
-                        raise
+                except PersistentWorkerError as exc:
                     attempts.append(
                         f"{adapter_name}: {type(exc).__name__}: {exc}"
                     )
                     continue
-                yield from chunks
-                return
+                try:
+                    yield from chunks
+                    return
+                except LegacyExtractionCancelled:
+                    raise
+                except LegacyExtractionTimeout:
+                    attempts.append(f"{adapter_name}: 超时")
+                    continue
+                except PersistentWorkerError as exc:
+                    attempts.append(
+                        f"{adapter_name}: {type(exc).__name__}: {exc}"
+                    )
+                    continue
 
             output = temp_root / f"chunks-{attempt_no}.bin"
             error_path = output.with_name(output.name + ".error.txt")

@@ -58,6 +58,46 @@ def _hanging_worker_command() -> list[str]:
     return [sys.executable, "-c", HANGING_WORKER]
 
 
+CORRUPT_SPOOL_WORKER = textwrap.dedent(
+    r'''
+    import json
+    import pickle
+    import sys
+    from pathlib import Path
+
+    print(json.dumps({"type": "ready", "protocol_version": 1}), flush=True)
+    for raw_line in sys.stdin:
+        request = json.loads(raw_line)
+        if request.get("type") == "shutdown":
+            print(json.dumps({"type": "shutdown_ack", "request_id": None}), flush=True)
+            raise SystemExit(0)
+
+        output = Path(request["output"])
+        output.parent.mkdir(parents=True, exist_ok=True)
+        if request.get("adapter_name") == "broken":
+            with output.open("wb") as handle:
+                pickle.dump((0, "partial", "must not leak"), handle)
+                handle.write(b"\x80")
+            chunk_count = 2
+        else:
+            with output.open("wb") as handle:
+                pickle.dump((0, "fallback", "fallback content"), handle)
+            chunk_count = 1
+
+        print(json.dumps({
+            "type": "result",
+            "request_id": request["request_id"],
+            "chunk_count": chunk_count,
+            "output": str(output),
+        }), flush=True)
+    '''
+)
+
+
+def _corrupt_spool_worker_command() -> list[str]:
+    return [sys.executable, "-c", CORRUPT_SPOOL_WORKER]
+
+
 class PersistentExtractionIntegrationTests(unittest.TestCase):
     def test_office_and_pdf_files_share_one_worker_pid_and_close_at_scan_end(self) -> None:
         fixture_root = Path(__file__).parent / "fixtures" / "official"
@@ -153,6 +193,31 @@ class PersistentExtractionIntegrationTests(unittest.TestCase):
         self.assertEqual(worker.calls, ["broken", "direct"])
         self.assertEqual(chunks[0].content, "persistent success")
 
+    def test_corrupt_persistent_spool_falls_back_before_leaking_partial_chunks(self) -> None:
+        worker = PersistentExtractionWorker(
+            command_factory=_corrupt_spool_worker_command,
+            timeout_seconds=5,
+        )
+        try:
+            with patch(
+                "docseek.legacy_isolation.available_legacy_adapter_names",
+                return_value=("broken", "direct"),
+            ):
+                chunks = list(
+                    iter_legacy_chunks_isolated(
+                        Path("sample.docx"),
+                        persistent_worker=worker,
+                    )
+                )
+
+            self.assertEqual(
+                chunks,
+                [DocumentChunk(0, "fallback", "fallback content")],
+            )
+            self.assertTrue(worker.is_alive)
+        finally:
+            worker.close()
+
     def test_worker_startup_failure_uses_one_shot_compatibility_fallback(self) -> None:
         class UnavailableWorker:
             def start(self) -> None:
@@ -174,6 +239,48 @@ class PersistentExtractionIntegrationTests(unittest.TestCase):
 
         isolated.assert_called_once()
         self.assertEqual(chunks, expected)
+
+    def test_startup_failure_disables_persistent_worker_for_remainder_of_job(self) -> None:
+        startup_attempts = 0
+
+        def unavailable_command() -> list[str]:
+            nonlocal startup_attempts
+            startup_attempts += 1
+            return [sys.executable, "-c", "import sys; sys.exit(23)"]
+
+        worker = PersistentExtractionWorker(
+            command_factory=unavailable_command,
+            timeout_seconds=2,
+        )
+        expected = [DocumentChunk(0, "legacy", "one-shot fallback")]
+        broker = ContentExtractionBroker()
+        try:
+            with patch(
+                "docseek.legacy_isolation.iter_legacy_chunks_isolated",
+                side_effect=lambda *args, **kwargs: iter(expected),
+            ) as isolated:
+                first = list(
+                    broker.iter_chunks(
+                        Path("first.docx"),
+                        cancelled=lambda: False,
+                        persistent_worker=worker,
+                    )
+                )
+                second = list(
+                    broker.iter_chunks(
+                        Path("second.docx"),
+                        cancelled=lambda: False,
+                        persistent_worker=worker,
+                    )
+                )
+
+            self.assertEqual(first, expected)
+            self.assertEqual(second, expected)
+            self.assertEqual(startup_attempts, 1)
+            self.assertEqual(isolated.call_count, 2)
+            self.assertTrue(worker.unavailable_for_job)
+        finally:
+            worker.close()
 
     def test_cancel_kills_active_worker_and_scan_closes_it(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
