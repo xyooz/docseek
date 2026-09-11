@@ -397,16 +397,6 @@ def _scan_thread(
         trace.mark("index_thread_exit")
 
 
-def _open_control_connection(path: Path, factory: Callable[..., sqlite3.Connection]) -> sqlite3.Connection:
-    """Use the same runtime connection settings without changing them."""
-    conn = sqlite3.connect(path, timeout=10, factory=factory)
-    conn.execute("PRAGMA busy_timeout=10000")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    conn.execute("PRAGMA temp_store=MEMORY")
-    conn.execute("PRAGMA cache_size=-32768")
-    return conn
-
-
 def run_sqlite_execute_phase() -> dict[str, Any]:
     trace = Trace("sqlite_execute", "control")
     entered = threading.Event()
