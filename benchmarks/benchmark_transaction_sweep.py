@@ -254,8 +254,8 @@ def run_cancel_probe(
             except BaseException as exc:  # noqa: BLE001 - probe records the outcome
                 outcome["error"] = exc
 
-        original_scan_batch_size = indexer_module.MAX_SCAN_BATCH_SIZE
-        indexer_module.MAX_SCAN_BATCH_SIZE = transaction_capacity
+        original_transaction_capacity = indexer_module.FULL_SCAN_BATCH_SIZE
+        indexer_module.FULL_SCAN_BATCH_SIZE = transaction_capacity
         try:
             worker = threading.Thread(target=scan_thread, daemon=True)
             worker.start()
@@ -279,7 +279,7 @@ def run_cancel_probe(
                     f"{backend_name}/capacity={transaction_capacity} cancel returned {error!r}"
                 )
         finally:
-            indexer_module.MAX_SCAN_BATCH_SIZE = original_scan_batch_size
+            indexer_module.FULL_SCAN_BATCH_SIZE = original_transaction_capacity
 
         reopened = database_snapshot(database.db_path, root)
         if reopened["integrity"] != "ok":

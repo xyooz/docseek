@@ -15,6 +15,7 @@ from docseek.indexer import (
     DirectoryIndexer,
 )
 from docseek.search_db import SearchDatabase
+from docseek.scan_backend import MAX_SCAN_BATCH_SIZE
 
 
 class DirectoryIndexerTests(unittest.TestCase):
@@ -32,6 +33,7 @@ class DirectoryIndexerTests(unittest.TestCase):
     def test_full_scan_batching_keeps_benchmark_verified_document_and_text_caps(self) -> None:
         self.assertEqual(FULL_SCAN_BATCH_SIZE, 512)
         self.assertEqual(FULL_SCAN_BATCH_TEXT_CHARS, 8_000_000)
+        self.assertEqual(MAX_SCAN_BATCH_SIZE, 128)
 
     def test_excluded_directory_is_not_indexed(self) -> None:
         visible = self.root / "visible.txt"

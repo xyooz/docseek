@@ -40,7 +40,6 @@ from .index_formats import (
 from .index_priority import prioritize_index_candidates
 from .document_types import KNOWN_DOCUMENT_EXTENSIONS
 from .scan_backend import (
-    MAX_SCAN_BATCH_SIZE,
     PythonScanBackend,
     RustScanBackendUnavailable,
     ScanBackend,
@@ -74,9 +73,11 @@ DEFAULT_IGNORED_DIR_NAMES = {
     "system volume information",
 }
 # Small text files benefit substantially from fewer FTS5 transaction boundaries.
-# The separate text-character cap still bounds writer-lock duration and memory for
-# larger documents, while Office/PDF/compatibility formats continue to spool and
-# flush per document in ChunkBatchWriter.
+# This is both the writer's document-count cap and the outer full-scan
+# discovery/flush boundary. The separate text-character cap still bounds
+# writer-lock duration and memory for larger documents, while Office/PDF/
+# compatibility formats continue to spool and flush per document in
+# ChunkBatchWriter. The scanner's own pull batch remains bounded separately.
 FULL_SCAN_BATCH_SIZE = 512
 FULL_SCAN_BATCH_TEXT_CHARS = 8_000_000
 # Commit the first useful results quickly, then widen batches for sustained
@@ -1087,7 +1088,10 @@ class DirectoryIndexer:
         scan_session = self._start_scan_session(root)
         discovery = iter_scan_candidates(
             scan_session,
-            max_items=MAX_SCAN_BATCH_SIZE,
+            # Keep the scanner's own pull batch bounded at 128 while allowing
+            # the full-index loop to accumulate one writer transaction's
+            # worth of candidates before its explicit flush.
+            max_items=FULL_SCAN_BATCH_SIZE,
             on_discovery=report_backend_discovery,
             on_progress=lambda progress: setattr(stats, "excluded", progress.excluded),
             on_issues=report_backend_issues,
@@ -1124,12 +1128,12 @@ class DirectoryIndexer:
                     # discovery; issue metadata remains buffered until the end.
                     writer.flush()
                     try:
-                        batch = list(islice(discovery, MAX_SCAN_BATCH_SIZE))
+                        batch = list(islice(discovery, FULL_SCAN_BATCH_SIZE))
                     except ScanCancelled as exc:
                         writer.abort()
                         raise IndexCancelled() from exc
                     discovered += len(batch)
-                    finished = len(batch) < MAX_SCAN_BATCH_SIZE
+                    finished = len(batch) < FULL_SCAN_BATCH_SIZE
                     if finished:
                         if on_candidates_ready:
                             on_candidates_ready(discovered)

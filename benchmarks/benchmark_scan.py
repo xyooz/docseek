@@ -627,13 +627,13 @@ def timed_scan(
 
     restorers: list[Callable[[], None]] = []
     if transaction_capacity is not None:
-        original_scan_batch_size = indexer_module.MAX_SCAN_BATCH_SIZE
-        indexer_module.MAX_SCAN_BATCH_SIZE = int(transaction_capacity)
+        original_transaction_capacity = indexer_module.FULL_SCAN_BATCH_SIZE
+        indexer_module.FULL_SCAN_BATCH_SIZE = int(transaction_capacity)
         restorers.append(
             lambda: setattr(
                 indexer_module,
-                "MAX_SCAN_BATCH_SIZE",
-                original_scan_batch_size,
+                "FULL_SCAN_BATCH_SIZE",
+                original_transaction_capacity,
             )
         )
     indexer_module.iter_scan_candidates = timed_iter_scan_candidates

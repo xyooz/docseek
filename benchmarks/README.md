@@ -188,3 +188,11 @@ chunk/FTS/state 内容 digest、搜索结果、数据库 `integrity_check` 以�
 一致性；同时报告 commit latency 的平均值、P50、P95、最大值、RSS 峰值和取消延迟。
 JSON 中保留每一次 commit 的 latency 样本，终端输出使用聚合值。不同指标存在嵌套关系，
 `writer_total`、`sql_total` 和 `commit_total` 不能简单相加。
+
+## SQLite production transaction tuning
+
+M9-B.1 将完整索引的 production flush boundary 固定为 512 个文件，同时保留 scanner
+内部最多 128 个 candidate 的 pull batch，以及 8,000,000 字符的 payload 上限。也就是说，
+索引层可以在一次 writer transaction 中积累更多小文本文件，但不会扩大 Rust/Python scanner
+的核心 batch 上限，也不会改变 SQLite PRAGMA、FTS 或 CJK tokenizer。M9-B 的 transaction
+sweep 仍可通过临时覆盖 `FULL_SCAN_BATCH_SIZE` 重跑各容量，用于验证生产默认值。
