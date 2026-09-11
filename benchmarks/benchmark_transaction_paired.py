@@ -233,7 +233,7 @@ def build_conclusion(summaries: list[dict[str, Any]]) -> dict[str, Any]:
         for item in summaries
     ]
     transaction_reduced = all(
-        min(item["candidate_512"]["transaction_counts"])
+        max(item["candidate_512"]["transaction_counts"])
         < min(item["baseline_128"]["transaction_counts"])
         for item in summaries
     )
@@ -360,6 +360,22 @@ def main() -> None:
                         raise RuntimeError(
                             "benchmark override did not restore production capacity"
                         )
+
+    # The transaction-capacity oracle above validates each backend separately.
+    # This second oracle keeps the existing Python/Rust full-index parity
+    # contract explicit for every workload in the paired experiment.
+    for workload_name in workload_names:
+        workload_results = [
+            item for item in raw_results if item["workload"] == workload_name
+        ]
+        oracle = workload_results[0]["validation"]
+        for item in workload_results:
+            if item["validation"] != oracle:
+                raise RuntimeError(
+                    f"{workload_name}/{item['backend']}/capacity="
+                    f"{item['transaction_capacity']} failed Python/Rust "
+                    "database/search parity"
+                )
 
     summaries = [
         summarize_group(
