@@ -1,0 +1,92 @@
+name: benchmark-sqlite-transaction-paired
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: "Git ref containing the paired transaction benchmark"
+        required: true
+        default: "perf/sqlite-transaction-paired-ab"
+        type: string
+      repeats:
+        description: "Paired repeats per backend and workload"
+        required: true
+        default: "2"
+        type: string
+      backend:
+        description: "Scanner backend(s) to include"
+        required: true
+        default: "both"
+        type: choice
+        options:
+          - both
+          - python
+          - rust
+
+permissions:
+  contents: read
+
+jobs:
+  windows-sqlite-transaction-paired:
+    runs-on: windows-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_ref }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Install benchmark and parser dependencies
+        run: python -m pip install -e ".[calamine,tika,wps,benchmarks]"
+
+      - name: Build and install PyO3 wheel
+        shell: pwsh
+        run: |
+          python -m pip install "maturin>=1.7,<2"
+          maturin build --interpreter python --manifest-path crates/docseek-python/Cargo.toml --release
+          python -c "import glob, os, subprocess, sys; wheels=sorted(glob.glob('target/wheels/docseek_rust-*.whl'), key=os.path.getmtime); assert wheels, 'no docseek_rust wheel'; subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--force-reinstall', '--no-deps', wheels[-1]])"
+          python -c "import docseek_rust; print(docseek_rust.__file__)"
+
+      - name: Record Windows runner
+        shell: pwsh
+        run: |
+          python --version
+          rustc --version
+          Get-ComputerInfo | Select-Object CsName, OsName, OsVersion, CsProcessors, CsTotalPhysicalMemory
+
+      - name: Run paired SQLite transaction A/B
+        shell: pwsh
+        run: |
+          $console_report = "benchmark-transaction-paired-windows.log"
+          $summary_report = "benchmark-transaction-paired-windows.txt"
+          python benchmarks/benchmark_transaction_paired.py `
+            --workload tiny-text `
+            --workload medium-text `
+            --workload large-text `
+            --backend "${{ inputs.backend }}" `
+            --repeats ${{ inputs.repeats }} `
+            --cancel-files 2000 `
+            --json-out benchmark-transaction-paired-windows.json `
+            --report-out $summary_report 2>&1 | Tee-Object -FilePath $console_report
+          if ($LASTEXITCODE -ne 0) {
+            throw "Paired SQLite transaction benchmark failed with exit code $LASTEXITCODE"
+          }
+
+      - name: Upload paired SQLite transaction reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: docseek-sqlite-transaction-paired-windows
+          path: |
+            benchmark-transaction-paired-windows.log
+            benchmark-transaction-paired-windows.txt
+            benchmark-transaction-paired-windows.json
+          if-no-files-found: error
+          retention-days: 30

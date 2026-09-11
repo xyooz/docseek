@@ -196,3 +196,28 @@ M9-B.1 将完整索引的 production flush boundary 固定为 512 个文件，�
 索引层可以在一次 writer transaction 中积累更多小文本文件，但不会扩大 Rust/Python scanner
 的核心 batch 上限，也不会改变 SQLite PRAGMA、FTS 或 CJK tokenizer。M9-B 的 transaction
 sweep 仍可通过临时覆盖 `FULL_SCAN_BATCH_SIZE` 重跑各容量，用于验证生产默认值。
+
+## SQLite paired transaction confirmation
+
+`benchmark_transaction_paired.py` 是 M9-B.2 的同 runner paired A/B benchmark。它保持生产
+默认 `FULL_SCAN_BATCH_SIZE=512`，在 benchmark 进程内按 `128, 512, 128, 512`（默认两轮）
+临时覆盖完整索引边界；每次运行都会建立独立数据库，并验证文件数、chunk/FTS/state
+内容、搜索结果、`integrity_check`、数据库重开以及取消后的数据库一致性。脚本同时记录
+RSS、取消延迟、事务/commit 数和 commit latency，并按 workload/backend 输出 128 与 512
+的 median、delta 和 speedup。它不会修改 SQLite PRAGMA、journal mode、synchronous、FTS
+或 tokenizer。
+
+本地 smoke：
+
+```bash
+python benchmarks/benchmark_transaction_paired.py \
+  --workload tiny-text --workload medium-text --workload large-text \
+  --backend both --repeats 2 \
+  --cancel-files 200 \
+  --json-out benchmark-transaction-paired.json \
+  --report-out benchmark-transaction-paired.txt
+```
+
+Windows 正式运行由手动触发的 `.github/workflows/benchmark-sqlite-transaction-paired.yml`
+上传。Actions 页面中的 workflow 分支应选 `main`，实际测试代码通过 `source_ref` 选择
+实验分支；默认 workload 是 tiny-text 50,000、medium-text 10,000 和 large-text 1,000。
